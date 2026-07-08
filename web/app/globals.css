@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+:root {
+  --whatsapp: #25d366;
+  --whatsapp-dark: #1da851;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: #f8fafc;
+  color: #0f172a;
+  -webkit-font-smoothing: antialiased;
+}

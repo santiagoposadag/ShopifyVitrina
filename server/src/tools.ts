@@ -1,0 +1,228 @@
+import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
+import type { Config } from "./config.js";
+import type { DB } from "./db.js";
+import type { KapsoClient } from "./kapso.js";
+import * as repo from "./repo.js";
+import type { Product, ProductAttributes, TurnContext } from "./types.js";
+
+export const MCP_SERVER_NAME = "vitrina";
+
+export interface ToolDeps {
+  db: DB;
+  kapso: KapsoClient;
+  config: Config;
+  ctx: TurnContext;
+}
+
+const MAX_PHOTOS_PER_SEND = 4;
+
+function text(body: string) {
+  return { content: [{ type: "text" as const, text: body }] };
+}
+
+/** Compact, model-friendly rendering of a product. */
+function describeProduct(p: Product): string {
+  const a = p.attributes;
+  const parts: string[] = [
+    `code=${p.code}`,
+    `title=${p.title}`,
+    `status=${p.status}`,
+    p.price != null ? `price=${p.price} ${p.currency}` : "price=unknown",
+  ];
+  if (a.neighborhood) parts.push(`neighborhood=${a.neighborhood}`);
+  if (a.city) parts.push(`city=${a.city}`);
+  if (a.area_m2 != null) parts.push(`area_m2=${a.area_m2}`);
+  if (a.bedrooms != null) parts.push(`bedrooms=${a.bedrooms}`);
+  if (a.bathrooms != null) parts.push(`bathrooms=${a.bathrooms}`);
+  if (a.admin_fee != null) parts.push(`admin_fee=${a.admin_fee}`);
+  if (a.estrato != null) parts.push(`estrato=${a.estrato}`);
+  if (a.floor != null) parts.push(`floor=${a.floor}`);
+  if (a.elevator != null) parts.push(`elevator=${a.elevator}`);
+  if (a.levels != null) parts.push(`levels=${a.levels}`);
+  if (a.negotiable != null) parts.push(`negotiable=${a.negotiable}`);
+  if (a.features && a.features.length > 0) parts.push(`features=[${a.features.join("; ")}]`);
+  if (p.description) parts.push(`description=${p.description}`);
+  return parts.join(" | ");
+}
+
+/**
+ * Build the in-process MCP server exposing the tools for this turn. Customer
+ * tools are always present; owner tools are added only for the owner role. The
+ * acting phone number is taken from context, never from the model.
+ */
+export function buildToolServer(deps: ToolDeps) {
+  const { db, kapso, config, ctx } = deps;
+
+  const searchCatalog = tool(
+    "search_catalog",
+    "Search the ACTIVE product catalog. Returns matching products with their facts. Use this before answering any question about availability, price, or features. Never answer product facts from memory.",
+    {
+      query: z.string().optional().describe("Free-text search over title, description, neighborhood, features"),
+      min_price: z.number().optional().describe("Minimum price (COP)"),
+      max_price: z.number().optional().describe("Maximum price (COP)"),
+      bedrooms: z.number().optional().describe("Minimum number of bedrooms"),
+      neighborhood: z.string().optional().describe("Neighborhood or city to match"),
+    },
+    async (args) => {
+      const results = repo.searchCatalog(db, args);
+      if (results.length === 0) {
+        return text("No matching active products. Offer to save the inquiry as a lead.");
+      }
+      return text(results.map(describeProduct).join("\n"));
+    },
+  );
+
+  const getProduct = tool(
+    "get_product",
+    "Get a single product by its code, including all facts. Use this when the customer references a specific code.",
+    { code: z.string().describe("The product code") },
+    async ({ code }) => {
+      const product = repo.getProductByCode(db, code);
+      if (!product) return text(`No product found with code ${code}.`);
+      const photos = repo.getProductPhotos(db, product.id);
+      return text(`${describeProduct(product)} | photos_available=${photos.length}`);
+    },
+  );
+
+  const sendProductPhotos = tool(
+    "send_product_photos",
+    `Send up to ${MAX_PHOTOS_PER_SEND} photos of a product to the current WhatsApp chat. Use when the customer asks to see the property or when offering photos.`,
+    { code: z.string().describe("The product code whose photos to send") },
+    async ({ code }) => {
+      const product = repo.getProductByCode(db, code);
+      if (!product) return text(`No product found with code ${code}.`);
+      const photos = repo.getProductPhotos(db, product.id).slice(0, MAX_PHOTOS_PER_SEND);
+      if (photos.length === 0) return text(`Product ${code} has no photos yet.`);
+      for (const [index, photo] of photos.entries()) {
+        const caption = index === 0 ? `${product.title} (código ${product.code})` : undefined;
+        await kapso.sendImage(ctx.phone, photo.public_path, caption);
+      }
+      return text(`Sent ${photos.length} photo(s) for código ${code} to the customer.`);
+    },
+  );
+
+  const saveLead = tool(
+    "save_lead",
+    "Save a lead for the current customer. Use type 'visit_request' to record a request to schedule a visit, or 'inquiry' for a general interest to follow up. The phone number is taken from context automatically.",
+    {
+      type: z.enum(["inquiry", "visit_request"]).describe("Kind of lead"),
+      name: z.string().optional().describe("Customer name if provided"),
+      note: z.string().optional().describe("Free-text note: budget, preferences, requested time, etc."),
+      product_code: z.string().optional().describe("Product code the lead is about, if any"),
+    },
+    async ({ type, name, note, product_code }) => {
+      const lead = repo.insertLead(db, {
+        phone: ctx.phone,
+        type,
+        name,
+        note,
+        product_code,
+      });
+      return text(`Saved lead #${lead.id} (${type}) for the customer.`);
+    },
+  );
+
+  const customerTools = [searchCatalog, getProduct, sendProductPhotos, saveLead];
+
+  if (ctx.role !== "owner") {
+    return {
+      server: createSdkMcpServer({ name: MCP_SERVER_NAME, version: "1.0.0", tools: customerTools }),
+      toolNames: customerTools.map((t) => `mcp__${MCP_SERVER_NAME}__${t.name}`),
+    };
+  }
+
+  // --- Owner-only tools -----------------------------------------------------
+
+  const upsertProduct = tool(
+    "upsert_product",
+    "Create a draft product or update an existing one by code. Only pass the fields you want to set or change. attributes_json is a JSON object merged into existing attributes (keys: area_m2, bedrooms, bathrooms, neighborhood, city, features[], admin_fee, estrato, levels, floor, elevator, negotiable). Set status to 'active' to publish it to the storefront.",
+    {
+      code: z.string().describe("Product code (required, unique identifier)"),
+      title: z.string().optional(),
+      description: z.string().optional(),
+      price: z.number().optional().describe("Price in COP"),
+      status: z.enum(["draft", "active", "sold", "inactive"]).optional(),
+      attributes_json: z
+        .string()
+        .optional()
+        .describe("JSON object of attributes to merge, e.g. {\"bedrooms\":3,\"neighborhood\":\"Belén\"}"),
+    },
+    async ({ code, title, description, price, status, attributes_json }) => {
+      let attributes: ProductAttributes | undefined;
+      if (attributes_json) {
+        try {
+          attributes = JSON.parse(attributes_json) as ProductAttributes;
+        } catch {
+          return text("attributes_json was not valid JSON. Ask again or send it differently.");
+        }
+      }
+      const { product, created } = repo.upsertProduct(
+        db,
+        { code, title, description, price, status, attributes },
+        ctx.phone,
+      );
+      return text(
+        `${created ? "Created" : "Updated"} product: ${describeProduct(product)}`,
+      );
+    },
+  );
+
+  const attachPendingPhotos = tool(
+    "attach_pending_photos",
+    "Attach the photos this owner recently sent in this chat (not yet attached to any product) to the given product code. Use after the owner sends a listing's photos.",
+    { code: z.string().describe("Product code to attach the pending photos to") },
+    async ({ code }) => {
+      const product = repo.getProductByCode(db, code);
+      if (!product) return text(`No product found with code ${code}. Create it first with upsert_product.`);
+      const count = repo.attachPendingPhotos(db, ctx.phone, product.id);
+      return text(
+        count > 0
+          ? `Attached ${count} photo(s) to product ${code}.`
+          : `No pending photos from this chat to attach.`,
+      );
+    },
+  );
+
+  const listProductsTool = tool(
+    "list_products",
+    "List products, optionally filtered by status (draft, active, sold, inactive).",
+    { status: z.enum(["draft", "active", "sold", "inactive"]).optional() },
+    async ({ status }) => {
+      const products = repo.listProducts(db, status);
+      if (products.length === 0) return text("No products found.");
+      return text(products.map(describeProduct).join("\n"));
+    },
+  );
+
+  const listLeadsTool = tool(
+    "list_leads",
+    "List captured leads (inquiries and visit requests), optionally limited to the last N days.",
+    { since_days: z.number().optional().describe("Only leads from the last N days") },
+    async ({ since_days }) => {
+      const leads = repo.listLeads(db, since_days);
+      if (leads.length === 0) return text("No leads found.");
+      return text(
+        leads
+          .map(
+            (l) =>
+              `#${l.id} ${l.type} phone=${l.phone} code=${l.product_code ?? "-"} name=${l.name ?? "-"} note=${l.note ?? "-"} at=${l.created_at}`,
+          )
+          .join("\n"),
+      );
+    },
+  );
+
+  const ownerTools = [
+    ...customerTools,
+    upsertProduct,
+    attachPendingPhotos,
+    listProductsTool,
+    listLeadsTool,
+  ];
+
+  return {
+    server: createSdkMcpServer({ name: MCP_SERVER_NAME, version: "1.0.0", tools: ownerTools }),
+    toolNames: ownerTools.map((t) => `mcp__${MCP_SERVER_NAME}__${t.name}`),
+  };
+}
