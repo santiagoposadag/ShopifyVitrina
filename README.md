@@ -194,7 +194,7 @@ Bot:  (upsert_product) Corregido: el apartamento ahora tiene el código 1912.
 
 ```bash
 npm test          # server unit tests (vitest) — no network, Kapso/Claude mocked
-npm run build     # server typecheck (tsc --noEmit) + next build
+npm run build     # server typecheck + tsc build (dist/) + next build
 npm run seed      # (re)seed the catalog
 ```
 
@@ -203,6 +203,39 @@ idempotency dedupe, batch-envelope parsing, inbound message extraction (text / i
 interactive / outbound-ignored), per-phone queue ordering (including on failure) and
 cross-phone concurrency, `search_catalog` filtering, `upsert_product` merge + audit trail,
 `attach_pending_photos`, and listing-parser sanity (including the 008→1912 correction).
+
+---
+
+## Docker
+
+`compose.yaml` runs `server` (Fastify) and `web` (Next.js) as separate images sharing
+one SQLite database + media directory over a named volume. Works the same for local
+testing and for a copy-paste deploy onto a real server.
+
+```bash
+cp env.sample .env                                    # fill in the values first
+docker compose build
+docker compose --profile seed run --rm seed           # one-time: seed the catalog
+docker compose up -d
+docker compose logs -f                                # tail both services
+docker compose down                                   # stop (add -v to also drop the data volume)
+```
+
+Notes:
+
+- `seed` only runs when explicitly invoked with `--profile seed` — it never runs on a
+  plain `docker compose up`. It needs no Kapso/Anthropic keys, only `DB_PATH` /
+  `MEDIA_DIR` / `PUBLIC_BASE_URL` (all provided by compose or defaulted).
+- `NEXT_PUBLIC_BRAND_NAME` and `NEXT_PUBLIC_WHATSAPP_NUMBER` are inlined into the web
+  bundle at **build** time. Set them in `.env` before `docker compose build`, not just in
+  the running container's environment — otherwise the WhatsApp CTA silently breaks.
+- On a real server, `PUBLIC_BASE_URL` (in `.env`, used by the `server` and `seed`
+  services) must point at the public tunnel/domain that Kapso/WhatsApp can reach —
+  never `localhost` — or WhatsApp cannot fetch photo URLs.
+- The data volume (`vitrina-data`) is a Docker-managed named volume, not a host bind
+  mount, so it already has the right ownership for the containers' non-root user.
+- The `web` container mounts the data volume read-write even though it only reads: SQLite
+  in WAL mode writes the `-shm` / `-wal` sidecar files even for read-only connections.
 
 ---
 

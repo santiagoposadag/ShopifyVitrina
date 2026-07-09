@@ -1,0 +1,76 @@
+services:
+  server:
+    image: vitrina-server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    env_file:
+      - .env
+    environment:
+      # Absolute paths inside the container. server/src/config.ts short-circuits
+      # on isAbsolute(), so these override anything set in .env.
+      DB_PATH: /data/vitrina.db
+      MEDIA_DIR: /data/media
+      PORT: "3001"
+    ports:
+      - "3001:3001"
+    volumes:
+      - vitrina-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+  web:
+    image: vitrina-web
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        # NEXT_PUBLIC_* vars are inlined at build time by Next.js — they must
+        # be build args, not just runtime `environment:` below.
+        NEXT_PUBLIC_BRAND_NAME: ${NEXT_PUBLIC_BRAND_NAME:-Vitrina}
+        NEXT_PUBLIC_WHATSAPP_NUMBER: ${NEXT_PUBLIC_WHATSAPP_NUMBER:-}
+    environment:
+      DB_PATH: /data/vitrina.db
+      MEDIA_DIR: /data/media
+    ports:
+      - "3000:3000"
+    volumes:
+      # Read-write, NOT read-only: SQLite in WAL mode writes -shm and -wal
+      # sidecar files next to the DB even for read-only queries, so a
+      # read-only mount here would break every read the storefront does.
+      - vitrina-data:/data
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Seeds the two example properties. Excluded from `docker compose up` via
+  # the "seed" profile — run it explicitly with:
+  #   docker compose --profile seed run --rm seed
+  # Shares the server image (same `image:` tag) so it is built only once.
+  seed:
+    image: vitrina-server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    env_file:
+      - .env
+    environment:
+      DB_PATH: /data/vitrina.db
+      MEDIA_DIR: /data/media
+    command: ["node", "server/dist/seed.js"]
+    volumes:
+      - vitrina-data:/data
+    profiles: ["seed"]
+
+volumes:
+  # A named volume (not a host bind mount): the image already creates /data
+  # owned by the non-root `node` user (see the Dockerfiles). A named volume
+  # inherits that ownership on first use; a host bind mount would land
+  # root-owned on most hosts and the non-root process could not write to it.
+  vitrina-data: {}
