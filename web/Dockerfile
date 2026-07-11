@@ -4,7 +4,7 @@
 #   docker build -f web/Dockerfile -t vitrina-web .
 # or via compose.yaml, which already sets context: . for this file.
 #
-# next.config.ts sets serverExternalPackages: ["better-sqlite3"] and does NOT
+# next.config.mjs sets serverExternalPackages: ["better-sqlite3"] and does NOT
 # use output: "standalone", so the runtime image needs the real node_modules
 # (with the compiled native binary), .next/, web/package.json, and the root
 # package.json — not a pruned standalone bundle.
@@ -63,7 +63,10 @@ COPY --from=prod-deps /app/web/node_modules ./web/node_modules
 COPY --from=build --chown=node:node /app/web/.next ./web/.next
 COPY package.json ./
 COPY web/package.json web/package.json
-COPY web/next.config.ts web/next.config.ts
+# Plain .mjs, NOT .ts: `next start` cannot load a TypeScript config without
+# typescript installed, and typescript is a devDependency absent from this
+# runtime image (Next would try to `yarn add` it at container startup).
+COPY web/next.config.mjs web/next.config.mjs
 
 RUN mkdir -p /data && chown -R node:node /data
 USER node
