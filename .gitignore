@@ -5,3 +5,6 @@ data/
 *.log
 dist/
 .DS_Store
+
+.codegraph/
+.playwright-mcp/
