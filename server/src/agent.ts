@@ -74,7 +74,7 @@ export async function runAgentTurn(
 ): Promise<string> {
   const { db, kapso, config } = deps;
   const { server, toolNames } = buildToolServer({ db, kapso, config, ctx });
-  const resumeId = getSessionId(db, ctx.phone);
+  const resumeId = getSessionId(db, ctx.phone, config.sessionMaxAgeDays);
 
   let capturedSessionId: string | undefined;
   let resultText = "";

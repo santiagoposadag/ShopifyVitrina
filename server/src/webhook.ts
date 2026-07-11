@@ -1,15 +1,22 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyBaseLogger, FastifyInstance, FastifyRequest } from "fastify";
 import type { Config } from "./config.js";
 import type { DB } from "./db.js";
 import type { KapsoClient } from "./kapso.js";
 import { saveMedia } from "./media.js";
-import { addPendingMedia, markProcessed } from "./repo.js";
+import {
+  addPendingMedia,
+  getInboxRow,
+  insertInboxMessage,
+  listReplayableInbox,
+  markInboxDone,
+  markInboxFailed,
+  markInboxProcessing,
+} from "./repo.js";
 import type { PerPhoneQueue } from "./queue.js";
 import type { TurnContext } from "./types.js";
 
 export const SIGNATURE_HEADER = "x-webhook-signature";
-export const IDEMPOTENCY_HEADER = "x-idempotency-key";
 
 // Total wall-clock budget for downloading inbound media during a single webhook
 // request. Kept well under Kapso's 10s ACK deadline so the response never waits
@@ -168,8 +175,46 @@ export interface WebhookDeps {
   roleFor: (phone: string) => TurnContext["role"];
 }
 
+/**
+ * Process one persisted inbox row through the agent worker. The status
+ * transitions are what make delivery at-least-once: a crash leaves the row
+ * 'pending' or 'processing', and replayPendingInbox re-enqueues it on boot.
+ * Never throws — a failure marks the row 'failed' and is logged.
+ */
+async function processInboxRow(
+  deps: WebhookDeps,
+  log: FastifyBaseLogger,
+  id: number,
+): Promise<void> {
+  const row = getInboxRow(deps.db, id);
+  if (!row || row.status === "done") return;
+  markInboxProcessing(deps.db, id);
+  const ctx: TurnContext = { phone: row.phone, role: deps.roleFor(row.phone) };
+  try {
+    await deps.onMessage(ctx, row.agent_text);
+    markInboxDone(deps.db, id);
+  } catch (err) {
+    markInboxFailed(deps.db, id);
+    log.error({ err, phone: row.phone, inboxId: id }, "inbox message failed");
+  }
+}
+
+/**
+ * Re-enqueue inbox rows a previous process accepted but never finished. Call
+ * once on boot, BEFORE listening, so replayed messages enter each phone's
+ * queue ahead of new webhook traffic and per-phone ordering holds.
+ */
+export function replayPendingInbox(log: FastifyBaseLogger, deps: WebhookDeps): number {
+  const rows = listReplayableInbox(deps.db);
+  for (const row of rows) {
+    void deps.queue.enqueue(row.phone, () => processInboxRow(deps, log, row.id));
+  }
+  if (rows.length > 0) log.info(`Replaying ${rows.length} unfinished inbox message(s)`);
+  return rows.length;
+}
+
 export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
-  const { config, db, kapso, queue, onMessage, roleFor } = deps;
+  const { config, db, kapso, queue, roleFor } = deps;
 
   // Keep the raw body so we can verify the signature over exact bytes.
   app.addContentTypeParser(
@@ -195,14 +240,6 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
       return reply.code(401).send({ error: "invalid_signature" });
     }
 
-    // Idempotency: drop duplicates that Kapso retries at 10/40/90s.
-    const idemHeader = request.headers[IDEMPOTENCY_HEADER];
-    const idemKey = Array.isArray(idemHeader) ? idemHeader[0] : idemHeader;
-    if (idemKey) {
-      const fresh = markProcessed(db, idemKey);
-      if (!fresh) return reply.code(200).send({ status: "duplicate" });
-    }
-
     const events = normalizeEvents(request.body);
 
     // Shared budget so the ACK never blocks on unbounded media downloads, even
@@ -212,18 +249,23 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
     for (const event of events) {
       const inbound = extractInbound(event);
       if (!inbound) continue;
+      // No agent-worthy content and no media side effects: skip entirely.
+      if (inbound.agentText.trim().length === 0 && inbound.kind !== "image") continue;
 
-      // Per-event dedupe with a stable fallback key: makes Kapso's 10/40/90s
-      // retries idempotent even when the request-level header is absent.
-      const dedupeKey = stableEventKey(event, inbound.id);
-      if (!markProcessed(db, dedupeKey)) continue;
-
-      const ctx: TurnContext = { phone: inbound.from, role: roleFor(inbound.from) };
+      // Persist BEFORE processing: the UNIQUE dedupe key absorbs Kapso's
+      // 10/40/90s retries, and a crash before the agent runs is replayed on
+      // boot instead of silently losing the message (at-least-once).
+      const row = insertInboxMessage(db, {
+        dedupe_key: stableEventKey(event, inbound.id),
+        phone: inbound.from,
+        agent_text: inbound.agentText,
+      });
+      if (!row) continue; // Retry of an event we already persisted.
 
       // Persist inbound media ONLY for owners (they ingest listings). Customers'
       // images are acknowledged in the agent context but never stored/served.
       // Download is bounded and non-fatal so a slow fetch cannot delay the ACK.
-      if (inbound.media && ctx.role === "owner") {
+      if (inbound.media && roleFor(inbound.from) === "owner") {
         try {
           const buffer = await kapso.downloadMedia(inbound.media.url, mediaDeadline);
           const saved = await saveMedia(config, buffer, {
@@ -242,10 +284,8 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
         }
       }
 
-      if (inbound.agentText.trim().length === 0 && inbound.kind !== "image") continue;
-
       // Enqueue with per-phone serialization; do NOT await the agent inline.
-      void queue.enqueue(ctx.phone, () => onMessage(ctx, inbound.agentText));
+      void queue.enqueue(row.phone, () => processInboxRow(deps, request.log, row.id));
     }
 
     // ACK fast; the agent runs on the async worker.

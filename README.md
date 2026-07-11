@@ -54,9 +54,12 @@ Customer / Owner (WhatsApp)
 - `src/db.ts` — SQLite (WAL), schema created on boot.
 - `src/repo.ts` — all catalog/lead/session queries.
 - `src/kapso.ts` — Kapso REST client: `sendText`, `sendImage`, `sendInteractiveButtons`, `downloadMedia`.
-- `src/webhook.ts` — `POST /webhook`: HMAC verify (raw body), idempotency dedupe, batch envelope, immediate media download, per-phone enqueue, fast ACK.
+- `src/webhook.ts` — `POST /webhook`: HMAC verify (raw body), batch envelope, persisted inbox (dedupe + at-least-once: unfinished messages are replayed on boot), immediate media download, per-phone enqueue, fast ACK.
 - `src/queue.ts` — in-process FIFO with per-phone serialization.
-- `src/agent.ts` — Claude Agent SDK integration: resume per-phone session, run tools, reply in Spanish.
+- `src/agent.ts` — Claude Agent SDK integration: resume per-phone session (idle sessions expire after `SESSION_MAX_AGE_DAYS`), run tools, reply in Spanish.
+- `src/rate-limit.ts` — cost protection: per-phone sliding-hour limit + global daily cap for customer turns (owners exempt).
+- `src/alerts.ts` — notifies the owner's WhatsApp after consecutive agent failures.
+- `src/backup.ts` — consistent SQLite snapshot (online backup API) with pruning.
 - `src/tools.ts` — in-process MCP tools. Customer: `search_catalog`, `get_product`, `send_product_photos`, `save_lead`. Owner (allowlist): the above plus `upsert_product`, `attach_pending_photos`, `list_products`, `list_leads`.
 - `src/media.ts` — serves `MEDIA_DIR` under `/media/*`; saves inbound media.
 - `src/seed.ts` — parses the two example properties and inserts them as **active** with photos.
@@ -88,6 +91,16 @@ npm install
 
 ### 2. Environment
 
+Preferred: secrets live GPG-encrypted in [gopass](https://github.com/gopasspw/gopass)
+and are injected at runtime by the wrapper script — no `.env` needed for them
+(setup in `docs/secrets-management.md`):
+
+```bash
+./scripts/with-secrets.sh npm run dev -w server
+```
+
+Fallback: a plain `.env` file still works everywhere:
+
 ```bash
 cp env.sample .env      # then edit .env
 ```
@@ -106,6 +119,8 @@ Every variable is documented in `env.sample`. Key ones:
 | `OWNER_PHONE_NUMBERS` | Comma-separated allowlist (E.164 digits, no `+`) that gets the owner toolset. |
 | `DB_PATH`, `MEDIA_DIR` | Shared by server and web. Relative paths resolve to the **repo root**, so both apps agree regardless of the workspace they run from. |
 | `PUBLIC_BASE_URL` | Public URL of the server (a tunnel) — used to build photo URLs WhatsApp can fetch. |
+| `RATE_LIMIT_PER_PHONE_PER_HOUR`, `RATE_LIMIT_GLOBAL_PER_DAY` | Cost protection for customer agent turns (defaults 20/hour per phone, 500/day global; owners exempt). |
+| `SESSION_MAX_AGE_DAYS` | Conversations idle longer than this start a fresh agent session (default 7). |
 
 ### 3. Seed the catalog
 
@@ -199,10 +214,13 @@ npm run seed      # (re)seed the catalog
 ```
 
 Tests cover: webhook signature verification (valid / wrong-secret / tampered / missing),
-idempotency dedupe, batch-envelope parsing, inbound message extraction (text / image /
-interactive / outbound-ignored), per-phone queue ordering (including on failure) and
-cross-phone concurrency, `search_catalog` filtering, `upsert_product` merge + audit trail,
-`attach_pending_photos`, and listing-parser sanity (including the 008→1912 correction).
+inbox dedupe + at-least-once lifecycle (replay of unfinished rows, TTL cleanup),
+batch-envelope parsing, inbound message extraction (text / image / interactive /
+outbound-ignored), per-phone queue ordering (including on failure) and cross-phone
+concurrency, rate limiting (sliding window, global cap, notice throttling), failure
+alerting, session expiry, the owner/customer tool privilege boundary, `search_catalog`
+filtering, `upsert_product` merge + audit trail, `attach_pending_photos`, and
+listing-parser sanity (including the 008→1912 correction).
 
 ---
 
@@ -213,13 +231,16 @@ one SQLite database + media directory over a named volume. Works the same for lo
 testing and for a copy-paste deploy onto a real server.
 
 ```bash
-cp env.sample .env                                    # fill in the values first
 docker compose build
-docker compose --profile seed run --rm seed           # one-time: seed the catalog
-docker compose up -d
-docker compose logs -f                                # tail both services
-docker compose down                                   # stop (add -v to also drop the data volume)
+docker compose --profile seed run --rm seed               # one-time: seed the catalog
+./scripts/with-secrets.sh docker compose up -d             # secrets injected from gopass
+docker compose logs -f                                     # tail both services
+docker compose down                                        # stop (add -v to also drop the data volume)
 ```
+
+Without gopass, the fallback still works: `cp env.sample .env`, fill in the
+values, and run `docker compose up -d` directly — Compose interpolates the
+repo-root `.env` into the same variables.
 
 Notes:
 
@@ -236,6 +257,24 @@ Notes:
   mount, so it already has the right ownership for the containers' non-root user.
 - The `web` container mounts the data volume read-write even though it only reads: SQLite
   in WAL mode writes the `-shm` / `-wal` sidecar files even for read-only connections.
+
+### Backups
+
+The catalog and every captured lead live in one SQLite file — back it up. Snapshots
+use SQLite's online backup API (consistent even while the server is writing) and are
+pruned to the `BACKUP_KEEP` most recent (default 14):
+
+```bash
+./scripts/backup.sh                              # snapshot copied to ./backups on the host
+docker compose --profile backup run --rm backup  # snapshot inside the data volume only
+npm run backup -w server                         # local (non-Docker) development
+```
+
+Schedule the host script daily, e.g. with cron:
+
+```
+30 3 * * * cd /path/to/vitrina && ./scripts/backup.sh >> backups/backup.log 2>&1
+```
 
 ---
 
@@ -272,12 +311,18 @@ sandbox before production:
   acknowledged in the agent context but never stored/served); the owner tool moves
   matching rows for that phone into `product_photos`. Unattached pending media older than
   48h is purged on boot and hourly.
-- **Webhook hardening.** Dedupe is per-event with a stable fallback key (WhatsApp message
-  id, else a content hash) in addition to the request-level `x-idempotency-key`, so retries
-  are idempotent even without the header. Inbound media download is bounded by a ~6s shared
-  budget and is non-fatal, so the 200 ACK never waits on an unbounded network call. Media
-  downloads (which carry the API key) are refused unless the URL host is `kapso.ai` or a
-  `*.kapso.ai` subdomain.
+- **Webhook hardening.** Every inbound message is persisted to an `inbox` table BEFORE
+  processing: the unique per-event dedupe key (WhatsApp message id, else a content hash)
+  absorbs Kapso's 10/40/90s retries, and rows left unfinished by a crash are re-enqueued
+  on the next boot (at-least-once delivery instead of silent loss). Inbound media download
+  is bounded by a ~6s shared budget and is non-fatal, so the 200 ACK never waits on an
+  unbounded network call. Media downloads (which carry the API key) are refused unless the
+  URL host is `kapso.ai` or a `*.kapso.ai` subdomain.
+- **Cost protection.** Customer agent turns are rate limited (sliding per-phone hourly
+  window + global daily circuit breaker; owners exempt) so strangers cannot run up the
+  Anthropic bill. Idle sessions expire after `SESSION_MAX_AGE_DAYS` so long-lived contacts
+  do not drag months of history — and cost — into every turn. After repeated consecutive
+  agent failures the owner is notified on WhatsApp (throttled to once per hour).
 - **Storefront photo serving.** Rather than copying `MEDIA_DIR` into `web/public`, the
   web app serves photos through its own `/media/[file]` route reading `MEDIA_DIR`
   directly — robust and independent of the server process.

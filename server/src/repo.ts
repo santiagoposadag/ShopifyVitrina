@@ -252,7 +252,7 @@ export function listLeads(db: DB, sinceDays?: number): Lead[] {
   return db.prepare(`SELECT * FROM leads ORDER BY created_at DESC`).all() as Lead[];
 }
 
-// --- Contacts / sessions / dedupe -------------------------------------------
+// --- Contacts / sessions ------------------------------------------------------
 
 export function upsertContact(
   db: DB,
@@ -270,10 +270,23 @@ export function upsertContact(
   ).run({ phone, name: name ?? null, role });
 }
 
-export function getSessionId(db: DB, phone: string): string | undefined {
-  const row = db.prepare(`SELECT agent_session_id FROM sessions WHERE phone = ?`).get(phone) as
-    | { agent_session_id: string | null }
-    | undefined;
+/**
+ * Get the resumable agent session for a phone. When maxAgeDays is given,
+ * sessions idle longer than that are treated as expired (returns undefined) so
+ * long-lived contacts start a fresh conversation instead of dragging months of
+ * history — and cost — into every turn.
+ */
+export function getSessionId(db: DB, phone: string, maxAgeDays?: number): string | undefined {
+  const row = (
+    maxAgeDays !== undefined
+      ? db
+          .prepare(
+            `SELECT agent_session_id FROM sessions
+             WHERE phone = ? AND updated_at >= datetime('now', ?)`,
+          )
+          .get(phone, `-${maxAgeDays} days`)
+      : db.prepare(`SELECT agent_session_id FROM sessions WHERE phone = ?`).get(phone)
+  ) as { agent_session_id: string | null } | undefined;
   return row?.agent_session_id ?? undefined;
 }
 
@@ -287,12 +300,90 @@ export function setSessionId(db: DB, phone: string, sessionId: string): void {
   ).run(phone, sessionId);
 }
 
-/** Returns true when the key was newly recorded, false when already seen. */
-export function markProcessed(db: DB, idempotencyKey: string): boolean {
+// --- Inbox (at-least-once message processing) --------------------------------
+
+export type InboxStatus = "pending" | "processing" | "done" | "failed";
+
+export interface InboxRow {
+  id: number;
+  dedupe_key: string;
+  phone: string;
+  agent_text: string;
+  status: InboxStatus;
+  attempts: number;
+  received_at: string;
+  processed_at: string | null;
+}
+
+/**
+ * Persist an inbound message for processing. Returns the new row, or null when
+ * the dedupe key was already recorded (a Kapso retry of a persisted event).
+ */
+export function insertInboxMessage(
+  db: DB,
+  input: { dedupe_key: string; phone: string; agent_text: string },
+): InboxRow | null {
   const info = db
-    .prepare(`INSERT OR IGNORE INTO processed_messages (idempotency_key) VALUES (?)`)
-    .run(idempotencyKey);
-  return info.changes > 0;
+    .prepare(
+      `INSERT OR IGNORE INTO inbox (dedupe_key, phone, agent_text)
+       VALUES (@dedupe_key, @phone, @agent_text)`,
+    )
+    .run(input);
+  if (info.changes === 0) return null;
+  return getInboxRow(db, Number(info.lastInsertRowid));
+}
+
+export function getInboxRow(db: DB, id: number): InboxRow | null {
+  const row = db.prepare(`SELECT * FROM inbox WHERE id = ?`).get(id) as InboxRow | undefined;
+  return row ?? null;
+}
+
+export function markInboxProcessing(db: DB, id: number): void {
+  db.prepare(`UPDATE inbox SET status = 'processing', attempts = attempts + 1 WHERE id = ?`).run(
+    id,
+  );
+}
+
+export function markInboxDone(db: DB, id: number): void {
+  db.prepare(`UPDATE inbox SET status = 'done', processed_at = datetime('now') WHERE id = ?`).run(
+    id,
+  );
+}
+
+export function markInboxFailed(db: DB, id: number): void {
+  db.prepare(`UPDATE inbox SET status = 'failed', processed_at = datetime('now') WHERE id = ?`).run(
+    id,
+  );
+}
+
+/**
+ * Rows a previous process accepted but never finished: 'pending' (crashed
+ * before the queue ran it) or 'processing' (crashed mid agent turn). Ordered by
+ * id so per-phone ordering is preserved when re-enqueued.
+ */
+export function listReplayableInbox(db: DB): InboxRow[] {
+  return db
+    .prepare(`SELECT * FROM inbox WHERE status IN ('pending','processing') ORDER BY id ASC`)
+    .all() as InboxRow[];
+}
+
+/**
+ * TTL cleanup for settled inbox rows. Done rows only serve dedupe, so a few
+ * days beyond Kapso's retry window is plenty; failed rows are kept longer for
+ * diagnosis. Returns the number of rows deleted.
+ */
+export function deleteStaleInboxRows(
+  db: DB,
+  doneOlderThanDays = 7,
+  failedOlderThanDays = 30,
+): number {
+  const done = db
+    .prepare(`DELETE FROM inbox WHERE status = 'done' AND processed_at < datetime('now', ?)`)
+    .run(`-${doneOlderThanDays} days`);
+  const failed = db
+    .prepare(`DELETE FROM inbox WHERE status = 'failed' AND processed_at < datetime('now', ?)`)
+    .run(`-${failedOlderThanDays} days`);
+  return done.changes + failed.changes;
 }
 
 // --- Pending media ----------------------------------------------------------

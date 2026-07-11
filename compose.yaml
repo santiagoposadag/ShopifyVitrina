@@ -1,17 +1,38 @@
+# Shared environment blocks (YAML anchors) so the services that need the same
+# variables cannot drift apart.
+#
+# Secrets and per-deploy config arrive via ${VAR} interpolation, which Compose
+# resolves from the parent shell env OR a repo-root .env file.
+# Preferred flow: ./scripts/with-secrets.sh docker compose up -d
+# (exports the secrets from gopass); a plain .env still works as fallback.
+x-secrets-env: &secrets-env
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  KAPSO_API_KEY: ${KAPSO_API_KEY}
+  KAPSO_PHONE_NUMBER_ID: ${KAPSO_PHONE_NUMBER_ID}
+  KAPSO_WEBHOOK_SECRET: ${KAPSO_WEBHOOK_SECRET}
+  OWNER_PHONE_NUMBERS: ${OWNER_PHONE_NUMBERS:-}
+
+# Absolute paths inside the containers. server/src/config.ts short-circuits on
+# isAbsolute(), so these override anything set in .env.
+x-data-env: &data-env
+  DB_PATH: /data/vitrina.db
+  MEDIA_DIR: /data/media
+
 services:
   server:
     image: vitrina-server
     build:
       context: .
       dockerfile: server/Dockerfile
-    env_file:
-      - .env
     environment:
-      # Absolute paths inside the container. server/src/config.ts short-circuits
-      # on isAbsolute(), so these override anything set in .env.
-      DB_PATH: /data/vitrina.db
-      MEDIA_DIR: /data/media
+      <<: [*secrets-env, *data-env]
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
       PORT: "3001"
+      # Cost/abuse protection and session lifetime. Empty values fall back to
+      # the defaults in server/src/config.ts (20/hour, 500/day, 7 days).
+      RATE_LIMIT_PER_PHONE_PER_HOUR: ${RATE_LIMIT_PER_PHONE_PER_HOUR:-}
+      RATE_LIMIT_GLOBAL_PER_DAY: ${RATE_LIMIT_GLOBAL_PER_DAY:-}
+      SESSION_MAX_AGE_DAYS: ${SESSION_MAX_AGE_DAYS:-}
     ports:
       - "3001:3001"
     volumes:
@@ -35,10 +56,11 @@ services:
         NEXT_PUBLIC_BRAND_NAME: ${NEXT_PUBLIC_BRAND_NAME:-Vitrina}
         NEXT_PUBLIC_WHATSAPP_NUMBER: ${NEXT_PUBLIC_WHATSAPP_NUMBER:-}
     environment:
-      DB_PATH: /data/vitrina.db
-      MEDIA_DIR: /data/media
+      <<: *data-env
     ports:
-      - "3000:3000"
+      # Host port is configurable so the storefront can coexist with other
+      # local apps that claim 3000 (set WEB_PORT in the shell or compose .env).
+      - "${WEB_PORT:-3000}:3000"
     volumes:
       # Read-write, NOT read-only: SQLite in WAL mode writes -shm and -wal
       # sidecar files next to the DB even for read-only queries, so a
@@ -53,20 +75,37 @@ services:
   # the "seed" profile — run it explicitly with:
   #   docker compose --profile seed run --rm seed
   # Shares the server image (same `image:` tag) so it is built only once.
+  # Needs no secrets (seed.ts never reads them), but DOES need PUBLIC_BASE_URL:
+  # it is baked into the seeded photo URLs that WhatsApp later fetches.
   seed:
     image: vitrina-server
     build:
       context: .
       dockerfile: server/Dockerfile
-    env_file:
-      - .env
     environment:
-      DB_PATH: /data/vitrina.db
-      MEDIA_DIR: /data/media
+      <<: *data-env
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
     command: ["node", "server/dist/seed.js"]
     volumes:
       - vitrina-data:/data
     profiles: ["seed"]
+
+  # One-off consistent SQLite snapshot (online backup API, safe under writes).
+  #   docker compose --profile backup run --rm backup   # snapshot inside the volume
+  #   ./scripts/backup.sh                               # snapshot copied to ./backups on the host
+  backup:
+    image: vitrina-server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      <<: *data-env
+      BACKUP_DIR: ${BACKUP_DIR:-/data/backups}
+      BACKUP_KEEP: ${BACKUP_KEEP:-}
+    command: ["node", "server/dist/backup.js"]
+    volumes:
+      - vitrina-data:/data
+    profiles: ["backup"]
 
 volumes:
   # A named volume (not a host bind mount): the image already creates /data

@@ -26,6 +26,12 @@ export interface Config {
   publicBaseUrl: string;
   port: number;
   model: string;
+  /** Agent sessions idle longer than this many days start fresh. */
+  sessionMaxAgeDays: number;
+  /** Max agent turns per customer phone per sliding hour (owners exempt). */
+  rateLimitPerPhonePerHour: number;
+  /** Max customer agent turns per day across all phones (circuit breaker). */
+  rateLimitGlobalPerDay: number;
 }
 
 function required(name: string): string {
@@ -39,6 +45,15 @@ function required(name: string): string {
 function optional(name: string, fallback: string): string {
   const value = process.env[name];
   return value === undefined || value.trim() === "" ? fallback : value.trim();
+}
+
+function optionalInt(name: string, fallback: number): number {
+  const raw = optional(name, String(fallback));
+  const value = Number.parseInt(raw, 10);
+  if (Number.isNaN(value) || value < 1) {
+    throw new Error(`Invalid value for ${name}: expected a positive integer, got "${raw}"`);
+  }
+  return value;
 }
 
 /** Normalize a phone number to bare E.164 digits (strip '+', spaces, dashes). */
@@ -65,6 +80,9 @@ export function loadConfig(): Config {
     publicBaseUrl: optional("PUBLIC_BASE_URL", "http://localhost:3001").replace(/\/+$/, ""),
     port: Number.parseInt(optional("PORT", "3001"), 10),
     model: optional("MODEL", "claude-haiku-4-5"),
+    sessionMaxAgeDays: optionalInt("SESSION_MAX_AGE_DAYS", 7),
+    rateLimitPerPhonePerHour: optionalInt("RATE_LIMIT_PER_PHONE_PER_HOUR", 20),
+    rateLimitGlobalPerDay: optionalInt("RATE_LIMIT_GLOBAL_PER_DAY", 500),
   };
 }
 
