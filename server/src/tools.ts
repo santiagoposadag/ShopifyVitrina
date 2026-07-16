@@ -5,9 +5,17 @@ import type { DB } from "./db.js";
 import type { KapsoClient } from "./kapso.js";
 import { previewLineFor } from "./preview.js";
 import * as repo from "./repo.js";
-import type { Product, ProductAttributeUpdates, TurnContext } from "./types.js";
+import type { Product, ProductAttributeUpdates, ProductStatus, TurnContext } from "./types.js";
 
 export const MCP_SERVER_NAME = "vitrina";
+
+/** True when this upsert PUBLISHED the product: it is now active and was not before. */
+export function isPublishTransition(
+  previous: ProductStatus | undefined,
+  next: ProductStatus,
+): boolean {
+  return next === "active" && previous !== "active";
+}
 
 export interface ToolDeps {
   db: DB;
@@ -158,11 +166,16 @@ export function buildToolServer(deps: ToolDeps) {
           return text("attributes_json was not valid JSON. Ask again or send it differently.");
         }
       }
+      const previousStatus = repo.getProductByCode(db, code)?.status;
       const { product, created } = repo.upsertProduct(
         db,
         { code, title, description, price, status, attributes },
         ctx.phone,
       );
+      // Publishing marks the end of a unit of work: ask runAgentTurn to start
+      // the next message on a fresh session, so the history stays lean and one
+      // product's details cannot bleed into the next one.
+      if (isPublishTransition(previousStatus, product.status)) ctx.sessionAfterTurn = "reset";
       return text(
         `${created ? "Created" : "Updated"} product: ${describeProduct(product)}` +
           previewLineFor(config, product),

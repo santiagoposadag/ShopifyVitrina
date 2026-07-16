@@ -175,3 +175,71 @@ describe("runAgentTurn session fallback", () => {
     expect(queryMock).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("runAgentTurn session reset after publish", () => {
+  let db: DB;
+  let sent: string[];
+  let deps: Parameters<typeof runAgentTurn>[0];
+
+  beforeEach(() => {
+    queryMock.mockReset();
+    db = openDb(":memory:");
+    sent = [];
+    deps = {
+      db,
+      config: CONFIG,
+      log: { warn: () => undefined } as never,
+      kapso: {
+        sendText: async (_phone: string, text: string) => {
+          sent.push(text);
+        },
+      } as unknown as KapsoClient,
+    };
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("clears the stored session instead of persisting when a tool requested a reset", async () => {
+    // Fresh ctx per test: the flag mutates it, exactly as the tool does.
+    const ctx: TurnContext = { phone: PHONE, role: "owner" };
+    setSessionId(db, PHONE, "session-abc");
+    queryMock.mockImplementationOnce(() => {
+      ctx.sessionAfterTurn = "reset"; // upsert_product on a publish transition
+      return successStream("session-new", "Listo, publiqué el código 0195");
+    });
+
+    const reply = await runAgentTurn(deps, ctx, "publícalo");
+
+    expect(reply).toBe("Listo, publiqué el código 0195");
+    expect(sent).toEqual(["Listo, publiqué el código 0195"]); // the reply still goes out
+    expect(getSessionId(db, PHONE)).toBeUndefined(); // cleared, NOT replaced by session-new
+  });
+
+  it("without the flag, the new session id is persisted as before", async () => {
+    const ctx: TurnContext = { phone: PHONE, role: "owner" };
+    queryMock.mockReturnValueOnce(successStream("session-new", "Hola"));
+
+    await runAgentTurn(deps, ctx, "hola");
+
+    expect(getSessionId(db, PHONE)).toBe("session-new");
+  });
+
+  it("keeps the reset when the resume failed and the fresh retry published", async () => {
+    // Attempt 1 resumes a dead session but its tools already committed the
+    // publish before dying — the reset must stick regardless of which attempt
+    // confirmed it.
+    const ctx: TurnContext = { phone: PHONE, role: "owner" };
+    setSessionId(db, PHONE, "session-dead");
+    queryMock.mockReturnValueOnce(exitingStream());
+    queryMock.mockImplementationOnce(() => {
+      ctx.sessionAfterTurn = "reset";
+      return successStream("session-fresh", "Listo, publiqué el código 0195");
+    });
+
+    await runAgentTurn(deps, ctx, "publícalo");
+
+    expect(getSessionId(db, PHONE)).toBeUndefined();
+  });
+});

@@ -1,27 +1,12 @@
 import Database from "better-sqlite3";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
+// Shared with the server (both read the same SQLite rows) — type-only,
+// erased at compile time (see shared/index.d.ts).
+import type { ProductAttributes } from "@vitrina/shared";
 import { dbPath } from "./paths";
 
-export interface ProductAttributes {
-  area_m2?: number;
-  /** Lot size in m² — for a house this is a primary decision factor. */
-  lot_m2?: number;
-  bedrooms?: number;
-  bathrooms?: number;
-  neighborhood?: string;
-  city?: string;
-  features?: string[];
-  admin_fee?: number;
-  /** Annual property tax (predial), in COP. */
-  property_tax?: number;
-  estrato?: number;
-  levels?: number;
-  floor?: number;
-  elevator?: boolean;
-  negotiable?: boolean;
-  [key: string]: unknown;
-}
+export type { ProductAttributes };
 
 export interface Product {
   id: number;

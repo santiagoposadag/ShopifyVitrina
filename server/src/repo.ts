@@ -382,24 +382,22 @@ export function getInboxRow(db: DB, id: number): InboxRow | null {
  * two batches from claiming the same rows.
  */
 export function claimInboxBatch(db: DB, phone: string): InboxRow[] {
-  const rows = db
-    .prepare(
-      `SELECT * FROM inbox
-       WHERE phone = ? AND status IN ('pending','processing')
-       ORDER BY received_at ASC, id ASC`,
-    )
-    .all(phone) as InboxRow[];
-  if (rows.length === 0) return [];
-
+  const select = db.prepare(
+    `SELECT * FROM inbox
+     WHERE phone = ? AND status IN ('pending','processing')
+     ORDER BY received_at ASC, id ASC`,
+  );
   const claim = db.prepare(
     `UPDATE inbox SET status = 'processing', attempts = attempts + 1 WHERE id = ?`,
   );
-  const tx = db.transaction(() => {
+  // Read and claim share one transaction, so the batch is atomic even if a
+  // future caller ever violates the per-phone-queue invariant above.
+  const tx = db.transaction((): InboxRow[] => {
+    const rows = select.all(phone) as InboxRow[];
     for (const row of rows) claim.run(row.id);
+    return rows.map((row) => ({ ...row, status: "processing" as const, attempts: row.attempts + 1 }));
   });
-  tx();
-
-  return rows.map((row) => ({ ...row, status: "processing", attempts: row.attempts + 1 }));
+  return tx();
 }
 
 /** Settle a whole claimed batch. All-or-nothing: one agent turn, one outcome. */
@@ -417,6 +415,21 @@ export function markInboxBatchFailed(db: DB, ids: number[]): void {
   const mark = db.prepare(
     `UPDATE inbox SET status = 'failed', processed_at = datetime('now') WHERE id = ?`,
   );
+  const tx = db.transaction(() => {
+    for (const id of ids) mark.run(id);
+  });
+  tx();
+}
+
+/**
+ * Return a claimed batch to 'pending' for a delayed retry. attempts is NOT
+ * reset — it is the retry budget (see MAX_BATCH_ATTEMPTS in batcher.ts). The
+ * rows are re-claimed by the next flush for that phone, together with any newer
+ * messages, so a retried batch may grow; ordering holds because the old rows
+ * keep their original received_at/id.
+ */
+export function markInboxBatchPending(db: DB, ids: number[]): void {
+  const mark = db.prepare(`UPDATE inbox SET status = 'pending' WHERE id = ?`);
   const tx = db.transaction(() => {
     for (const id of ids) mark.run(id);
   });

@@ -4,6 +4,7 @@
   "private": true,
   "description": "Vitrina — a WhatsApp-native sales & inventory assistant.",
   "workspaces": [
+    "shared",
     "server",
     "web"
   ],

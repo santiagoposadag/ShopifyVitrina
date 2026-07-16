@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildBatchText,
   InboxBatcher,
+  MAX_BATCH_ATTEMPTS,
+  RETRY_DELAY_MS,
   type InboxBatcherDeps,
   type MessageKind,
 } from "../src/batcher.js";
@@ -25,11 +27,14 @@ interface Harness {
   batcher: InboxBatcher;
   /** One entry per agent turn: exactly what the agent was asked to answer. */
   turns: { phone: string; role: TurnContext["role"]; text: string }[];
+  /** One entry per failed attempt, in order — final marks the terminal one. */
+  failures: { phone: string; final: boolean; attempts: number }[];
 }
 
 function harness(overrides: Partial<InboxBatcherDeps> = {}): Harness {
   const db = openDb(":memory:");
   const turns: Harness["turns"] = [];
+  const failures: Harness["failures"] = [];
   const batcher = new InboxBatcher({
     db,
     queue: new PerPhoneQueue(),
@@ -42,9 +47,12 @@ function harness(overrides: Partial<InboxBatcherDeps> = {}): Harness {
     onMessage: async (ctx, text) => {
       turns.push({ phone: ctx.phone, role: ctx.role, text });
     },
+    onBatchFailure: async (ctx, { final, attempts }) => {
+      failures.push({ phone: ctx.phone, final, attempts });
+    },
     ...overrides,
   });
-  return { db, batcher, turns };
+  return { db, batcher, turns, failures };
 }
 
 /** Persist an inbound message and hand it to the batcher, as the webhook does. */
@@ -190,19 +198,159 @@ describe("InboxBatcher", () => {
     h.db.close();
   });
 
-  it("marks every row in the batch failed when the agent throws", async () => {
+  it("marks every row in the batch failed once the retry budget is spent", async () => {
+    let calls = 0;
     const h = harness({
       onMessage: async () => {
+        calls += 1;
         throw new Error("agent exploded");
       },
     });
     const first = receive(h, "573001", "uno");
     const second = receive(h, "573001", "dos");
 
-    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); // attempt 1
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS); // attempt 2
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS); // attempt 3 — terminal
 
+    expect(calls).toBe(MAX_BATCH_ATTEMPTS);
     expect(getInboxRow(h.db, first)?.status).toBe("failed");
     expect(getInboxRow(h.db, second)?.status).toBe("failed");
+    expect(getInboxRow(h.db, first)?.attempts).toBe(MAX_BATCH_ATTEMPTS);
+
+    // Terminal means terminal: nothing fires after settling.
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS * 2);
+    expect(calls).toBe(MAX_BATCH_ATTEMPTS);
+    h.db.close();
+  });
+
+  it("returns a failed batch to pending and succeeds on the retry", async () => {
+    let failuresLeft = 1;
+    const texts: string[] = [];
+    const h = harness({
+      onMessage: async (_ctx, text) => {
+        texts.push(text);
+        if (failuresLeft > 0) {
+          failuresLeft -= 1;
+          throw new Error("transient blip");
+        }
+      },
+    });
+    const id = receive(h, "573001", "uno");
+
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    expect(getInboxRow(h.db, id)?.status).toBe("pending"); // returned for retry, not failed
+    expect(getInboxRow(h.db, id)?.attempts).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS);
+    expect(getInboxRow(h.db, id)?.status).toBe("done");
+    expect(texts).toEqual(["uno", "uno"]); // the retry re-runs the same batch text
+    h.db.close();
+  });
+
+  it("does not retry before RETRY_DELAY_MS elapses", async () => {
+    let calls = 0;
+    const h = harness({
+      onMessage: async () => {
+        calls += 1;
+        throw new Error("boom");
+      },
+    });
+    receive(h, "573001", "uno");
+
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS - 1);
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(calls).toBe(2);
+    h.db.close();
+  });
+
+  it("reports final=true exactly once, on the last attempt", async () => {
+    const h = harness({
+      onMessage: async () => {
+        throw new Error("boom");
+      },
+    });
+    receive(h, "573001", "uno");
+
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS);
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS);
+
+    // One apology, not three: user-facing side effects hang off `final`.
+    expect(h.failures.map((f) => f.final)).toEqual([false, false, true]);
+    expect(h.failures.map((f) => f.attempts)).toEqual([1, 2, 3]);
+    h.db.close();
+  });
+
+  it("a retried batch absorbs messages that arrived while waiting", async () => {
+    let failuresLeft = 1;
+    const texts: string[] = [];
+    const h = harness({
+      onMessage: async (_ctx, text) => {
+        texts.push(text);
+        if (failuresLeft > 0) {
+          failuresLeft -= 1;
+          throw new Error("transient blip");
+        }
+      },
+    });
+    const a = receive(h, "573001", "uno");
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); // attempt 1 fails; retry armed
+
+    // A new message during the backoff opens a burst whose flush (8s < 30s)
+    // claims the pending retry row together with the new one.
+    const b = receive(h, "573001", "dos");
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+
+    expect(texts).toEqual(["uno", "uno\ndos"]);
+    expect(getInboxRow(h.db, a)?.status).toBe("done");
+    expect(getInboxRow(h.db, b)?.status).toBe("done");
+
+    // The retry timer still fires later and must be a no-op.
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS);
+    expect(texts).toHaveLength(2);
+    h.db.close();
+  });
+
+  it("stop() cancels a pending retry and leaves the rows replayable", async () => {
+    const h = harness({
+      onMessage: async () => {
+        throw new Error("boom");
+      },
+    });
+    const id = receive(h, "573001", "uno");
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); // attempt 1 fails, retry armed
+
+    h.batcher.stop();
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS * 3);
+
+    expect(h.failures).toHaveLength(1); // no retry ever ran
+    expect(getInboxRow(h.db, id)?.status).toBe("pending"); // replayed on next boot
+    h.db.close();
+  });
+
+  it("boot replay of a poison message settles as failed at the cap instead of looping", async () => {
+    const h = harness();
+    const row = insertInboxMessage(h.db, { dedupe_key: "k1", phone: "573001", agent_text: "veneno" });
+    if (!row) throw new Error("insert failed");
+    // Three earlier processes each claimed this row and crashed mid-turn: the
+    // budget is spent, so this boot must give up rather than crash-loop again.
+    h.db.prepare(`UPDATE inbox SET status = 'processing', attempts = ? WHERE id = ?`).run(
+      MAX_BATCH_ATTEMPTS,
+      row.id,
+    );
+
+    h.batcher.replayPending();
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+
+    expect(h.turns).toHaveLength(0); // the agent never runs
+    expect(getInboxRow(h.db, row.id)?.status).toBe("failed");
+    expect(h.failures).toEqual([
+      { phone: "573001", final: true, attempts: MAX_BATCH_ATTEMPTS + 1 },
+    ]);
     h.db.close();
   });
 

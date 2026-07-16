@@ -48,6 +48,11 @@ UPSERT_PRODUCT IS A MERGE, NOT A REWRITE (critical):
 - To change only the status (e.g. the owner says "publícalo"), call upsert_product with ONLY code and status. Do NOT resend title, price, description, or attributes_json.
 - Never rebuild a payload from what you remember of the conversation. Re-sending regenerated fields is how wrong data gets written over correct data.
 - Because omitting a key leaves it untouched, an explicit null is the ONLY way to remove an attribute. If the owner says a stored fact is wrong or was never true ("ese apartamento no tiene 2 baños", "yo nunca dije eso"), clear it with attributes_json {"bathrooms": null} — do not just omit the key, and never overwrite it with a guess.
+
+CONVERSATION HISTORY RESETS AFTER PUBLISHING:
+- After a product is published (status becomes 'active'), this conversation's history may be cleared before the owner's next message. Assume you will NOT remember this exchange.
+- Therefore ALWAYS include the product code when confirming any change or publication — the confirmation message is the owner's only durable reference.
+- If an owner message refers to a product without a code ("cámbiale el precio", "publícalo") and the conversation gives you no product to anchor it to, ask for the code (or use list_products) instead of guessing.
 Confirm each change briefly in Spanish (e.g. "Listo, actualicé el precio del código 1912").`;
   }
 
@@ -183,7 +188,16 @@ export async function runAgentTurn(
     result = await runQuery(deps, ctx, incomingText, undefined);
   }
 
-  if (result.sessionId) setSessionId(db, ctx.phone, result.sessionId);
+  // A publish ends the unit of work: drop the session instead of persisting
+  // the new id, so the next owner message starts clean — history stays lean
+  // and one product's details cannot bleed into the next one. The flag is not
+  // reset between the resume-failure attempts above: if attempt 1 published
+  // and then died, the publish still happened and the reset must stick.
+  if (ctx.sessionAfterTurn === "reset") {
+    clearSessionId(db, ctx.phone);
+  } else if (result.sessionId) {
+    setSessionId(db, ctx.phone, result.sessionId);
+  }
   if (result.reply.length > 0) {
     await kapso.sendText(ctx.phone, result.reply);
   }

@@ -6,8 +6,25 @@ import {
   listReplayableInbox,
   markInboxBatchDone,
   markInboxBatchFailed,
+  markInboxBatchPending,
 } from "./repo.js";
 import type { TurnContext } from "./types.js";
+
+/**
+ * Total processing attempts a batch's rows get before settling as 'failed'.
+ * Counted via inbox.attempts, which claimInboxBatch increments — so attempts
+ * survive restarts, and boot-replay of 'processing' rows counts against the
+ * same cap (a poison message cannot crash-loop forever).
+ */
+export const MAX_BATCH_ATTEMPTS = 3;
+
+/**
+ * Fixed delay before a failed batch is retried. Deliberately a constant, not
+ * config: with only 2 retries ever, backoff escalation buys nothing, and a new
+ * env var is not worth its surface for a pilot. 30s is long enough to ride out
+ * a transient API blip and short enough that the customer plausibly still cares.
+ */
+export const RETRY_DELAY_MS = 30_000;
 
 /**
  * Placeholder text stored for an inbound photo with no caption. The agent never
@@ -70,6 +87,17 @@ export interface InboxBatcherDeps {
   /** Async worker invoked once per coalesced burst. */
   onMessage: (ctx: TurnContext, text: string) => Promise<void>;
   roleFor: (phone: string) => TurnContext["role"];
+  /**
+   * Invoked after a batch attempt fails, on EVERY attempt. `final` is true when
+   * the batch just settled as 'failed' (retry budget exhausted) — user-facing
+   * side effects like an apology belong behind `final`; monitoring (failure
+   * streak alerting) may count every attempt. Optional so tests and callers
+   * without side effects need nothing. Awaited, but never allowed to throw.
+   */
+  onBatchFailure?: (
+    ctx: TurnContext,
+    info: { final: boolean; attempts: number; error: unknown },
+  ) => Promise<void>;
 }
 
 interface PhoneBurst {
@@ -105,6 +133,12 @@ interface PhoneBurst {
  */
 export class InboxBatcher {
   private readonly timers = new Map<string, PhoneBurst>();
+
+  /**
+   * Delayed re-flush timers for failed batches, one per phone — separate from
+   * the burst timers because a retry must fire even though no burst is open.
+   */
+  private readonly retries = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(private readonly deps: InboxBatcherDeps) {}
 
@@ -156,13 +190,19 @@ export class InboxBatcher {
     return rows.length;
   }
 
-  /** Drop every pending timer. Un-flushed rows stay replayable on next boot. */
+  /**
+   * Drop every pending timer, retries included. Un-flushed and retry-pending
+   * rows stay 'pending' and are replayed on next boot — which is exactly how
+   * retries survive a restart.
+   */
   stop(): void {
     for (const timers of this.timers.values()) {
       clearTimeout(timers.silence);
       clearTimeout(timers.cap);
     }
     this.timers.clear();
+    for (const retry of this.retries.values()) clearTimeout(retry);
+    this.retries.clear();
   }
 
   /** Phones with a burst waiting to flush. */
@@ -196,8 +236,40 @@ export class InboxBatcher {
   }
 
   /**
-   * Run one coalesced burst through the agent. Never throws — the batch settles
-   * as 'failed' and is logged, matching the old per-row behaviour.
+   * Arm a delayed re-flush for a phone whose batch just failed. When it fires,
+   * an OPEN burst for the phone wins: its own flush will claim the pending
+   * retry rows together with the new messages, and firing here too would steal
+   * the burst's rows before its window closed. If the burst already flushed
+   * everything, the claim below returns no rows and this is a no-op.
+   */
+  private armRetry(phone: string): void {
+    if (this.retries.has(phone)) return; // defensive; the per-phone queue serializes failures
+    this.retries.set(
+      phone,
+      setTimeout(() => {
+        this.retries.delete(phone);
+        if (this.timers.has(phone)) return;
+        void this.deps.queue.enqueue(phone, () => this.processBatch(phone));
+      }, RETRY_DELAY_MS),
+    );
+  }
+
+  /** Best-effort: a failing hook must not break processBatch's never-throws contract. */
+  private async notifyFailure(
+    ctx: TurnContext,
+    info: { final: boolean; attempts: number; error: unknown },
+  ): Promise<void> {
+    try {
+      await this.deps.onBatchFailure?.(ctx, info);
+    } catch (err) {
+      this.deps.log.error({ err, phone: ctx.phone }, "onBatchFailure hook failed");
+    }
+  }
+
+  /**
+   * Run one coalesced burst through the agent. Never throws — a failed attempt
+   * returns the rows to 'pending' and arms a delayed retry until the attempt
+   * budget (MAX_BATCH_ATTEMPTS) is spent, then the batch settles as 'failed'.
    */
   private async processBatch(phone: string): Promise<void> {
     const { db, log, onMessage, roleFor } = this.deps;
@@ -205,6 +277,27 @@ export class InboxBatcher {
     if (rows.length === 0) return;
 
     const ids = rows.map((row) => row.id);
+    const ctx: TurnContext = { phone, role: roleFor(phone) };
+    // max, not min: a retried batch absorbs fresh rows (attempts = 1), and min
+    // would let one poison row pin ever-growing batches forever. Consequence:
+    // fresh messages that joined a terminally failing batch die with it —
+    // all-or-nothing settling is already this module's contract.
+    const attempts = Math.max(...rows.map((row) => row.attempts));
+    // The claim above consumed an attempt, so > MAX means the budget was spent
+    // by earlier processes that crashed mid-turn (boot-replay loops): settle as
+    // failed WITHOUT running the agent, or a poison message would be retried on
+    // every boot forever.
+    if (attempts > MAX_BATCH_ATTEMPTS) {
+      markInboxBatchFailed(db, ids);
+      log.error({ phone, inboxIds: ids, attempts }, "inbox batch exceeded attempt cap; giving up");
+      await this.notifyFailure(ctx, {
+        final: true,
+        attempts,
+        error: new Error("attempt cap exceeded"),
+      });
+      return;
+    }
+
     const text = buildBatchText(rows.map((row) => row.agent_text));
     // Nothing for the agent to answer (e.g. only unsupported event kinds):
     // settle the rows rather than spending a turn on an empty prompt.
@@ -214,11 +307,18 @@ export class InboxBatcher {
     }
 
     try {
-      await onMessage({ phone, role: roleFor(phone) }, text);
+      await onMessage(ctx, text);
       markInboxBatchDone(db, ids);
     } catch (err) {
-      markInboxBatchFailed(db, ids);
-      log.error({ err, phone, inboxIds: ids }, "inbox batch failed");
+      const final = attempts >= MAX_BATCH_ATTEMPTS;
+      if (final) {
+        markInboxBatchFailed(db, ids);
+      } else {
+        markInboxBatchPending(db, ids);
+        this.armRetry(phone);
+      }
+      log.error({ err, phone, inboxIds: ids, attempts, final }, "inbox batch failed");
+      await this.notifyFailure(ctx, { final, attempts, error: err });
     }
   }
 }

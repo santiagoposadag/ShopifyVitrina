@@ -1,29 +1,12 @@
+// The row shapes both apps must agree on live in the shared workspace —
+// type-only, erased at compile time (see shared/index.d.ts).
+import type { ProductAttributes, ProductStatus } from "@vitrina/shared";
+
+export type { ProductAttributes, ProductStatus };
+
 export type Role = "owner" | "customer";
 
-export type ProductStatus = "draft" | "active" | "sold" | "inactive";
-
 export type LeadType = "inquiry" | "visit_request";
-
-/** Structured attributes stored as JSON in products.attributes. */
-export interface ProductAttributes {
-  area_m2?: number;
-  /** Lot size in m² — for a house this is a primary decision factor. */
-  lot_m2?: number;
-  bedrooms?: number;
-  bathrooms?: number;
-  neighborhood?: string;
-  city?: string;
-  features?: string[];
-  admin_fee?: number;
-  /** Annual property tax (predial), in COP. */
-  property_tax?: number;
-  estrato?: number;
-  levels?: number;
-  floor?: number;
-  elevator?: boolean;
-  negotiable?: boolean;
-  [key: string]: unknown;
-}
 
 /**
  * Attributes as they arrive from the agent, where an explicit null means "clear
@@ -72,4 +55,11 @@ export interface Lead {
 export interface TurnContext {
   phone: string;
   role: Role;
+  /**
+   * Set by a tool to change what happens to the stored agent session AFTER
+   * this turn completes. "reset" clears it instead of persisting the new id,
+   * so the next message starts a fresh conversation. This mutable field is the
+   * only in-process channel from a tool back to runAgentTurn.
+   */
+  sessionAfterTurn?: "reset";
 }

@@ -27,6 +27,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 COPY web/package.json web/package.json
+# npm ci reads every workspace manifest declared at the root, shared included.
+COPY shared/package.json shared/package.json
 RUN npm ci -w web --include-workspace-root --omit=dev
 RUN mkdir -p /app/web/node_modules
 
@@ -48,8 +50,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 COPY web/package.json web/package.json
+COPY shared/package.json shared/package.json
 RUN npm ci -w web --include-workspace-root
 COPY web/ web/
+# Type-only workspace: next build's typecheck resolves @vitrina/shared through
+# the workspace symlink, which must point at real files. Never needed at runtime.
+COPY shared/ shared/
 RUN npm run build -w web
 
 # ---------------------------------------------------------------------------

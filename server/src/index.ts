@@ -98,18 +98,23 @@ async function main(): Promise<void> {
         }
       }
 
+      // A throw here reaches the batcher, which retries the batch with backoff
+      // and settles it as failed once the attempt budget is spent — the
+      // user-facing side effects live in onBatchFailure below.
+      await runAgentTurn({ db, kapso, config, log: app.log }, ctx, text);
+      failureAlert.recordSuccess();
+    },
+    onBatchFailure: async (ctx, { final }) => {
+      // The streak counts EVERY failed attempt, not only terminal ones: this
+      // alert is the pilot's outage monitor, and waiting for terminal failures
+      // would delay detection by the whole retry budget. The cooldown plus the
+      // success reset keep it from spamming.
+      if (failureAlert.recordFailure()) void notifyOwnersOfFailures();
+      if (!final) return; // the retry may still answer; apologize only when it cannot
       try {
-        await runAgentTurn({ db, kapso, config, log: app.log }, ctx, text);
-        failureAlert.recordSuccess();
-      } catch (err) {
-        app.log.error({ err, phone: ctx.phone }, "agent turn failed");
-        try {
-          await kapso.sendText(ctx.phone, AGENT_ERROR_APOLOGY);
-        } catch {
-          // Best effort; nothing else to do if the send also fails.
-        }
-        if (failureAlert.recordFailure()) void notifyOwnersOfFailures();
-        throw err; // Rethrow so the inbox marks this batch failed.
+        await kapso.sendText(ctx.phone, AGENT_ERROR_APOLOGY);
+      } catch {
+        // Best effort; the failure is already in the logs.
       }
     },
   });

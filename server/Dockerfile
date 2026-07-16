@@ -21,6 +21,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 COPY server/package.json server/package.json
+# npm ci reads every workspace manifest declared at the root, shared included.
+COPY shared/package.json shared/package.json
 RUN npm ci -w server --include-workspace-root --omit=dev
 # Guard against a hoisted install layout where server/node_modules never gets
 # created — the runtime stage COPY below must not fail on a missing dir.
@@ -35,8 +37,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 COPY server/package.json server/package.json
+COPY shared/package.json shared/package.json
 RUN npm ci -w server --include-workspace-root
 COPY server/ server/
+# Type-only workspace: tsc resolves node_modules/@vitrina/shared through the
+# workspace symlink, which must point at real files. Never needed at runtime.
+COPY shared/ shared/
 RUN npm run build -w server
 
 # ---------------------------------------------------------------------------

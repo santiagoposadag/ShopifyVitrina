@@ -16,6 +16,7 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4.0.0",
     "@types/better-sqlite3": "^7.6.12",
+    "@vitrina/shared": "*",
     "@types/node": "^22.10.5",
     "@types/react": "^19.0.7",
     "@types/react-dom": "^19.0.3",
