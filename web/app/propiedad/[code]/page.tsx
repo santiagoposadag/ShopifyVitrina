@@ -1,126 +1,17 @@
 import { notFound } from "next/navigation";
+import { PropertyDetail } from "@/app/components/PropertyDetail";
 import { getProductByCode } from "@/lib/db";
-import { attributeSummary, formatCOP, locationSummary } from "@/lib/format";
-import { WhatsAppButton } from "../../components/WhatsAppButton";
 
 export const dynamic = "force-dynamic";
-
-interface AttrRow {
-  label: string;
-  value: string;
-}
-
-function attributeRows(product: NonNullable<ReturnType<typeof getProductByCode>>): AttrRow[] {
-  const a = product.attributes;
-  const rows: AttrRow[] = [];
-  if (a.neighborhood) rows.push({ label: "Barrio / sector", value: a.neighborhood });
-  if (a.city) rows.push({ label: "Ciudad", value: a.city });
-  if (a.area_m2 != null) rows.push({ label: "Área", value: `${a.area_m2} m²` });
-  if (a.bedrooms != null) rows.push({ label: "Habitaciones", value: String(a.bedrooms) });
-  if (a.bathrooms != null) rows.push({ label: "Baños", value: String(a.bathrooms) });
-  if (a.levels != null) rows.push({ label: "Niveles", value: String(a.levels) });
-  if (a.floor != null) rows.push({ label: "Piso", value: String(a.floor) });
-  if (a.elevator != null) rows.push({ label: "Ascensor", value: a.elevator ? "Sí" : "No" });
-  if (a.estrato != null) rows.push({ label: "Estrato", value: String(a.estrato) });
-  if (a.admin_fee != null)
-    rows.push({ label: "Administración", value: a.admin_fee === 0 ? "Sin administración" : formatCOP(a.admin_fee) });
-  return rows;
-}
 
 export default async function ProductPage({ params }: { params: Promise<{ code: string }> }) {
   const { code } = await params;
   const product = getProductByCode(decodeURIComponent(code));
   if (!product) notFound();
 
-  const rows = attributeRows(product);
-  const location = locationSummary(product);
-  const attrs = attributeSummary(product);
-  const features = product.attributes.features ?? [];
-  const message = `Hola, me interesa la propiedad con código ${product.code}`;
-
   return (
     <div className="mx-auto max-w-5xl px-4 py-10">
-      <div className="mb-6">
-        <span className="text-sm font-medium text-slate-500">Código {product.code}</span>
-        <h1 className="mt-1 text-3xl font-bold text-slate-900">{product.title}</h1>
-        {location && <p className="mt-1 text-slate-600">{location}</p>}
-        {attrs && <p className="text-slate-600">{attrs}</p>}
-      </div>
-
-      {product.photos.length > 0 && (
-        <div className="mb-8 grid grid-cols-2 gap-3 md:grid-cols-4">
-          {product.photos.map((src, i) => (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              key={src}
-              src={src}
-              alt={`${product.title} — foto ${i + 1}`}
-              className={`w-full rounded-xl object-cover ${
-                i === 0 ? "col-span-2 row-span-2 aspect-square md:col-span-2" : "aspect-square"
-              }`}
-            />
-          ))}
-        </div>
-      )}
-
-      <div className="grid grid-cols-1 gap-8 md:grid-cols-3">
-        <div className="md:col-span-2">
-          {product.description && (
-            <section className="mb-8">
-              <h2 className="mb-2 text-lg font-semibold text-slate-900">Descripción</h2>
-              <p className="whitespace-pre-line leading-relaxed text-slate-700">
-                {product.description}
-              </p>
-            </section>
-          )}
-
-          {rows.length > 0 && (
-            <section className="mb-8">
-              <h2 className="mb-3 text-lg font-semibold text-slate-900">Características</h2>
-              <dl className="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
-                {rows.map((r) => (
-                  <div key={r.label} className="flex justify-between border-b border-slate-100 py-2">
-                    <dt className="text-slate-500">{r.label}</dt>
-                    <dd className="font-medium text-slate-900">{r.value}</dd>
-                  </div>
-                ))}
-              </dl>
-            </section>
-          )}
-
-          {features.length > 0 && (
-            <section>
-              <h2 className="mb-3 text-lg font-semibold text-slate-900">Comodidades</h2>
-              <ul className="flex flex-wrap gap-2">
-                {features.map((f) => (
-                  <li
-                    key={f}
-                    className="rounded-full bg-slate-100 px-3 py-1 text-sm text-slate-700"
-                  >
-                    {f}
-                  </li>
-                ))}
-              </ul>
-            </section>
-          )}
-        </div>
-
-        <aside className="md:col-span-1">
-          <div className="sticky top-20 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-            <p className="text-sm text-slate-500">Precio</p>
-            <p className="mb-1 text-3xl font-bold text-slate-900">{formatCOP(product.price)}</p>
-            {product.attributes.negotiable && (
-              <p className="mb-4 text-sm text-slate-500">Precio negociable</p>
-            )}
-            <WhatsAppButton message={message} className="mt-4 w-full">
-              Consultar por WhatsApp
-            </WhatsAppButton>
-            <p className="mt-3 text-center text-xs text-slate-400">
-              Te atenderemos con el código {product.code} ya cargado.
-            </p>
-          </div>
-        </aside>
-      </div>
+      <PropertyDetail product={product} />
     </div>
   );
 }

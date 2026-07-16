@@ -5,6 +5,7 @@ import type {
   LeadType,
   Product,
   ProductAttributes,
+  ProductAttributeUpdates,
   ProductPhoto,
   ProductStatus,
 } from "./types.js";
@@ -105,7 +106,28 @@ export interface UpsertProductInput {
   price?: number;
   currency?: string;
   status?: ProductStatus;
-  attributes?: ProductAttributes;
+  attributes?: ProductAttributeUpdates;
+}
+
+/**
+ * Merge incoming attributes into the stored ones, key by key. An explicit null
+ * REMOVES the key rather than storing a null: the owner's only way to un-say a
+ * fact (the agent has been known to invent one), and the stored JSON keeps
+ * matching ProductAttributes, where absent means absent.
+ *
+ * Only null clears. Falsy values like 0 (no admin fee) and false (no elevator)
+ * are facts the owner stated and are preserved.
+ */
+function mergeAttributes(
+  existing: ProductAttributes,
+  incoming: ProductAttributeUpdates | undefined,
+): ProductAttributes {
+  const merged: ProductAttributes = { ...existing };
+  for (const [key, value] of Object.entries(incoming ?? {})) {
+    if (value === null) delete merged[key];
+    else merged[key] = value;
+  }
+  return merged;
 }
 
 export interface UpsertResult {
@@ -137,14 +159,14 @@ export function upsertProduct(
         price: input.price ?? null,
         currency: input.currency ?? "COP",
         status: input.status ?? "draft",
-        attributes: JSON.stringify(input.attributes ?? {}),
+        attributes: JSON.stringify(mergeAttributes({}, input.attributes)),
       });
     const product = getProductById(db, Number(info.lastInsertRowid));
     recordChange(db, product.id, changedByPhone, `Created product ${input.code}`);
     return { product, created: true };
   }
 
-  const merged: ProductAttributes = { ...existing.attributes, ...(input.attributes ?? {}) };
+  const merged = mergeAttributes(existing.attributes, input.attributes);
   const changes: string[] = [];
   if (input.title !== undefined && input.title !== existing.title) changes.push("title");
   if (input.description !== undefined && input.description !== existing.description)
@@ -290,6 +312,15 @@ export function getSessionId(db: DB, phone: string, maxAgeDays?: number): string
   return row?.agent_session_id ?? undefined;
 }
 
+/**
+ * Forget a phone's stored session id. Used when the SDK cannot resume it — the
+ * transcript is gone, so keeping the id only guarantees the next turn fails the
+ * same way (a replayed inbox row would resume the same dead session).
+ */
+export function clearSessionId(db: DB, phone: string): void {
+  db.prepare(`DELETE FROM sessions WHERE phone = ?`).run(phone);
+}
+
 export function setSessionId(db: DB, phone: string, sessionId: string): void {
   db.prepare(
     `INSERT INTO sessions (phone, agent_session_id, updated_at)
@@ -338,22 +369,58 @@ export function getInboxRow(db: DB, id: number): InboxRow | null {
   return row ?? null;
 }
 
-export function markInboxProcessing(db: DB, id: number): void {
-  db.prepare(`UPDATE inbox SET status = 'processing', attempts = attempts + 1 WHERE id = ?`).run(
-    id,
+/**
+ * Claim every un-settled row for a phone as ONE batch: 'pending' rows plus
+ * 'processing' rows a previous process crashed on. Marking them in a single
+ * transaction keeps at-least-once intact — a crash mid-batch leaves them
+ * 'processing', so listReplayableInbox picks the whole burst up again on boot.
+ *
+ * Ordered by arrival (received_at is only second-resolution, so id breaks ties)
+ * because the joined prompt has to read in the order the user typed it.
+ *
+ * Callers MUST run this inside the phone's queue: serialization is what stops
+ * two batches from claiming the same rows.
+ */
+export function claimInboxBatch(db: DB, phone: string): InboxRow[] {
+  const rows = db
+    .prepare(
+      `SELECT * FROM inbox
+       WHERE phone = ? AND status IN ('pending','processing')
+       ORDER BY received_at ASC, id ASC`,
+    )
+    .all(phone) as InboxRow[];
+  if (rows.length === 0) return [];
+
+  const claim = db.prepare(
+    `UPDATE inbox SET status = 'processing', attempts = attempts + 1 WHERE id = ?`,
   );
+  const tx = db.transaction(() => {
+    for (const row of rows) claim.run(row.id);
+  });
+  tx();
+
+  return rows.map((row) => ({ ...row, status: "processing", attempts: row.attempts + 1 }));
 }
 
-export function markInboxDone(db: DB, id: number): void {
-  db.prepare(`UPDATE inbox SET status = 'done', processed_at = datetime('now') WHERE id = ?`).run(
-    id,
+/** Settle a whole claimed batch. All-or-nothing: one agent turn, one outcome. */
+export function markInboxBatchDone(db: DB, ids: number[]): void {
+  const mark = db.prepare(
+    `UPDATE inbox SET status = 'done', processed_at = datetime('now') WHERE id = ?`,
   );
+  const tx = db.transaction(() => {
+    for (const id of ids) mark.run(id);
+  });
+  tx();
 }
 
-export function markInboxFailed(db: DB, id: number): void {
-  db.prepare(`UPDATE inbox SET status = 'failed', processed_at = datetime('now') WHERE id = ?`).run(
-    id,
+export function markInboxBatchFailed(db: DB, ids: number[]): void {
+  const mark = db.prepare(
+    `UPDATE inbox SET status = 'failed', processed_at = datetime('now') WHERE id = ?`,
   );
+  const tx = db.transaction(() => {
+    for (const id of ids) mark.run(id);
+  });
+  tx();
 }
 
 /**

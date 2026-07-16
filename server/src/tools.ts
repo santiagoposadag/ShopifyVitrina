@@ -3,8 +3,9 @@ import { z } from "zod";
 import type { Config } from "./config.js";
 import type { DB } from "./db.js";
 import type { KapsoClient } from "./kapso.js";
+import { previewLineFor } from "./preview.js";
 import * as repo from "./repo.js";
-import type { Product, ProductAttributes, TurnContext } from "./types.js";
+import type { Product, ProductAttributeUpdates, TurnContext } from "./types.js";
 
 export const MCP_SERVER_NAME = "vitrina";
 
@@ -136,7 +137,7 @@ export function buildToolServer(deps: ToolDeps) {
 
   const upsertProduct = tool(
     "upsert_product",
-    "Create a draft product or update an existing one by code. Only pass the fields you want to set or change. attributes_json is a JSON object merged into existing attributes (keys: area_m2, bedrooms, bathrooms, neighborhood, city, features[], admin_fee, estrato, levels, floor, elevator, negotiable). Set status to 'active' to publish it to the storefront.",
+    "Create a draft product or update an existing one by code. This is a MERGE, not a rewrite: pass ONLY the fields you are setting or changing — omitted fields keep their stored value, and attributes_json merges key by key into the stored attributes. To change only the status, pass just code and status. attributes_json is a JSON object of attributes (keys: area_m2 (built area m²), lot_m2 (lot size m²), bedrooms, bathrooms, neighborhood, city, features[], admin_fee (monthly COP), property_tax (annual predial COP), estrato, levels, floor, elevator, negotiable); every fact the owner states that has a key here MUST go in attributes_json — the storefront only renders these, so a fact left in the description alone is invisible. Include ONLY attributes the owner explicitly stated — never infer or complete one the owner did not give. To REMOVE an attribute that is stored but wrong or was never stated, pass an explicit null for that key, e.g. {\"bathrooms\":null} — omitting the key leaves the stored value untouched, so null is the only way to clear one. Set status to 'active' to publish it to the storefront. While it is not active, the result includes a preview link to send to the OWNER so they can see the page before publishing.",
     {
       code: z.string().describe("Product code (required, unique identifier)"),
       title: z.string().optional(),
@@ -149,10 +150,10 @@ export function buildToolServer(deps: ToolDeps) {
         .describe("JSON object of attributes to merge, e.g. {\"bedrooms\":3,\"neighborhood\":\"Belén\"}"),
     },
     async ({ code, title, description, price, status, attributes_json }) => {
-      let attributes: ProductAttributes | undefined;
+      let attributes: ProductAttributeUpdates | undefined;
       if (attributes_json) {
         try {
-          attributes = JSON.parse(attributes_json) as ProductAttributes;
+          attributes = JSON.parse(attributes_json) as ProductAttributeUpdates;
         } catch {
           return text("attributes_json was not valid JSON. Ask again or send it differently.");
         }
@@ -163,7 +164,8 @@ export function buildToolServer(deps: ToolDeps) {
         ctx.phone,
       );
       return text(
-        `${created ? "Created" : "Updated"} product: ${describeProduct(product)}`,
+        `${created ? "Created" : "Updated"} product: ${describeProduct(product)}` +
+          previewLineFor(config, product),
       );
     },
   );

@@ -32,6 +32,15 @@ export interface Config {
   rateLimitPerPhonePerHour: number;
   /** Max customer agent turns per day across all phones (circuit breaker). */
   rateLimitGlobalPerDay: number;
+  /** Silence after an inbound message before its burst becomes one agent turn. */
+  batchDebounceMs: number;
+  /** Ceiling on that wait, so a non-stop talker still gets a reply. */
+  batchMaxWaitMs: number;
+  /** Same, for a burst containing photos: WhatsApp uploads them in slow waves. */
+  batchMediaDebounceMs: number;
+  batchMediaMaxWaitMs: number;
+  /** Public URL of the STOREFRONT (the web app) — not this server. */
+  storefrontBaseUrl: string;
 }
 
 function required(name: string): string {
@@ -83,6 +92,11 @@ export function loadConfig(): Config {
     sessionMaxAgeDays: optionalInt("SESSION_MAX_AGE_DAYS", 7),
     rateLimitPerPhonePerHour: optionalInt("RATE_LIMIT_PER_PHONE_PER_HOUR", 20),
     rateLimitGlobalPerDay: optionalInt("RATE_LIMIT_GLOBAL_PER_DAY", 500),
+    batchDebounceMs: optionalInt("BATCH_DEBOUNCE_MS", 8000),
+    batchMaxWaitMs: optionalInt("BATCH_MAX_WAIT_MS", 45000),
+    batchMediaDebounceMs: optionalInt("BATCH_MEDIA_DEBOUNCE_MS", 45000),
+    batchMediaMaxWaitMs: optionalInt("BATCH_MEDIA_MAX_WAIT_MS", 120000),
+    storefrontBaseUrl: optional("STOREFRONT_BASE_URL", "http://localhost:3000").replace(/\/+$/, ""),
   };
 }
 

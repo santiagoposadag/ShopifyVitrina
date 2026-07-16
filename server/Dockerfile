@@ -54,7 +54,13 @@ COPY server/package.json server/package.json
 COPY propiedad_1/ propiedad_1/
 COPY propiedad_2/ propiedad_2/
 
-RUN mkdir -p /data && chown -R node:node /data
+# /data holds the SQLite db and media; /home/node/.claude is where the Agent SDK
+# writes its session transcripts. BOTH are named-volume mountpoints in
+# compose.yaml, and both MUST exist here owned by node: a named volume inherits
+# the ownership of the image directory it covers, but when that directory does
+# not exist in the image Docker creates the mountpoint as root and the non-root
+# process below cannot write to it.
+RUN mkdir -p /data /home/node/.claude && chown -R node:node /data /home/node/.claude
 USER node
 
 EXPOSE 3001

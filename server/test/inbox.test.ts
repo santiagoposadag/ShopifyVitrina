@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { openDb } from "../src/db.js";
 import {
+  claimInboxBatch,
   deleteStaleInboxRows,
   getInboxRow,
   getSessionId,
   insertInboxMessage,
   listReplayableInbox,
-  markInboxDone,
-  markInboxFailed,
-  markInboxProcessing,
+  markInboxBatchDone,
+  markInboxBatchFailed,
   setSessionId,
 } from "../src/repo.js";
 
@@ -27,15 +27,15 @@ describe("inbox lifecycle (at-least-once)", () => {
   it("replays rows interrupted mid-processing, but not settled ones", () => {
     const db = openDb(":memory:");
     const a = insertInboxMessage(db, MSG);
-    const b = insertInboxMessage(db, { ...MSG, dedupe_key: "msg:wamid.2" });
-    const c = insertInboxMessage(db, { ...MSG, dedupe_key: "msg:wamid.3" });
+    const b = insertInboxMessage(db, { ...MSG, dedupe_key: "msg:wamid.2", phone: "573002" });
+    const c = insertInboxMessage(db, { ...MSG, dedupe_key: "msg:wamid.3", phone: "573003" });
     if (!a || !b || !c) throw new Error("insert failed");
 
-    markInboxProcessing(db, a.id); // crashed mid-run → replayable
-    markInboxProcessing(db, b.id);
-    markInboxDone(db, b.id); // finished → settled
-    markInboxProcessing(db, c.id);
-    markInboxFailed(db, c.id); // failed → settled (kept for diagnosis)
+    claimInboxBatch(db, a.phone); // crashed mid-run → replayable
+    claimInboxBatch(db, b.phone);
+    markInboxBatchDone(db, [b.id]); // finished → settled
+    claimInboxBatch(db, c.phone);
+    markInboxBatchFailed(db, [c.id]); // failed → settled (kept for diagnosis)
 
     expect(listReplayableInbox(db).map((r) => r.id)).toEqual([a.id]);
     expect(getInboxRow(db, a.id)?.attempts).toBe(1);
@@ -52,9 +52,8 @@ describe("inbox lifecycle (at-least-once)", () => {
     const pending = insertInboxMessage(db, { ...MSG, dedupe_key: "k4" });
     if (!oldDone || !freshDone || !oldFailed || !pending) throw new Error("insert failed");
 
-    markInboxDone(db, oldDone.id);
-    markInboxDone(db, freshDone.id);
-    markInboxFailed(db, oldFailed.id);
+    markInboxBatchDone(db, [oldDone.id, freshDone.id]);
+    markInboxBatchFailed(db, [oldFailed.id]);
     const backdate = db.prepare(`UPDATE inbox SET processed_at = datetime('now', ?) WHERE id = ?`);
     backdate.run("-10 days", oldDone.id); // past the 7-day done TTL
     backdate.run("-40 days", oldFailed.id); // past the 30-day failed TTL
@@ -64,6 +63,51 @@ describe("inbox lifecycle (at-least-once)", () => {
     expect(getInboxRow(db, oldFailed.id)).toBeNull();
     expect(getInboxRow(db, freshDone.id)?.status).toBe("done");
     expect(getInboxRow(db, pending.id)?.status).toBe("pending");
+    db.close();
+  });
+});
+
+describe("inbox batch claim", () => {
+  it("claims one phone's un-settled rows in arrival order and skips other phones", () => {
+    const db = openDb(":memory:");
+    const a = insertInboxMessage(db, { ...MSG, dedupe_key: "k1", agent_text: "uno" });
+    const b = insertInboxMessage(db, { ...MSG, dedupe_key: "k2", agent_text: "dos" });
+    const other = insertInboxMessage(db, { ...MSG, dedupe_key: "k3", phone: "573002" });
+    const settled = insertInboxMessage(db, { ...MSG, dedupe_key: "k4", agent_text: "viejo" });
+    if (!a || !b || !other || !settled) throw new Error("insert failed");
+    markInboxBatchDone(db, [settled.id]);
+    // Simulate a crash mid-batch: the row is left 'processing' with one attempt.
+    db.prepare(`UPDATE inbox SET status = 'processing', attempts = 1 WHERE id = ?`).run(a.id);
+
+    const claimed = claimInboxBatch(db, MSG.phone);
+
+    expect(claimed.map((r) => r.agent_text)).toEqual(["uno", "dos"]);
+    expect(claimed.every((r) => r.status === "processing")).toBe(true);
+    expect(claimed[0]?.attempts).toBe(2); // the crashed row's earlier attempt counts
+    expect(getInboxRow(db, other.id)?.status).toBe("pending");
+    db.close();
+  });
+
+  it("returns an empty batch when the phone has nothing pending", () => {
+    const db = openDb(":memory:");
+    expect(claimInboxBatch(db, "573009")).toEqual([]);
+    db.close();
+  });
+
+  it("settles a whole batch at once, done or failed", () => {
+    const db = openDb(":memory:");
+    const a = insertInboxMessage(db, { ...MSG, dedupe_key: "k1" });
+    const b = insertInboxMessage(db, { ...MSG, dedupe_key: "k2" });
+    const c = insertInboxMessage(db, { ...MSG, dedupe_key: "k3" });
+    if (!a || !b || !c) throw new Error("insert failed");
+
+    markInboxBatchDone(db, [a.id, b.id]);
+    markInboxBatchFailed(db, [c.id]);
+
+    expect(getInboxRow(db, a.id)?.status).toBe("done");
+    expect(getInboxRow(db, b.id)?.status).toBe("done");
+    expect(getInboxRow(db, c.id)?.status).toBe("failed");
+    expect(listReplayableInbox(db)).toEqual([]); // nothing left to replay
     db.close();
   });
 });

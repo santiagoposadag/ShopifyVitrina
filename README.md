@@ -54,9 +54,10 @@ Customer / Owner (WhatsApp)
 - `src/db.ts` — SQLite (WAL), schema created on boot.
 - `src/repo.ts` — all catalog/lead/session queries.
 - `src/kapso.ts` — Kapso REST client: `sendText`, `sendImage`, `sendInteractiveButtons`, `downloadMedia`.
-- `src/webhook.ts` — `POST /webhook`: HMAC verify (raw body), batch envelope, persisted inbox (dedupe + at-least-once: unfinished messages are replayed on boot), immediate media download, per-phone enqueue, fast ACK.
+- `src/webhook.ts` — `POST /webhook`: HMAC verify (raw body), batch envelope, persisted inbox (dedupe + at-least-once: unfinished messages are replayed on boot), immediate media download, fast ACK.
+- `src/batcher.ts` — coalesces each phone's message burst into ONE agent turn (`BATCH_DEBOUNCE_MS` of silence, `BATCH_MAX_WAIT_MS` ceiling) and settles its inbox rows.
 - `src/queue.ts` — in-process FIFO with per-phone serialization.
-- `src/agent.ts` — Claude Agent SDK integration: resume per-phone session (idle sessions expire after `SESSION_MAX_AGE_DAYS`), run tools, reply in Spanish.
+- `src/agent.ts` — Claude Agent SDK integration: resume per-phone session (idle sessions expire after `SESSION_MAX_AGE_DAYS`; an unresumable session falls back once to a fresh one), run tools, reply in Spanish.
 - `src/rate-limit.ts` — cost protection: per-phone sliding-hour limit + global daily cap for customer turns (owners exempt).
 - `src/alerts.ts` — notifies the owner's WhatsApp after consecutive agent failures.
 - `src/backup.ts` — consistent SQLite snapshot (online backup API) with pruning.
@@ -74,6 +75,8 @@ Next.js 15 (App Router) + Tailwind v4, reading the **same** SQLite file directly
 - `/catalogo` — grid of all active products.
 - `/propiedad/[code]` — photo gallery, attributes, description, and the key CTA:
   a `wa.me` deep link prefilled with `Hola, me interesa la propiedad con código <code>`.
+- `/preview/[code]` — the owner's view of a property in **any** status, so a draft can
+  be reviewed before publishing. Unlisted and `noindex`; not in the catalog.
 - `/media/[file]` — serves product photos from `MEDIA_DIR` (so the storefront is
   self-contained and does not depend on the WhatsApp server being reachable).
 
@@ -119,8 +122,11 @@ Every variable is documented in `env.sample`. Key ones:
 | `OWNER_PHONE_NUMBERS` | Comma-separated allowlist (E.164 digits, no `+`) that gets the owner toolset. |
 | `DB_PATH`, `MEDIA_DIR` | Shared by server and web. Relative paths resolve to the **repo root**, so both apps agree regardless of the workspace they run from. |
 | `PUBLIC_BASE_URL` | Public URL of the server (a tunnel) — used to build photo URLs WhatsApp can fetch. |
+| `STOREFRONT_BASE_URL` | Public URL of the **storefront** (a different host from `PUBLIC_BASE_URL`) — used to build the owner's private draft-preview links (default `http://localhost:3000`). |
 | `RATE_LIMIT_PER_PHONE_PER_HOUR`, `RATE_LIMIT_GLOBAL_PER_DAY` | Cost protection for customer agent turns (defaults 20/hour per phone, 500/day global; owners exempt). |
 | `SESSION_MAX_AGE_DAYS` | Conversations idle longer than this start a fresh agent session (default 7). |
+| `BATCH_DEBOUNCE_MS`, `BATCH_MAX_WAIT_MS` | How long a phone's messages are coalesced into one agent turn: silence that ends a burst (default 8000) and the ceiling from its first message (default 45000). |
+| `BATCH_MEDIA_DEBOUNCE_MS`, `BATCH_MEDIA_MAX_WAIT_MS` | The same two knobs once a burst contains photos (defaults 45000 / 120000) — WhatsApp delivers a photo set in waves tens of seconds apart. |
 
 ### 3. Seed the catalog
 
@@ -318,6 +324,35 @@ sandbox before production:
   is bounded by a ~6s shared budget and is non-fatal, so the 200 ACK never waits on an
   unbounded network call. Media downloads (which carry the API key) are refused unless the
   URL host is `kapso.ai` or a `*.kapso.ai` subdomain.
+- **Draft previews.** The catalog renders only `active` products, so an owner could
+  otherwise review a new listing only as a text summary over WhatsApp — or by publishing
+  it to customers first, which defeats the point of a draft. `/preview/<code>` renders the
+  real page (photos included) for any status, and the assistant includes the link in its
+  `upsert_product` result while the product is not active. The page is **unlisted, not
+  private**: no token, no access control — a deliberate pilot tradeoff, since the catalog
+  holds no sensitive data. It IS `noindex`'d, which is not about secrecy but about data
+  quality: a draft is unreviewed (the assistant has invented an attribute on a real
+  listing before), and a wrong fact about a real property indexed by a search engine
+  outlives the draft.
+- **Message coalescing.** People send one thought per WhatsApp message, so a single
+  listing can arrive as twenty of them. Rather than one agent turn (and one Claude call)
+  per message — each seeing only a fragment of what was said — a phone's burst is
+  debounced (`BATCH_DEBOUNCE_MS` of silence, restarted by every new message) and joined
+  into ONE turn. `BATCH_MAX_WAIT_MS` caps the wait so someone who never pauses still gets
+  a reply. The wait happens on the async worker, never in the request handler, so the ACK
+  stays fast; rows stay `pending` until the batch settles, so a crash mid-burst replays it.
+  The window is **adaptive**: photos arrive far slower than text — a measured 37-photo
+  listing came in two waves 32 seconds apart — so a burst containing media switches to
+  `BATCH_MEDIA_DEBOUNCE_MS` / `BATCH_MEDIA_MAX_WAIT_MS` and stays there until it flushes.
+- **Session persistence across deploys.** The agent session id lives in SQLite, but the
+  Agent SDK keeps the actual transcripts under its home directory — so `compose.yaml`
+  mounts `/home/node/.claude` on its own named volume (`vitrina-sessions`). Without it
+  the transcripts sit on the container's ephemeral overlay filesystem and every recreate
+  leaves SQLite pointing at ids whose transcripts are gone. `server/Dockerfile` must
+  create that directory owned by `node`, or the volume mountpoint lands root-owned and
+  the non-root process cannot write to it — the same reason `/data` is created there.
+  Belt and braces: if a session still cannot be resumed, the agent retries once with a
+  fresh one, so a customer gets a reply rather than silence.
 - **Cost protection.** Customer agent turns are rate limited (sliding per-phone hourly
   window + global daily circuit breaker; owners exempt) so strangers cannot run up the
   Anthropic bill. Idle sessions expire after `SESSION_MAX_AGE_DAYS` so long-lived contacts

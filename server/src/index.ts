@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import { runAgentTurn } from "./agent.js";
 import { ConsecutiveFailureAlert } from "./alerts.js";
+import { InboxBatcher } from "./batcher.js";
 import { isOwner, loadConfig, loadDotEnv } from "./config.js";
 import { openDb } from "./db.js";
 import { KapsoClient } from "./kapso.js";
@@ -8,7 +9,7 @@ import { registerMediaRoutes } from "./media.js";
 import { PerPhoneQueue } from "./queue.js";
 import { RateLimiter } from "./rate-limit.js";
 import { deleteStaleInboxRows, deleteStalePendingMedia, upsertContact } from "./repo.js";
-import { registerWebhook, replayPendingInbox, type WebhookDeps } from "./webhook.js";
+import { registerWebhook, type WebhookDeps } from "./webhook.js";
 import type { TurnContext } from "./types.js";
 
 const RATE_LIMIT_NOTICE =
@@ -66,12 +67,18 @@ async function main(): Promise<void> {
     }
   };
 
-  const deps: WebhookDeps = {
-    config,
+  const roleFor = (phone: string): TurnContext["role"] =>
+    isOwner(config, phone) ? "owner" : "customer";
+
+  const batcher = new InboxBatcher({
     db,
-    kapso,
     queue,
-    roleFor: (phone) => (isOwner(config, phone) ? "owner" : "customer"),
+    log: app.log,
+    debounceMs: config.batchDebounceMs,
+    maxWaitMs: config.batchMaxWaitMs,
+    mediaDebounceMs: config.batchMediaDebounceMs,
+    mediaMaxWaitMs: config.batchMediaMaxWaitMs,
+    roleFor,
     onMessage: async (ctx: TurnContext, text: string) => {
       upsertContact(db, ctx.phone, ctx.role);
 
@@ -87,12 +94,12 @@ async function main(): Promise<void> {
               // Best effort.
             }
           }
-          return; // Deliberately consumed; the inbox row settles as done.
+          return; // Deliberately consumed; the inbox batch settles as done.
         }
       }
 
       try {
-        await runAgentTurn({ db, kapso, config }, ctx, text);
+        await runAgentTurn({ db, kapso, config, log: app.log }, ctx, text);
         failureAlert.recordSuccess();
       } catch (err) {
         app.log.error({ err, phone: ctx.phone }, "agent turn failed");
@@ -102,16 +109,24 @@ async function main(): Promise<void> {
           // Best effort; nothing else to do if the send also fails.
         }
         if (failureAlert.recordFailure()) void notifyOwnersOfFailures();
-        throw err; // Rethrow so the inbox marks this row failed.
+        throw err; // Rethrow so the inbox marks this batch failed.
       }
     },
-  };
+  });
+
+  const deps: WebhookDeps = { config, db, kapso, batcher, roleFor };
 
   registerWebhook(app, deps);
 
+  // Un-flushed bursts must not hold the process open on shutdown; their rows
+  // stay pending and are replayed on the next boot.
+  app.addHook("onClose", async () => {
+    batcher.stop();
+  });
+
   // Recover messages a previous process accepted but never finished, before
   // taking new traffic so per-phone ordering holds.
-  replayPendingInbox(app.log, deps);
+  batcher.replayPending();
 
   await app.listen({ port: config.port, host: "0.0.0.0" });
   app.log.info(`Vitrina server listening on :${config.port}`);

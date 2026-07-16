@@ -1,19 +1,11 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import type { FastifyBaseLogger, FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
+import { PHOTO_PLACEHOLDER, type InboxBatcher } from "./batcher.js";
 import type { Config } from "./config.js";
 import type { DB } from "./db.js";
 import type { KapsoClient } from "./kapso.js";
 import { saveMedia } from "./media.js";
-import {
-  addPendingMedia,
-  getInboxRow,
-  insertInboxMessage,
-  listReplayableInbox,
-  markInboxDone,
-  markInboxFailed,
-  markInboxProcessing,
-} from "./repo.js";
-import type { PerPhoneQueue } from "./queue.js";
+import { addPendingMedia, insertInboxMessage } from "./repo.js";
 import type { TurnContext } from "./types.js";
 
 export const SIGNATURE_HEADER = "x-webhook-signature";
@@ -154,7 +146,7 @@ export function extractInbound(event: Record<string, unknown>): InboundMessage |
       from,
       id,
       kind: "image",
-      agentText: caption || "(El usuario envió una foto)",
+      agentText: caption || PHOTO_PLACEHOLDER,
       media: { url: mediaUrl, filename, contentType },
     };
   }
@@ -168,53 +160,14 @@ export interface WebhookDeps {
   config: Config;
   db: DB;
   kapso: KapsoClient;
-  queue: PerPhoneQueue;
-  /** Async worker invoked (via the queue) once per inbound message. */
-  onMessage: (ctx: TurnContext, text: string) => Promise<void>;
+  /** Coalesces each phone's burst into a single agent turn, off the ACK path. */
+  batcher: InboxBatcher;
   /** Maps a phone number to its role (owner vs customer). */
   roleFor: (phone: string) => TurnContext["role"];
 }
 
-/**
- * Process one persisted inbox row through the agent worker. The status
- * transitions are what make delivery at-least-once: a crash leaves the row
- * 'pending' or 'processing', and replayPendingInbox re-enqueues it on boot.
- * Never throws — a failure marks the row 'failed' and is logged.
- */
-async function processInboxRow(
-  deps: WebhookDeps,
-  log: FastifyBaseLogger,
-  id: number,
-): Promise<void> {
-  const row = getInboxRow(deps.db, id);
-  if (!row || row.status === "done") return;
-  markInboxProcessing(deps.db, id);
-  const ctx: TurnContext = { phone: row.phone, role: deps.roleFor(row.phone) };
-  try {
-    await deps.onMessage(ctx, row.agent_text);
-    markInboxDone(deps.db, id);
-  } catch (err) {
-    markInboxFailed(deps.db, id);
-    log.error({ err, phone: row.phone, inboxId: id }, "inbox message failed");
-  }
-}
-
-/**
- * Re-enqueue inbox rows a previous process accepted but never finished. Call
- * once on boot, BEFORE listening, so replayed messages enter each phone's
- * queue ahead of new webhook traffic and per-phone ordering holds.
- */
-export function replayPendingInbox(log: FastifyBaseLogger, deps: WebhookDeps): number {
-  const rows = listReplayableInbox(deps.db);
-  for (const row of rows) {
-    void deps.queue.enqueue(row.phone, () => processInboxRow(deps, log, row.id));
-  }
-  if (rows.length > 0) log.info(`Replaying ${rows.length} unfinished inbox message(s)`);
-  return rows.length;
-}
-
 export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
-  const { config, db, kapso, queue, roleFor } = deps;
+  const { config, db, kapso, batcher, roleFor } = deps;
 
   // Keep the raw body so we can verify the signature over exact bytes.
   app.addContentTypeParser(
@@ -284,8 +237,11 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
         }
       }
 
-      // Enqueue with per-phone serialization; do NOT await the agent inline.
-      void queue.enqueue(row.phone, () => processInboxRow(deps, request.log, row.id));
+      // Hand the row to the batcher; it debounces and runs the agent on the
+      // async worker. Only the timer state is touched here, so the ACK stays
+      // fast. The media flag comes from the parsed event — a photo burst needs
+      // a much longer window than chat (see InboxBatcher).
+      batcher.schedule(row.phone, inbound.media ? "media" : "text");
     }
 
     // ACK fast; the agent runs on the async worker.

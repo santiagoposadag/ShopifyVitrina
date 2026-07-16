@@ -27,16 +27,36 @@ services:
     environment:
       <<: [*secrets-env, *data-env]
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
+      # The STOREFRONT's URL, not this server's — the two are different hosts.
+      # Used to build the owner's private draft-preview links.
+      STOREFRONT_BASE_URL: ${STOREFRONT_BASE_URL:-http://localhost:3000}
       PORT: "3001"
       # Cost/abuse protection and session lifetime. Empty values fall back to
       # the defaults in server/src/config.ts (20/hour, 500/day, 7 days).
       RATE_LIMIT_PER_PHONE_PER_HOUR: ${RATE_LIMIT_PER_PHONE_PER_HOUR:-}
       RATE_LIMIT_GLOBAL_PER_DAY: ${RATE_LIMIT_GLOBAL_PER_DAY:-}
       SESSION_MAX_AGE_DAYS: ${SESSION_MAX_AGE_DAYS:-}
+      # Coalescing of a phone's message burst into one agent turn. Empty values
+      # fall back to the defaults in server/src/config.ts (8s silence, 45s cap
+      # for text; 45s silence, 120s cap once a burst contains photos).
+      BATCH_DEBOUNCE_MS: ${BATCH_DEBOUNCE_MS:-}
+      BATCH_MAX_WAIT_MS: ${BATCH_MAX_WAIT_MS:-}
+      BATCH_MEDIA_DEBOUNCE_MS: ${BATCH_MEDIA_DEBOUNCE_MS:-}
+      BATCH_MEDIA_MAX_WAIT_MS: ${BATCH_MEDIA_MAX_WAIT_MS:-}
     ports:
       - "3001:3001"
     volumes:
       - vitrina-data:/data
+      # The Agent SDK stores its session transcripts under its home directory,
+      # NOT in our SQLite db — which only holds the session id. Without this
+      # volume the transcripts live on the container's ephemeral overlay fs, so
+      # every recreate leaves SQLite pointing at ids whose transcripts are gone
+      # and the agent fails to resume them (runAgentTurn falls back to a fresh
+      # session, so replies survive, but the conversation history does not).
+      # Mounting the whole directory also persists the SDK's .cache — intended.
+      # Only the server runs the agent; seed and backup share the image but not
+      # this volume.
+      - vitrina-sessions:/home/node/.claude
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 30s
@@ -113,3 +133,8 @@ volumes:
   # inherits that ownership on first use; a host bind mount would land
   # root-owned on most hosts and the non-root process could not write to it.
   vitrina-data: {}
+  # Same reasoning for the Agent SDK's home: server/Dockerfile creates
+  # /home/node/.claude owned by node so this volume inherits that ownership.
+  # Separate from vitrina-data because it is disposable — losing it costs
+  # conversation history, not business data, and the storefront never reads it.
+  vitrina-sessions: {}

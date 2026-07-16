@@ -7,12 +7,16 @@ export type LeadType = "inquiry" | "visit_request";
 /** Structured attributes stored as JSON in products.attributes. */
 export interface ProductAttributes {
   area_m2?: number;
+  /** Lot size in m² — for a house this is a primary decision factor. */
+  lot_m2?: number;
   bedrooms?: number;
   bathrooms?: number;
   neighborhood?: string;
   city?: string;
   features?: string[];
   admin_fee?: number;
+  /** Annual property tax (predial), in COP. */
+  property_tax?: number;
   estrato?: number;
   levels?: number;
   floor?: number;
@@ -20,6 +24,16 @@ export interface ProductAttributes {
   negotiable?: boolean;
   [key: string]: unknown;
 }
+
+/**
+ * Attributes as they arrive from the agent, where an explicit null means "clear
+ * this key" — the owner never stated it, or un-said it. Stored attributes never
+ * contain null (upsertProduct strips the keys), so ProductAttributes above stays
+ * honest: a value is present or the key is absent, never a null in between.
+ */
+export type ProductAttributeUpdates = {
+  [K in keyof ProductAttributes]: ProductAttributes[K] | null;
+};
 
 export interface Product {
   id: number;

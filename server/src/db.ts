@@ -103,7 +103,10 @@ export function createSchema(db: DB): void {
 
     CREATE INDEX IF NOT EXISTS idx_products_status ON products(status);
     CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
+    -- Every batch flush claims one phone's un-settled rows by (phone, status).
+    CREATE INDEX IF NOT EXISTS idx_inbox_phone_status ON inbox(phone, status);
     CREATE INDEX IF NOT EXISTS idx_leads_created_at ON leads(created_at);
     CREATE INDEX IF NOT EXISTS idx_pending_media_phone ON pending_media(phone);
   `);
 }
+
