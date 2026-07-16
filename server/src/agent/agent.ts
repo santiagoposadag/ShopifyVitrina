@@ -1,11 +1,11 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { FastifyBaseLogger } from "fastify";
-import type { Config } from "./config.js";
-import type { DB } from "./db.js";
-import type { KapsoClient } from "./kapso.js";
-import { clearSessionId, getSessionId, setSessionId } from "./repo.js";
+import type { Config } from "../config.js";
+import type { DB } from "../data/db.js";
+import type { KapsoClient } from "../whatsapp/kapso.js";
+import { clearSessionId, getSessionId, setSessionId } from "../data/repo.js";
 import { buildToolServer, MCP_SERVER_NAME } from "./tools.js";
-import type { Role, TurnContext } from "./types.js";
+import type { Role, TurnContext } from "../types.js";
 
 /**
  * System prompt: English instructions, Spanish output. The agent is grounded —

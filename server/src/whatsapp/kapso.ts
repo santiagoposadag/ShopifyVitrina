@@ -1,4 +1,4 @@
-import type { Config } from "./config.js";
+import type { Config } from "../config.js";
 
 /**
  * Minimal REST client for Kapso's WhatsApp Cloud API proxy.

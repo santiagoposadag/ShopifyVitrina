@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isAllowedMediaHost, KapsoClient } from "../src/kapso.js";
+import { isAllowedMediaHost, KapsoClient } from "../src/whatsapp/kapso.js";
 
 describe("isAllowedMediaHost", () => {
   it("allows kapso.ai and its subdomains", () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Config } from "../src/config.js";
-import { previewLineFor, previewUrl } from "../src/preview.js";
+import { previewLineFor, previewUrl } from "../src/agent/preview.js";
 import type { Product } from "../src/types.js";
 
 const CONFIG = { storefrontBaseUrl: "https://vitrina.example.com" } as Config;

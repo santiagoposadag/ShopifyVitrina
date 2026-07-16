@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { RateLimiter } from "../src/rate-limit.js";
+import { RateLimiter } from "../src/inbox/rate-limit.js";
 
 const T0 = Date.UTC(2026, 0, 15, 12, 0, 0);
 const MINUTE = 60 * 1000;

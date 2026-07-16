@@ -1,12 +1,12 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { PHOTO_PLACEHOLDER, type InboxBatcher } from "./batcher.js";
-import type { Config } from "./config.js";
-import type { DB } from "./db.js";
-import type { KapsoClient } from "./kapso.js";
-import { saveMedia } from "./media.js";
-import { addPendingMedia, insertInboxMessage } from "./repo.js";
-import type { TurnContext } from "./types.js";
+import type { Config } from "../config.js";
+import type { DB } from "../data/db.js";
+import type { KapsoClient } from "../whatsapp/kapso.js";
+import { saveMedia } from "../whatsapp/media.js";
+import { addPendingMedia, insertInboxMessage } from "../data/repo.js";
+import type { TurnContext } from "../types.js";
 
 export const SIGNATURE_HEADER = "x-webhook-signature";
 

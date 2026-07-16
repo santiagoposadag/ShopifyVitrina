@@ -1,15 +1,15 @@
 import Fastify from "fastify";
-import { runAgentTurn } from "./agent.js";
-import { ConsecutiveFailureAlert } from "./alerts.js";
-import { InboxBatcher } from "./batcher.js";
+import { runAgentTurn } from "./agent/agent.js";
+import { ConsecutiveFailureAlert } from "./inbox/alerts.js";
+import { InboxBatcher } from "./inbox/batcher.js";
 import { isOwner, loadConfig, loadDotEnv } from "./config.js";
-import { openDb } from "./db.js";
-import { KapsoClient } from "./kapso.js";
-import { registerMediaRoutes } from "./media.js";
-import { PerPhoneQueue } from "./queue.js";
-import { RateLimiter } from "./rate-limit.js";
-import { deleteStaleInboxRows, deleteStalePendingMedia, upsertContact } from "./repo.js";
-import { registerWebhook, type WebhookDeps } from "./webhook.js";
+import { openDb } from "./data/db.js";
+import { KapsoClient } from "./whatsapp/kapso.js";
+import { registerMediaRoutes } from "./whatsapp/media.js";
+import { PerPhoneQueue } from "./inbox/queue.js";
+import { RateLimiter } from "./inbox/rate-limit.js";
+import { deleteStaleInboxRows, deleteStalePendingMedia, upsertContact } from "./data/repo.js";
+import { registerWebhook, type WebhookDeps } from "./inbox/webhook.js";
 import type { TurnContext } from "./types.js";
 
 const RATE_LIMIT_NOTICE =

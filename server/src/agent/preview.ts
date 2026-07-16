@@ -1,5 +1,5 @@
-import type { Config } from "./config.js";
-import type { Product } from "./types.js";
+import type { Config } from "../config.js";
+import type { Product } from "../types.js";
 
 /** The storefront's preview URL for a product, in any status. */
 export function previewUrl(config: Config, product: Product): string {

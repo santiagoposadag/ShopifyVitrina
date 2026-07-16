@@ -105,7 +105,7 @@ services:
     environment:
       <<: *data-env
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
-    command: ["node", "server/dist/seed.js"]
+    command: ["node", "server/dist/seed/seed.js"]
     volumes:
       - vitrina-data:/data
     profiles: ["seed"]
@@ -122,7 +122,7 @@ services:
       <<: *data-env
       BACKUP_DIR: ${BACKUP_DIR:-/data/backups}
       BACKUP_KEEP: ${BACKUP_KEEP:-}
-    command: ["node", "server/dist/backup.js"]
+    command: ["node", "server/dist/data/backup.js"]
     volumes:
       - vitrina-data:/data
     profiles: ["backup"]

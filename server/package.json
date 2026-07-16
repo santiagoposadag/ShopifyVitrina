@@ -6,9 +6,9 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "seed": "tsx src/seed.ts",
-    "seed:dist": "node dist/seed.js",
-    "backup": "tsx src/backup.ts",
+    "seed": "tsx src/seed/seed.ts",
+    "seed:dist": "node dist/seed/seed.js",
+    "backup": "tsx src/data/backup.ts",
     "build": "tsc --noEmit && tsc -p tsconfig.build.json",
     "test": "vitest run"
   },

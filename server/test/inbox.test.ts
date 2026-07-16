@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { openDb } from "../src/db.js";
+import { openDb } from "../src/data/db.js";
 import {
   claimInboxBatch,
   deleteStaleInboxRows,
@@ -10,7 +10,7 @@ import {
   markInboxBatchDone,
   markInboxBatchFailed,
   setSessionId,
-} from "../src/repo.js";
+} from "../src/data/repo.js";
 
 const MSG = { dedupe_key: "msg:wamid.1", phone: "573001", agent_text: "hola" };
 

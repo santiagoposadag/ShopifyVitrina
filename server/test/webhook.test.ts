@@ -1,13 +1,13 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { openDb } from "../src/db.js";
-import { insertInboxMessage } from "../src/repo.js";
+import { openDb } from "../src/data/db.js";
+import { insertInboxMessage } from "../src/data/repo.js";
 import {
   extractInbound,
   normalizeEvents,
   stableEventKey,
   verifySignature,
-} from "../src/webhook.js";
+} from "../src/inbox/webhook.js";
 
 const SECRET = "test_webhook_secret";
 

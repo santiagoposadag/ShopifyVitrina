@@ -1,11 +1,11 @@
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import type { Config } from "./config.js";
-import type { DB } from "./db.js";
-import type { KapsoClient } from "./kapso.js";
+import type { Config } from "../config.js";
+import type { DB } from "../data/db.js";
+import type { KapsoClient } from "../whatsapp/kapso.js";
 import { previewLineFor } from "./preview.js";
-import * as repo from "./repo.js";
-import type { Product, ProductAttributeUpdates, ProductStatus, TurnContext } from "./types.js";
+import * as repo from "../data/repo.js";
+import type { Product, ProductAttributeUpdates, ProductStatus, TurnContext } from "../types.js";
 
 export const MCP_SERVER_NAME = "vitrina";
 

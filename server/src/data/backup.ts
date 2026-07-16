@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { mkdirSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { loadDotEnv, resolveDataPath } from "./config.js";
+import { loadDotEnv, resolveDataPath } from "../config.js";
 
 /**
  * Consistent SQLite snapshot via the online backup API — safe while the server

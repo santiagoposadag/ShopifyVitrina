@@ -7,10 +7,10 @@ import {
   RETRY_DELAY_MS,
   type InboxBatcherDeps,
   type MessageKind,
-} from "../src/batcher.js";
-import { openDb, type DB } from "../src/db.js";
-import { PerPhoneQueue } from "../src/queue.js";
-import { getInboxRow, insertInboxMessage } from "../src/repo.js";
+} from "../src/inbox/batcher.js";
+import { openDb, type DB } from "../src/data/db.js";
+import { PerPhoneQueue } from "../src/inbox/queue.js";
+import { getInboxRow, insertInboxMessage } from "../src/data/repo.js";
 import type { TurnContext } from "../src/types.js";
 
 const DEBOUNCE_MS = 8000;

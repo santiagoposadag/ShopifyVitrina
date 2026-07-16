@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PerPhoneQueue } from "../src/queue.js";
+import { PerPhoneQueue } from "../src/inbox/queue.js";
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

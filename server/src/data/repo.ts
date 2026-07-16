@@ -8,7 +8,7 @@ import type {
   ProductAttributeUpdates,
   ProductPhoto,
   ProductStatus,
-} from "./types.js";
+} from "../types.js";
 
 interface ProductRow {
   id: number;

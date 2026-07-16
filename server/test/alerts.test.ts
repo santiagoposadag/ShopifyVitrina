@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ConsecutiveFailureAlert } from "../src/alerts.js";
+import { ConsecutiveFailureAlert } from "../src/inbox/alerts.js";
 
 const T0 = Date.UTC(2026, 0, 15, 12, 0, 0);
 const MINUTE = 60 * 1000;

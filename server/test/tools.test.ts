@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { Config } from "../src/config.js";
-import { openDb } from "../src/db.js";
-import type { KapsoClient } from "../src/kapso.js";
-import { buildToolServer, isPublishTransition, MCP_SERVER_NAME } from "../src/tools.js";
+import { openDb } from "../src/data/db.js";
+import type { KapsoClient } from "../src/whatsapp/kapso.js";
+import { buildToolServer, isPublishTransition, MCP_SERVER_NAME } from "../src/agent/tools.js";
 import type { Role } from "../src/types.js";
 
 const CUSTOMER_TOOLS = ["search_catalog", "get_product", "send_product_photos", "save_lead"];

@@ -51,19 +51,19 @@ Customer / Owner (WhatsApp)
 ### server/ — the brain
 
 - `src/config.ts` — env loading and role detection (`OWNER_PHONE_NUMBERS` allowlist).
-- `src/db.ts` — SQLite (WAL), schema created on boot.
-- `src/repo.ts` — all catalog/lead/session queries.
-- `src/kapso.ts` — Kapso REST client: `sendText`, `sendImage`, `sendInteractiveButtons`, `downloadMedia`.
-- `src/webhook.ts` — `POST /webhook`: HMAC verify (raw body), batch envelope, persisted inbox (dedupe + at-least-once: unfinished messages are replayed on boot), immediate media download, fast ACK.
-- `src/batcher.ts` — coalesces each phone's message burst into ONE agent turn (`BATCH_DEBOUNCE_MS` of silence, `BATCH_MAX_WAIT_MS` ceiling) and settles its inbox rows.
-- `src/queue.ts` — in-process FIFO with per-phone serialization.
-- `src/agent.ts` — Claude Agent SDK integration: resume per-phone session (idle sessions expire after `SESSION_MAX_AGE_DAYS`; an unresumable session falls back once to a fresh one), run tools, reply in Spanish.
-- `src/rate-limit.ts` — cost protection: per-phone sliding-hour limit + global daily cap for customer turns (owners exempt).
-- `src/alerts.ts` — notifies the owner's WhatsApp after consecutive agent failures.
-- `src/backup.ts` — consistent SQLite snapshot (online backup API) with pruning.
-- `src/tools.ts` — in-process MCP tools. Customer: `search_catalog`, `get_product`, `send_product_photos`, `save_lead`. Owner (allowlist): the above plus `upsert_product`, `attach_pending_photos`, `list_products`, `list_leads`.
-- `src/media.ts` — serves `MEDIA_DIR` under `/media/*`; saves inbound media.
-- `src/seed.ts` — parses the two example properties and inserts them as **active** with photos.
+- `src/data/db.ts` — SQLite (WAL), schema created on boot.
+- `src/data/repo.ts` — all catalog/lead/session queries.
+- `src/whatsapp/kapso.ts` — Kapso REST client: `sendText`, `sendImage`, `sendInteractiveButtons`, `downloadMedia`.
+- `src/inbox/webhook.ts` — `POST /webhook`: HMAC verify (raw body), batch envelope, persisted inbox (dedupe + at-least-once: unfinished messages are replayed on boot), immediate media download, fast ACK.
+- `src/inbox/batcher.ts` — coalesces each phone's message burst into ONE agent turn (`BATCH_DEBOUNCE_MS` of silence, `BATCH_MAX_WAIT_MS` ceiling) and settles its inbox rows.
+- `src/inbox/queue.ts` — in-process FIFO with per-phone serialization.
+- `src/agent/agent.ts` — Claude Agent SDK integration: resume per-phone session (idle sessions expire after `SESSION_MAX_AGE_DAYS`; an unresumable session falls back once to a fresh one), run tools, reply in Spanish.
+- `src/inbox/rate-limit.ts` — cost protection: per-phone sliding-hour limit + global daily cap for customer turns (owners exempt).
+- `src/inbox/alerts.ts` — notifies the owner's WhatsApp after consecutive agent failures.
+- `src/data/backup.ts` — consistent SQLite snapshot (online backup API) with pruning.
+- `src/agent/tools.ts` — in-process MCP tools. Customer: `search_catalog`, `get_product`, `send_product_photos`, `save_lead`. Owner (allowlist): the above plus `upsert_product`, `attach_pending_photos`, `list_products`, `list_leads`.
+- `src/whatsapp/media.ts` — serves `MEDIA_DIR` under `/media/*`; saves inbound media.
+- `src/seed/seed.ts` — parses the two example properties and inserts them as **active** with photos.
 - `src/index.ts` — wires everything; `GET /health`.
 
 ### web/ — the storefront
@@ -288,14 +288,14 @@ Schedule the host script daily, e.g. with cron:
 
 External API details were checked against live docs (Kapso `send-messages/*`,
 `webhooks/*`; Claude Agent SDK TypeScript reference) and are isolated behind
-`src/kapso.ts`, `src/webhook.ts`, and `src/agent.ts`. Confirm these against a real
+`src/whatsapp/kapso.ts`, `src/inbox/webhook.ts`, and `src/agent/agent.ts`. Confirm these against a real
 sandbox before production:
 
 1. **Webhook signature basis.** Kapso docs express the signed content as
    `JSON.stringify(payload)`; we verify the HMAC-SHA256 over the **raw request body**
    (the robust choice — re-serializing can reorder keys). For Kapso-generated requests
    these are identical. If Kapso ever signs a re-serialized form, adjust
-   `verifySignature` in `src/webhook.ts`. We accept both a bare hex digest and a
+   `verifySignature` in `src/inbox/webhook.ts`. We accept both a bare hex digest and a
    `sha256=`-prefixed value.
 2. **Inbound webhook envelope.** We read the message from `event.message`,
    `event.data.message`, or the event itself, and unwrap the batch envelope
@@ -303,7 +303,7 @@ sandbox before production:
    (`extractInbound` / `normalizeEvents`).
 3. **Inbound media URL + auth.** We download from `message.kapso.media_data.url` (falling
    back to `kapso.media_url`) and send `X-API-Key`. Confirm the field and whether the
-   signed token needs the header (`downloadMedia` in `src/kapso.ts`).
+   signed token needs the header (`downloadMedia` in `src/whatsapp/kapso.ts`).
 4. **Interactive replies.** We read `interactive.button_reply` / `interactive.list_reply`.
    Confirm inbound shape for list replies.
 5. **Agent session id.** We capture `session_id` from the SDK result message and resume

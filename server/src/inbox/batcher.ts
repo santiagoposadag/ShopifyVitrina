@@ -1,5 +1,5 @@
 import type { FastifyBaseLogger } from "fastify";
-import type { DB } from "./db.js";
+import type { DB } from "../data/db.js";
 import type { PerPhoneQueue } from "./queue.js";
 import {
   claimInboxBatch,
@@ -7,8 +7,8 @@ import {
   markInboxBatchDone,
   markInboxBatchFailed,
   markInboxBatchPending,
-} from "./repo.js";
-import type { TurnContext } from "./types.js";
+} from "../data/repo.js";
+import type { TurnContext } from "../types.js";
 
 /**
  * Total processing attempts a batch's rows get before settling as 'failed'.

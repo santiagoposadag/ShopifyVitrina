@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../src/config.js";
-import { openDb, type DB } from "../src/db.js";
-import type { KapsoClient } from "../src/kapso.js";
-import { getSessionId, setSessionId } from "../src/repo.js";
+import { openDb, type DB } from "../src/data/db.js";
+import type { KapsoClient } from "../src/whatsapp/kapso.js";
+import { getSessionId, setSessionId } from "../src/data/repo.js";
 import type { TurnContext } from "../src/types.js";
 
 // Only `query` is faked; tools.ts imports createSdkMcpServer/tool from the same
@@ -13,7 +13,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importActual) => ({
   query: queryMock,
 }));
 
-const { runAgentTurn } = await import("../src/agent.js");
+const { runAgentTurn } = await import("../src/agent/agent.js");
 
 const PHONE = "573001112233";
 const CTX: TurnContext = { phone: PHONE, role: "customer" };

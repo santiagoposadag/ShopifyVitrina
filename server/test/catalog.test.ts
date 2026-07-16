@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { openDb, type DB } from "../src/db.js";
+import { openDb, type DB } from "../src/data/db.js";
 import {
   attachPendingPhotos,
   addPendingMedia,
@@ -8,7 +8,7 @@ import {
   listLeads,
   searchCatalog,
   upsertProduct,
-} from "../src/repo.js";
+} from "../src/data/repo.js";
 
 function seed(db: DB): void {
   upsertProduct(

@@ -2,7 +2,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { parseListing } from "../src/parse-listing.js";
+import { parseListing } from "../src/seed/parse-listing.js";
 
 const REPO_ROOT = resolve(fileURLToPath(new URL(".", import.meta.url)), "../../");
 
