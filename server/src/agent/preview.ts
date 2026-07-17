@@ -6,6 +6,29 @@ export function previewUrl(config: Config, product: Product): string {
   return `${config.storefrontBaseUrl}/preview/${encodeURIComponent(product.code)}`;
 }
 
+/** The public storefront URL for a product. Only active products render there. */
+export function propertyUrl(config: Config, product: Product): string {
+  return `${config.storefrontBaseUrl}/propiedad/${encodeURIComponent(product.code)}`;
+}
+
+/**
+ * The link appended to the product-reading tools' results, so the agent can
+ * relay a page instead of the facts alone. This is how a customer sees photos:
+ * the assistant cannot send images, it sends this.
+ *
+ * It comes back from a tool rather than living in the prompt because of the
+ * grounding rules — a URL the model assembles from memory is a URL it can get
+ * wrong.
+ *
+ * Empty unless the product is active, mirroring previewLineFor: the storefront
+ * only serves active products at this path, so a draft's link would 404, and a
+ * draft's facts are unreviewed and must not reach a customer either way.
+ */
+export function linkLineFor(config: Config, product: Product): string {
+  if (product.status !== "active") return "";
+  return ` | link=${propertyUrl(config, product)}`;
+}
+
 /**
  * The line appended to upsert_product's result so the agent relays a preview
  * link to the owner — the owner cannot review a draft any other way, since the

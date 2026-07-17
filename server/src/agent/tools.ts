@@ -2,8 +2,7 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { Config } from "../config.js";
 import type { DB } from "../data/db.js";
-import type { KapsoClient } from "../whatsapp/kapso.js";
-import { previewLineFor } from "./preview.js";
+import { linkLineFor, previewLineFor } from "./preview.js";
 import * as repo from "../data/repo.js";
 import type { Product, ProductAttributeUpdates, ProductStatus, TurnContext } from "../types.js";
 
@@ -17,14 +16,17 @@ export function isPublishTransition(
   return next === "active" && previous !== "active";
 }
 
+/**
+ * No WhatsApp client on purpose: the tools may read and write data, never push
+ * a message into the chat. The turn's single reply is runAgentTurn's to send,
+ * and photos are relayed as a storefront link (see linkLineFor), never as
+ * images — so the tool server has nothing to send them with.
+ */
 export interface ToolDeps {
   db: DB;
-  kapso: KapsoClient;
   config: Config;
   ctx: TurnContext;
 }
-
-const MAX_PHOTOS_PER_SEND = 4;
 
 function text(body: string) {
   return { content: [{ type: "text" as const, text: body }] };
@@ -61,11 +63,11 @@ function describeProduct(p: Product): string {
  * acting phone number is taken from context, never from the model.
  */
 export function buildToolServer(deps: ToolDeps) {
-  const { db, kapso, config, ctx } = deps;
+  const { db, config, ctx } = deps;
 
   const searchCatalog = tool(
     "search_catalog",
-    "Search the ACTIVE product catalog. Returns matching products with their facts. Use this before answering any question about availability, price, or features. Never answer product facts from memory.",
+    "Search the ACTIVE product catalog. Returns matching products with their facts, each with a 'link' to its page on the storefront. Use this before answering any question about availability, price, or features. Never answer product facts from memory.",
     {
       query: z.string().optional().describe("Free-text search over title, description, neighborhood, features"),
       min_price: z.number().optional().describe("Minimum price (COP)"),
@@ -78,36 +80,22 @@ export function buildToolServer(deps: ToolDeps) {
       if (results.length === 0) {
         return text("No matching active products. Offer to save the inquiry as a lead.");
       }
-      return text(results.map(describeProduct).join("\n"));
+      return text(results.map((p) => describeProduct(p) + linkLineFor(config, p)).join("\n"));
     },
   );
 
   const getProduct = tool(
     "get_product",
-    "Get a single product by its code, including all facts. Use this when the customer references a specific code.",
+    "Get a single product by its code, including all facts, how many photos its page has, and a 'link' to that page on the storefront. Use this when the customer references a specific code.",
     { code: z.string().describe("The product code") },
     async ({ code }) => {
       const product = repo.getProductByCode(db, code);
       if (!product) return text(`No product found with code ${code}.`);
       const photos = repo.getProductPhotos(db, product.id);
-      return text(`${describeProduct(product)} | photos_available=${photos.length}`);
-    },
-  );
-
-  const sendProductPhotos = tool(
-    "send_product_photos",
-    `Send up to ${MAX_PHOTOS_PER_SEND} photos of a product to the current WhatsApp chat. Use when the customer asks to see the property or when offering photos.`,
-    { code: z.string().describe("The product code whose photos to send") },
-    async ({ code }) => {
-      const product = repo.getProductByCode(db, code);
-      if (!product) return text(`No product found with code ${code}.`);
-      const photos = repo.getProductPhotos(db, product.id).slice(0, MAX_PHOTOS_PER_SEND);
-      if (photos.length === 0) return text(`Product ${code} has no photos yet.`);
-      for (const [index, photo] of photos.entries()) {
-        const caption = index === 0 ? `${product.title} (código ${product.code})` : undefined;
-        await kapso.sendImage(ctx.phone, photo.public_path, caption);
-      }
-      return text(`Sent ${photos.length} photo(s) for código ${code} to the customer.`);
+      return text(
+        `${describeProduct(product)} | photos_available=${photos.length}` +
+          linkLineFor(config, product),
+      );
     },
   );
 
@@ -132,7 +120,7 @@ export function buildToolServer(deps: ToolDeps) {
     },
   );
 
-  const customerTools = [searchCatalog, getProduct, sendProductPhotos, saveLead];
+  const customerTools = [searchCatalog, getProduct, saveLead];
 
   if (ctx.role !== "owner") {
     return {

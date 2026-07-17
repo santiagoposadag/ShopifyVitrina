@@ -8,9 +8,14 @@ import type { Config } from "../config.js";
  * Body:   Meta Cloud API format  ({ messaging_product: "whatsapp", ... })
  *
  * Verified against https://docs.kapso.ai/docs/whatsapp/send-messages/* (text,
- * image, buttons). Media download uses the signed url returned on the inbound
+ * buttons). Media download uses the signed url returned on the inbound
  * webhook (message.kapso.media_data.url); token expires ~4 minutes so callers
  * MUST download at webhook receipt, not from the agent job.
+ *
+ * Outbound is text-only by design. We never push images into a chat: a product's
+ * photos live on its storefront page and the assistant relays that link. There
+ * is deliberately no sendImage — adding one back should be a decision, not a
+ * method that happens to be within reach.
  */
 
 const KAPSO_BASE = "https://api.kapso.ai/meta/whatsapp/v24.0";
@@ -69,15 +74,6 @@ export class KapsoClient {
       to,
       type: "text",
       text: { body },
-    });
-  }
-
-  async sendImage(to: string, link: string, caption?: string): Promise<void> {
-    await this.post({
-      messaging_product: "whatsapp",
-      to,
-      type: "image",
-      image: caption ? { link, caption } : { link },
     });
   }
 

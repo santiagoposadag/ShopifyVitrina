@@ -204,6 +204,37 @@ describe("systemPrompt role boundary", () => {
   });
 });
 
+// The pilot's customer path was interrogating people — several questions per
+// reply, and a visit pushed before the customer had seen anything. It was doing
+// what the prompt asked for ("move them toward a visit", "proactively offer to
+// schedule"), so the pacing rules that replaced those lines ARE the fix, not
+// decoration around it.
+describe("systemPrompt customer conversation style", () => {
+  it("asks one question at a time and answers before it asks", () => {
+    const prompt = systemPrompt("customer");
+    expect(prompt).toContain("ONE question per message");
+    expect(prompt).toContain("Answer first, ask second");
+  });
+
+  it("makes the visit the customer's decision, not the agent's goal", () => {
+    const prompt = systemPrompt("customer");
+    expect(prompt).toContain("A VISIT IS THEIR DECISION, NOT YOUR GOAL");
+    expect(prompt).toContain("Never offer one in your first reply");
+    expect(prompt).not.toContain("move them toward a visit"); // the old goal
+    expect(prompt).not.toContain("Proactively offer"); // the old eagerness
+  });
+
+  // The conversational half of the no-images boundary. tools.test.ts pins the
+  // structural half: no role gets a tool that could send media.
+  it("routes photos to the property page instead of the chat", () => {
+    const prompt = systemPrompt("customer");
+    expect(prompt).toContain("PHOTOS LIVE ON THE PROPERTY PAGE");
+    expect(prompt).toContain("CANNOT send images");
+    expect(prompt).toContain("Send the link exactly as the tool returned it"); // no invented URLs
+    expect(prompt).not.toContain("send_product_photos"); // the tool is gone
+  });
+});
+
 describe("runAgentTurn session reset after publish", () => {
   let db: DB;
   let sent: string[];
