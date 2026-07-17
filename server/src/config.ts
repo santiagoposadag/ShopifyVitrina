@@ -127,7 +127,13 @@ export function loadDotEnv(path = ".env"): void {
   const proc = process as unknown as { loadEnvFile?: (p: string) => void };
   if (typeof proc.loadEnvFile === "function") {
     try {
-      proc.loadEnvFile(path);
+      // Anchor at REPO_ROOT, not the cwd, for the same reason resolveDataPath
+      // exists: every `npm run <script> -w server` (dev, seed, backup) runs from
+      // server/, where a relative ".env" resolves to a file that does not exist
+      // and the catch below swallows it. Every variable then falls back to its
+      // default — and an empty OWNER_PHONE_NUMBERS makes every phone read as a
+      // customer, the owner included.
+      proc.loadEnvFile(resolveDataPath(path));
     } catch {
       // No .env file present — rely on real environment variables.
     }
