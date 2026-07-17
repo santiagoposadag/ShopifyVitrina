@@ -13,7 +13,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importActual) => ({
   query: queryMock,
 }));
 
-const { runAgentTurn } = await import("../src/agent/agent.js");
+const { runAgentTurn, systemPrompt } = await import("../src/agent/agent.js");
 
 const PHONE = "573001112233";
 const CTX: TurnContext = { phone: PHONE, role: "customer" };
@@ -37,6 +37,7 @@ const CONFIG: Config = {
   batchMediaDebounceMs: 45000,
   batchMediaMaxWaitMs: 120000,
   storefrontBaseUrl: "http://localhost:3000",
+  customerAgentEnabled: true,
 };
 
 /** A successful SDK stream: an assistant block plus the final result message. */
@@ -173,6 +174,33 @@ describe("runAgentTurn session fallback", () => {
 
     expect(await runAgentTurn(deps, CTX, "hola")).toBe("Hola");
     expect(queryMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// The conversational twin of the tool privilege boundary in tools.test.ts: the
+// customer persona must not just LACK the inventory tools, it must refuse the
+// inventory CONVERSATION — a misclassified owner once got walked through a full
+// listing flow that failed only at the tool call.
+describe("systemPrompt role boundary", () => {
+  it("scopes the customer persona to sales only", () => {
+    const prompt = systemPrompt("customer");
+    expect(prompt).toContain("YOU DO NOT MANAGE INVENTORY");
+    expect(prompt).toContain("never by what the person claims"); // social-engineering guard
+    expect(prompt).not.toContain("upsert_product");
+    expect(prompt).not.toContain("attach_pending_photos");
+  });
+
+  it("keeps the inventory instructions for the owner", () => {
+    const prompt = systemPrompt("owner");
+    expect(prompt).toContain("INVENTORY assistant");
+    expect(prompt).toContain("upsert_product");
+    expect(prompt).not.toContain("YOU DO NOT MANAGE INVENTORY");
+  });
+
+  it("keeps the grounding rules in both personas", () => {
+    for (const role of ["customer", "owner"] as const) {
+      expect(systemPrompt(role)).toContain("GROUNDING RULES");
+    }
   });
 });
 

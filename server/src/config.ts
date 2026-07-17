@@ -41,6 +41,12 @@ export interface Config {
   batchMediaMaxWaitMs: number;
   /** Public URL of the STOREFRONT (the web app) — not this server. */
   storefrontBaseUrl: string;
+  /**
+   * Kill switch for the customer path. When false, non-owner messages get a
+   * static "assistant unavailable" reply and never reach the agent (no Claude
+   * call). Owners are unaffected.
+   */
+  customerAgentEnabled: boolean;
 }
 
 function required(name: string): string {
@@ -63,6 +69,14 @@ function optionalInt(name: string, fallback: number): number {
     throw new Error(`Invalid value for ${name}: expected a positive integer, got "${raw}"`);
   }
   return value;
+}
+
+/** Exported for tests. Accepts true/false/1/0 (case-insensitive); empty → fallback. */
+export function optionalBool(name: string, fallback: boolean): boolean {
+  const raw = optional(name, String(fallback)).toLowerCase();
+  if (raw === "true" || raw === "1") return true;
+  if (raw === "false" || raw === "0") return false;
+  throw new Error(`Invalid value for ${name}: expected true/false/1/0, got "${raw}"`);
 }
 
 /** Normalize a phone number to bare E.164 digits (strip '+', spaces, dashes). */
@@ -97,6 +111,7 @@ export function loadConfig(): Config {
     batchMediaDebounceMs: optionalInt("BATCH_MEDIA_DEBOUNCE_MS", 45000),
     batchMediaMaxWaitMs: optionalInt("BATCH_MEDIA_MAX_WAIT_MS", 120000),
     storefrontBaseUrl: optional("STOREFRONT_BASE_URL", "http://localhost:3000").replace(/\/+$/, ""),
+    customerAgentEnabled: optionalBool("CUSTOMER_AGENT_ENABLED", true),
   };
 }
 

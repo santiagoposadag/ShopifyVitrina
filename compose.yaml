@@ -36,6 +36,9 @@ services:
       RATE_LIMIT_PER_PHONE_PER_HOUR: ${RATE_LIMIT_PER_PHONE_PER_HOUR:-}
       RATE_LIMIT_GLOBAL_PER_DAY: ${RATE_LIMIT_GLOBAL_PER_DAY:-}
       SESSION_MAX_AGE_DAYS: ${SESSION_MAX_AGE_DAYS:-}
+      # Kill switch for the customer path: false auto-replies "assistant
+      # unavailable" to non-owners without running the agent. Default true.
+      CUSTOMER_AGENT_ENABLED: ${CUSTOMER_AGENT_ENABLED:-}
       # Coalescing of a phone's message burst into one agent turn. Empty values
       # fall back to the defaults in server/src/config.ts (8s silence, 45s cap
       # for text; 45s silence, 120s cap once a burst contains photos).

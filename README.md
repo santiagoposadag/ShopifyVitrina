@@ -124,6 +124,7 @@ Every variable is documented in `env.sample`. Key ones:
 | `PUBLIC_BASE_URL` | Public URL of the server (a tunnel) — used to build photo URLs WhatsApp can fetch. |
 | `STOREFRONT_BASE_URL` | Public URL of the **storefront** (a different host from `PUBLIC_BASE_URL`) — used to build the owner's private draft-preview links (default `http://localhost:3000`). |
 | `RATE_LIMIT_PER_PHONE_PER_HOUR`, `RATE_LIMIT_GLOBAL_PER_DAY` | Cost protection for customer agent turns (defaults 20/hour per phone, 500/day global; owners exempt). |
+| `CUSTOMER_AGENT_ENABLED` | Kill switch for the customer path (default `true`). `false` auto-replies that the assistant is unavailable — non-owner messages never reach the agent or spend a Claude call. |
 | `SESSION_MAX_AGE_DAYS` | Conversations idle longer than this start a fresh agent session (default 7). |
 | `BATCH_DEBOUNCE_MS`, `BATCH_MAX_WAIT_MS` | How long a phone's messages are coalesced into one agent turn: silence that ends a burst (default 8000) and the ceiling from its first message (default 45000). |
 | `BATCH_MEDIA_DEBOUNCE_MS`, `BATCH_MEDIA_MAX_WAIT_MS` | The same two knobs once a burst contains photos (defaults 45000 / 120000) — WhatsApp delivers a photo set in waves tens of seconds apart. |

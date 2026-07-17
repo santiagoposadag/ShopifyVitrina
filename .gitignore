@@ -8,3 +8,6 @@ dist/
 
 .codegraph/
 .playwright-mcp/
+
+# Local scratch template for .env (see env.sample for the committed reference)
+env.txt

@@ -14,6 +14,8 @@ import type { TurnContext } from "./types.js";
 
 const RATE_LIMIT_NOTICE =
   "Estamos recibiendo muchos mensajes tuyos en poco tiempo. Dame unos minutos y escríbeme de nuevo, por favor.";
+const CUSTOMER_UNAVAILABLE_NOTICE =
+  "Hola, gracias por escribirnos. En este momento nuestro asistente de ventas no está disponible. Por favor intenta más tarde.";
 const AGENT_ERROR_APOLOGY =
   "Disculpa, tuve un inconveniente para responder. ¿Podrías intentarlo de nuevo?";
 const OWNER_FAILURE_ALERT =
@@ -81,6 +83,18 @@ async function main(): Promise<void> {
     roleFor,
     onMessage: async (ctx: TurnContext, text: string) => {
       upsertContact(db, ctx.phone, ctx.role);
+
+      // Kill switch: with the customer path disabled, non-owners get a static
+      // notice and the agent never runs (no Claude call). One reply per
+      // coalesced burst, so a message barrage cannot turn this into spam.
+      if (ctx.role !== "owner" && !config.customerAgentEnabled) {
+        try {
+          await kapso.sendText(ctx.phone, CUSTOMER_UNAVAILABLE_NOTICE);
+        } catch {
+          // Best effort.
+        }
+        return; // Deliberately consumed; the inbox batch settles as done.
+      }
 
       // Cost protection: customers are rate limited; owners are exempt.
       if (ctx.role !== "owner") {
