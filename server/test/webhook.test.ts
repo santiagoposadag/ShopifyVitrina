@@ -1,13 +1,13 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { openDb } from "../src/db.js";
-import { markProcessed } from "../src/repo.js";
+import { openDb } from "../src/data/db.js";
+import { insertInboxMessage } from "../src/data/repo.js";
 import {
   extractInbound,
   normalizeEvents,
   stableEventKey,
   verifySignature,
-} from "../src/webhook.js";
+} from "../src/inbox/webhook.js";
 
 const SECRET = "test_webhook_secret";
 
@@ -40,26 +40,16 @@ describe("verifySignature", () => {
   });
 });
 
-describe("idempotency dedupe", () => {
-  it("records a key once and reports duplicates", () => {
-    const db = openDb(":memory:");
-    expect(markProcessed(db, "idem-1")).toBe(true);
-    expect(markProcessed(db, "idem-1")).toBe(false);
-    expect(markProcessed(db, "idem-2")).toBe(true);
-    db.close();
-  });
-});
-
-describe("per-event dedupe without an idempotency header", () => {
+describe("per-event dedupe via the inbox", () => {
   it("dedupes on the WhatsApp message id across retries", () => {
     const db = openDb(":memory:");
     const event = { message: { id: "wamid.ABC", type: "text", from: "573001", text: { body: "hi" } } };
     const inbound = extractInbound(event);
     const key = stableEventKey(event, inbound?.id);
     expect(key).toBe("msg:wamid.ABC");
-    // First delivery is fresh; the 10/40/90s retry of the same message is not.
-    expect(markProcessed(db, key)).toBe(true);
-    expect(markProcessed(db, key)).toBe(false);
+    // First delivery is persisted; the 10/40/90s retry of the same message is not.
+    expect(insertInboxMessage(db, { dedupe_key: key, phone: "573001", agent_text: "hi" })).not.toBeNull();
+    expect(insertInboxMessage(db, { dedupe_key: key, phone: "573001", agent_text: "hi" })).toBeNull();
     db.close();
   });
 
@@ -70,8 +60,8 @@ describe("per-event dedupe without an idempotency header", () => {
     const key2 = stableEventKey(event, undefined);
     expect(key1).toBe(key2); // deterministic
     expect(key1.startsWith("evt:")).toBe(true);
-    expect(markProcessed(db, key1)).toBe(true);
-    expect(markProcessed(db, key2)).toBe(false); // retry deduped
+    expect(insertInboxMessage(db, { dedupe_key: key1, phone: "573001", agent_text: "hola" })).not.toBeNull();
+    expect(insertInboxMessage(db, { dedupe_key: key2, phone: "573001", agent_text: "hola" })).toBeNull(); // retry deduped
     db.close();
   });
 

@@ -1,7 +1,16 @@
 node_modules/
 .next/
-data/
+# Leading slash: the runtime SQLite/media directory at the repo root ONLY.
+# Unanchored, this also matched server/src/data/ — real source, silently
+# untracked, so a commit would build fine locally and fail in the image.
+/data/
 .env
 *.log
 dist/
 .DS_Store
+
+.codegraph/
+.playwright-mcp/
+
+# Local scratch template for .env (see env.sample for the committed reference)
+env.txt

@@ -1,0 +1,179 @@
+# Shared environment blocks (YAML anchors) so the services that need the same
+# variables cannot drift apart.
+#
+# Secrets and per-deploy config arrive via ${VAR} interpolation, which Compose
+# resolves from the parent shell env OR a repo-root .env file.
+# Preferred flow: ./scripts/with-secrets.sh docker compose up -d
+# (exports the secrets from gopass); a plain .env still works as fallback.
+x-secrets-env: &secrets-env
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  KAPSO_API_KEY: ${KAPSO_API_KEY}
+  KAPSO_PHONE_NUMBER_ID: ${KAPSO_PHONE_NUMBER_ID}
+  KAPSO_WEBHOOK_SECRET: ${KAPSO_WEBHOOK_SECRET}
+  OWNER_PHONE_NUMBERS: ${OWNER_PHONE_NUMBERS:-}
+
+# Absolute paths inside the containers. server/src/config.ts short-circuits on
+# isAbsolute(), so these override anything set in .env.
+x-data-env: &data-env
+  DB_PATH: /data/vitrina.db
+  MEDIA_DIR: /data/media
+
+services:
+  server:
+    image: vitrina-server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      <<: [*secrets-env, *data-env]
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
+      # The STOREFRONT's URL, not this server's — the two are different hosts.
+      # Used to build the owner's private draft-preview links.
+      STOREFRONT_BASE_URL: ${STOREFRONT_BASE_URL:-http://localhost:3000}
+      PORT: "3001"
+      # Cost/abuse protection and session lifetime. Empty values fall back to
+      # the defaults in server/src/config.ts (20/hour, 500/day, 7 days).
+      RATE_LIMIT_PER_PHONE_PER_HOUR: ${RATE_LIMIT_PER_PHONE_PER_HOUR:-}
+      RATE_LIMIT_GLOBAL_PER_DAY: ${RATE_LIMIT_GLOBAL_PER_DAY:-}
+      SESSION_MAX_AGE_DAYS: ${SESSION_MAX_AGE_DAYS:-}
+      # Kill switch for the customer path: false auto-replies "assistant
+      # unavailable" to non-owners without running the agent. Default true.
+      CUSTOMER_AGENT_ENABLED: ${CUSTOMER_AGENT_ENABLED:-}
+      # Where the Agent SDK keeps its transcripts, so hourly housekeeping can
+      # delete the ones no session row can resume any more (dropping a session id
+      # leaves its transcript behind forever otherwise). Deliberately explicit
+      # and NOT defaulted in code: the path the SDK would derive on a developer's
+      # machine is that developer's own Claude Code history for this repo. Unset,
+      # the sweep does nothing. See server/src/data/transcripts.ts.
+      AGENT_TRANSCRIPTS_DIR: /home/node/.claude/projects
+      # Coalescing of a phone's message burst into one agent turn. Empty values
+      # fall back to the defaults in server/src/config.ts (8s silence, 45s cap
+      # for text; 45s silence, 120s cap once a burst contains photos).
+      BATCH_DEBOUNCE_MS: ${BATCH_DEBOUNCE_MS:-}
+      BATCH_MAX_WAIT_MS: ${BATCH_MAX_WAIT_MS:-}
+      BATCH_MEDIA_DEBOUNCE_MS: ${BATCH_MEDIA_DEBOUNCE_MS:-}
+      BATCH_MEDIA_MAX_WAIT_MS: ${BATCH_MEDIA_MAX_WAIT_MS:-}
+    ports:
+      - "3001:3001"
+    volumes:
+      - vitrina-data:/data
+      # The Agent SDK stores its session transcripts under its home directory,
+      # NOT in our SQLite db — which only holds the session id. Without this
+      # volume the transcripts live on the container's ephemeral overlay fs, so
+      # every recreate leaves SQLite pointing at ids whose transcripts are gone
+      # and the agent fails to resume them (runAgentTurn falls back to a fresh
+      # session, so replies survive, but the conversation history does not).
+      # Mounting the whole directory also persists the SDK's .cache — intended.
+      # Only the server runs the agent; seed and backup share the image but not
+      # this volume. The purge-sessions profile mounts it too, because deleting a
+      # conversation means deleting the transcript, not just the SQLite row.
+      - vitrina-sessions:/home/node/.claude
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+  web:
+    image: vitrina-web
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        # NEXT_PUBLIC_* vars are inlined at build time by Next.js — they must
+        # be build args, not just runtime `environment:` below.
+        NEXT_PUBLIC_BRAND_NAME: ${NEXT_PUBLIC_BRAND_NAME:-Vitrina}
+        NEXT_PUBLIC_WHATSAPP_NUMBER: ${NEXT_PUBLIC_WHATSAPP_NUMBER:-}
+    environment:
+      <<: *data-env
+    ports:
+      # Host port is configurable so the storefront can coexist with other
+      # local apps that claim 3000 (set WEB_PORT in the shell or compose .env).
+      - "${WEB_PORT:-3000}:3000"
+    volumes:
+      # Read-write, NOT read-only: SQLite in WAL mode writes -shm and -wal
+      # sidecar files next to the DB even for read-only queries, so a
+      # read-only mount here would break every read the storefront does.
+      - vitrina-data:/data
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Seeds the two example properties. Excluded from `docker compose up` via
+  # the "seed" profile — run it explicitly with:
+  #   docker compose --profile seed run --rm seed
+  # Shares the server image (same `image:` tag) so it is built only once.
+  # Needs no secrets (seed.ts never reads them), but DOES need PUBLIC_BASE_URL:
+  # it is baked into the seeded photo URLs that WhatsApp later fetches.
+  seed:
+    image: vitrina-server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      <<: *data-env
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
+    command: ["node", "server/dist/seed/seed.js"]
+    volumes:
+      - vitrina-data:/data
+    profiles: ["seed"]
+
+  # One-off consistent SQLite snapshot (online backup API, safe under writes).
+  #   docker compose --profile backup run --rm backup   # snapshot inside the volume
+  #   ./scripts/backup.sh                               # snapshot copied to ./backups on the host
+  backup:
+    image: vitrina-server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      <<: *data-env
+      BACKUP_DIR: ${BACKUP_DIR:-/data/backups}
+      BACKUP_KEEP: ${BACKUP_KEEP:-}
+    command: ["node", "server/dist/data/backup.js"]
+    volumes:
+      - vitrina-data:/data
+    profiles: ["backup"]
+
+  # Drop every CUSTOMER conversation history — session rows and the transcripts
+  # behind them — and collect transcripts orphaned by earlier resets. Customers
+  # start fresh on their next message; OWNER sessions are kept (an owner
+  # mid-listing would lose in-progress work). Needs the secrets wrapper: it reads
+  # OWNER_PHONE_NUMBERS to tell the two apart.
+  #   ./scripts/with-secrets.sh docker compose --profile purge run --rm purge-sessions
+  #
+  # A command rather than an env flag on the server, on purpose: a purge checked
+  # at boot would re-fire on every restart and wipe live conversations each time.
+  purge-sessions:
+    image: vitrina-server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      <<: *data-env
+      OWNER_PHONE_NUMBERS: ${OWNER_PHONE_NUMBERS:-}
+      SESSION_MAX_AGE_DAYS: ${SESSION_MAX_AGE_DAYS:-}
+      AGENT_TRANSCRIPTS_DIR: /home/node/.claude/projects
+    command: ["node", "server/dist/data/purge-sessions.js"]
+    volumes:
+      - vitrina-data:/data
+      # Both volumes: the session id lives in SQLite on vitrina-data, the
+      # transcript it points at lives here. Purging one without the other either
+      # leaves a resumable conversation or leaks the file forever.
+      - vitrina-sessions:/home/node/.claude
+    profiles: ["purge"]
+
+volumes:
+  # A named volume (not a host bind mount): the image already creates /data
+  # owned by the non-root `node` user (see the Dockerfiles). A named volume
+  # inherits that ownership on first use; a host bind mount would land
+  # root-owned on most hosts and the non-root process could not write to it.
+  vitrina-data: {}
+  # Same reasoning for the Agent SDK's home: server/Dockerfile creates
+  # /home/node/.claude owned by node so this volume inherits that ownership.
+  # Separate from vitrina-data because it is disposable — losing it costs
+  # conversation history, not business data, and the storefront never reads it.
+  vitrina-sessions: {}

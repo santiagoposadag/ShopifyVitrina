@@ -38,6 +38,58 @@ If Vitrina later runs **autonomous AI agents** that need scoped, revocable, logg
 
 ## Decision
 
-- **Now (solo/pilot):** keep gitignored `.env` + `env.sample` (current setup). Adequate while one person holds the keys.
+- **Now (solo/pilot):** ~~keep gitignored `.env` + `env.sample`~~ **superseded 2026-07-10 — adopted gopass, see below.**
 - **When the team grows or prod deploys:** adopt **Doppler or Infisical** for runtime env injection in dev and prod. If the team standardizes on 1Password, `op run` is an equal alternative.
 - **Do not** use onecli as a `.env` replacement.
+
+## Adopted: gopass (2026-07-10)
+
+> Replaces the hand-populated plaintext `.env` for the solo/pilot phase. Trigger:
+> working from a second machine that had no `.env`, plus raw API keys sitting
+> unencrypted on disk.
+
+**What**: [gopass](https://github.com/gopasspw/gopass) — each secret is a
+GPG-encrypted file inside a git repo (the "store"), synced to a **private
+GitHub repo**. No server, no SaaS.
+
+### Layout
+
+| Secret | gopass path |
+|--------|-------------|
+| `ANTHROPIC_API_KEY` | `vitrina/anthropic_api_key` |
+| `KAPSO_API_KEY` | `vitrina/kapso_api_key` |
+| `KAPSO_PHONE_NUMBER_ID` | `vitrina/kapso_phone_number_id` |
+| `KAPSO_WEBHOOK_SECRET` | `vitrina/kapso_webhook_secret` |
+
+Non-secret config (`OWNER_PHONE_NUMBERS`, `PUBLIC_BASE_URL`, `NEXT_PUBLIC_*`)
+stays out of the vault — shell env or `.env` fallback.
+
+### Daily use
+
+```sh
+./scripts/with-secrets.sh docker compose up -d      # full stack
+./scripts/with-secrets.sh npm run dev -w server     # local dev
+gopass insert vitrina/<name>                        # add/rotate a secret
+gopass git push                                     # sync the vault
+```
+
+The wrapper script exports each secret under the exact env-var name
+`server/src/config.ts` expects (`gopass env` was rejected: its path→name
+mapping prefixes the subtree, producing `VITRINA_*` names).
+
+### Key management policy
+
+- **GPG key passphrase** → iCloud Passwords (E2E-encrypted keychain).
+- **GPG private key backup** → exported `.asc` file stored OUTSIDE this repo
+  and outside the vault (encrypted volume / iCloud Drive / USB). Losing the
+  key without this backup loses every secret.
+- **Vault sync** → private GitHub repo; GitHub only ever sees `.gpg`
+  ciphertext.
+- **New machine** → `gopass clone <vault-repo>` + `gpg --import` the key
+  backup + its passphrase from iCloud Passwords.
+
+### When to revisit
+
+Unchanged: when a second person needs the keys or prod deploys, move to
+Doppler/Infisical (rotation, audit, per-environment configs). gopass has
+neither rotation UX nor audit logging — acceptable solo, not for a team.

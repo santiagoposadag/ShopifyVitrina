@@ -5,9 +5,10 @@ import type {
   LeadType,
   Product,
   ProductAttributes,
+  ProductAttributeUpdates,
   ProductPhoto,
   ProductStatus,
-} from "./types.js";
+} from "../types.js";
 
 interface ProductRow {
   id: number;
@@ -105,7 +106,28 @@ export interface UpsertProductInput {
   price?: number;
   currency?: string;
   status?: ProductStatus;
-  attributes?: ProductAttributes;
+  attributes?: ProductAttributeUpdates;
+}
+
+/**
+ * Merge incoming attributes into the stored ones, key by key. An explicit null
+ * REMOVES the key rather than storing a null: the owner's only way to un-say a
+ * fact (the agent has been known to invent one), and the stored JSON keeps
+ * matching ProductAttributes, where absent means absent.
+ *
+ * Only null clears. Falsy values like 0 (no admin fee) and false (no elevator)
+ * are facts the owner stated and are preserved.
+ */
+function mergeAttributes(
+  existing: ProductAttributes,
+  incoming: ProductAttributeUpdates | undefined,
+): ProductAttributes {
+  const merged: ProductAttributes = { ...existing };
+  for (const [key, value] of Object.entries(incoming ?? {})) {
+    if (value === null) delete merged[key];
+    else merged[key] = value;
+  }
+  return merged;
 }
 
 export interface UpsertResult {
@@ -137,14 +159,14 @@ export function upsertProduct(
         price: input.price ?? null,
         currency: input.currency ?? "COP",
         status: input.status ?? "draft",
-        attributes: JSON.stringify(input.attributes ?? {}),
+        attributes: JSON.stringify(mergeAttributes({}, input.attributes)),
       });
     const product = getProductById(db, Number(info.lastInsertRowid));
     recordChange(db, product.id, changedByPhone, `Created product ${input.code}`);
     return { product, created: true };
   }
 
-  const merged: ProductAttributes = { ...existing.attributes, ...(input.attributes ?? {}) };
+  const merged = mergeAttributes(existing.attributes, input.attributes);
   const changes: string[] = [];
   if (input.title !== undefined && input.title !== existing.title) changes.push("title");
   if (input.description !== undefined && input.description !== existing.description)
@@ -252,7 +274,7 @@ export function listLeads(db: DB, sinceDays?: number): Lead[] {
   return db.prepare(`SELECT * FROM leads ORDER BY created_at DESC`).all() as Lead[];
 }
 
-// --- Contacts / sessions / dedupe -------------------------------------------
+// --- Contacts / sessions ------------------------------------------------------
 
 export function upsertContact(
   db: DB,
@@ -270,11 +292,47 @@ export function upsertContact(
   ).run({ phone, name: name ?? null, role });
 }
 
-export function getSessionId(db: DB, phone: string): string | undefined {
-  const row = db.prepare(`SELECT agent_session_id FROM sessions WHERE phone = ?`).get(phone) as
-    | { agent_session_id: string | null }
-    | undefined;
+/**
+ * Get the resumable agent session for a phone. When maxAgeDays is given,
+ * sessions idle longer than that are treated as expired (returns undefined) so
+ * long-lived contacts start a fresh conversation instead of dragging months of
+ * history — and cost — into every turn.
+ */
+export function getSessionId(db: DB, phone: string, maxAgeDays?: number): string | undefined {
+  const row = (
+    maxAgeDays !== undefined
+      ? db
+          .prepare(
+            `SELECT agent_session_id FROM sessions
+             WHERE phone = ? AND updated_at >= datetime('now', ?)`,
+          )
+          .get(phone, `-${maxAgeDays} days`)
+      : db.prepare(`SELECT agent_session_id FROM sessions WHERE phone = ?`).get(phone)
+  ) as { agent_session_id: string | null } | undefined;
   return row?.agent_session_id ?? undefined;
+}
+
+/**
+ * Every stored session, regardless of age. Deliberately unfiltered, unlike
+ * getSessionId: the callers are housekeeping and the purge tool, and a session
+ * too old to RESUME still owns a transcript on disk that must not be swept as
+ * an orphan until its row is actually gone.
+ */
+export function listSessions(db: DB): { phone: string; agent_session_id: string }[] {
+  return db
+    .prepare(
+      `SELECT phone, agent_session_id FROM sessions WHERE agent_session_id IS NOT NULL`,
+    )
+    .all() as { phone: string; agent_session_id: string }[];
+}
+
+/**
+ * Forget a phone's stored session id. Used when the SDK cannot resume it — the
+ * transcript is gone, so keeping the id only guarantees the next turn fails the
+ * same way (a replayed inbox row would resume the same dead session).
+ */
+export function clearSessionId(db: DB, phone: string): void {
+  db.prepare(`DELETE FROM sessions WHERE phone = ?`).run(phone);
 }
 
 export function setSessionId(db: DB, phone: string, sessionId: string): void {
@@ -287,12 +345,139 @@ export function setSessionId(db: DB, phone: string, sessionId: string): void {
   ).run(phone, sessionId);
 }
 
-/** Returns true when the key was newly recorded, false when already seen. */
-export function markProcessed(db: DB, idempotencyKey: string): boolean {
+// --- Inbox (at-least-once message processing) --------------------------------
+
+export type InboxStatus = "pending" | "processing" | "done" | "failed";
+
+export interface InboxRow {
+  id: number;
+  dedupe_key: string;
+  phone: string;
+  agent_text: string;
+  status: InboxStatus;
+  attempts: number;
+  received_at: string;
+  processed_at: string | null;
+}
+
+/**
+ * Persist an inbound message for processing. Returns the new row, or null when
+ * the dedupe key was already recorded (a Kapso retry of a persisted event).
+ */
+export function insertInboxMessage(
+  db: DB,
+  input: { dedupe_key: string; phone: string; agent_text: string },
+): InboxRow | null {
   const info = db
-    .prepare(`INSERT OR IGNORE INTO processed_messages (idempotency_key) VALUES (?)`)
-    .run(idempotencyKey);
-  return info.changes > 0;
+    .prepare(
+      `INSERT OR IGNORE INTO inbox (dedupe_key, phone, agent_text)
+       VALUES (@dedupe_key, @phone, @agent_text)`,
+    )
+    .run(input);
+  if (info.changes === 0) return null;
+  return getInboxRow(db, Number(info.lastInsertRowid));
+}
+
+export function getInboxRow(db: DB, id: number): InboxRow | null {
+  const row = db.prepare(`SELECT * FROM inbox WHERE id = ?`).get(id) as InboxRow | undefined;
+  return row ?? null;
+}
+
+/**
+ * Claim every un-settled row for a phone as ONE batch: 'pending' rows plus
+ * 'processing' rows a previous process crashed on. Marking them in a single
+ * transaction keeps at-least-once intact — a crash mid-batch leaves them
+ * 'processing', so listReplayableInbox picks the whole burst up again on boot.
+ *
+ * Ordered by arrival (received_at is only second-resolution, so id breaks ties)
+ * because the joined prompt has to read in the order the user typed it.
+ *
+ * Callers MUST run this inside the phone's queue: serialization is what stops
+ * two batches from claiming the same rows.
+ */
+export function claimInboxBatch(db: DB, phone: string): InboxRow[] {
+  const select = db.prepare(
+    `SELECT * FROM inbox
+     WHERE phone = ? AND status IN ('pending','processing')
+     ORDER BY received_at ASC, id ASC`,
+  );
+  const claim = db.prepare(
+    `UPDATE inbox SET status = 'processing', attempts = attempts + 1 WHERE id = ?`,
+  );
+  // Read and claim share one transaction, so the batch is atomic even if a
+  // future caller ever violates the per-phone-queue invariant above.
+  const tx = db.transaction((): InboxRow[] => {
+    const rows = select.all(phone) as InboxRow[];
+    for (const row of rows) claim.run(row.id);
+    return rows.map((row) => ({ ...row, status: "processing" as const, attempts: row.attempts + 1 }));
+  });
+  return tx();
+}
+
+/** Settle a whole claimed batch. All-or-nothing: one agent turn, one outcome. */
+export function markInboxBatchDone(db: DB, ids: number[]): void {
+  const mark = db.prepare(
+    `UPDATE inbox SET status = 'done', processed_at = datetime('now') WHERE id = ?`,
+  );
+  const tx = db.transaction(() => {
+    for (const id of ids) mark.run(id);
+  });
+  tx();
+}
+
+export function markInboxBatchFailed(db: DB, ids: number[]): void {
+  const mark = db.prepare(
+    `UPDATE inbox SET status = 'failed', processed_at = datetime('now') WHERE id = ?`,
+  );
+  const tx = db.transaction(() => {
+    for (const id of ids) mark.run(id);
+  });
+  tx();
+}
+
+/**
+ * Return a claimed batch to 'pending' for a delayed retry. attempts is NOT
+ * reset — it is the retry budget (see MAX_BATCH_ATTEMPTS in batcher.ts). The
+ * rows are re-claimed by the next flush for that phone, together with any newer
+ * messages, so a retried batch may grow; ordering holds because the old rows
+ * keep their original received_at/id.
+ */
+export function markInboxBatchPending(db: DB, ids: number[]): void {
+  const mark = db.prepare(`UPDATE inbox SET status = 'pending' WHERE id = ?`);
+  const tx = db.transaction(() => {
+    for (const id of ids) mark.run(id);
+  });
+  tx();
+}
+
+/**
+ * Rows a previous process accepted but never finished: 'pending' (crashed
+ * before the queue ran it) or 'processing' (crashed mid agent turn). Ordered by
+ * id so per-phone ordering is preserved when re-enqueued.
+ */
+export function listReplayableInbox(db: DB): InboxRow[] {
+  return db
+    .prepare(`SELECT * FROM inbox WHERE status IN ('pending','processing') ORDER BY id ASC`)
+    .all() as InboxRow[];
+}
+
+/**
+ * TTL cleanup for settled inbox rows. Done rows only serve dedupe, so a few
+ * days beyond Kapso's retry window is plenty; failed rows are kept longer for
+ * diagnosis. Returns the number of rows deleted.
+ */
+export function deleteStaleInboxRows(
+  db: DB,
+  doneOlderThanDays = 7,
+  failedOlderThanDays = 30,
+): number {
+  const done = db
+    .prepare(`DELETE FROM inbox WHERE status = 'done' AND processed_at < datetime('now', ?)`)
+    .run(`-${doneOlderThanDays} days`);
+  const failed = db
+    .prepare(`DELETE FROM inbox WHERE status = 'failed' AND processed_at < datetime('now', ?)`)
+    .run(`-${failedOlderThanDays} days`);
+  return done.changes + failed.changes;
 }
 
 // --- Pending media ----------------------------------------------------------

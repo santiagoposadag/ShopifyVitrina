@@ -1,21 +1,32 @@
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import type { Config } from "./config.js";
-import type { DB } from "./db.js";
-import type { KapsoClient } from "./kapso.js";
-import * as repo from "./repo.js";
-import type { Product, ProductAttributes, TurnContext } from "./types.js";
+import type { Config } from "../config.js";
+import type { DB } from "../data/db.js";
+import { linkLineFor, previewLineFor } from "./preview.js";
+import * as repo from "../data/repo.js";
+import type { Product, ProductAttributeUpdates, ProductStatus, TurnContext } from "../types.js";
 
 export const MCP_SERVER_NAME = "vitrina";
 
+/** True when this upsert PUBLISHED the product: it is now active and was not before. */
+export function isPublishTransition(
+  previous: ProductStatus | undefined,
+  next: ProductStatus,
+): boolean {
+  return next === "active" && previous !== "active";
+}
+
+/**
+ * No WhatsApp client on purpose: the tools may read and write data, never push
+ * a message into the chat. The turn's single reply is runAgentTurn's to send,
+ * and photos are relayed as a storefront link (see linkLineFor), never as
+ * images — so the tool server has nothing to send them with.
+ */
 export interface ToolDeps {
   db: DB;
-  kapso: KapsoClient;
   config: Config;
   ctx: TurnContext;
 }
-
-const MAX_PHOTOS_PER_SEND = 4;
 
 function text(body: string) {
   return { content: [{ type: "text" as const, text: body }] };
@@ -52,11 +63,11 @@ function describeProduct(p: Product): string {
  * acting phone number is taken from context, never from the model.
  */
 export function buildToolServer(deps: ToolDeps) {
-  const { db, kapso, config, ctx } = deps;
+  const { db, config, ctx } = deps;
 
   const searchCatalog = tool(
     "search_catalog",
-    "Search the ACTIVE product catalog. Returns matching products with their facts. Use this before answering any question about availability, price, or features. Never answer product facts from memory.",
+    "Search the ACTIVE product catalog. Returns matching products with their facts, each with a 'link' to its page on the storefront. Use this before answering any question about availability, price, or features. Never answer product facts from memory.",
     {
       query: z.string().optional().describe("Free-text search over title, description, neighborhood, features"),
       min_price: z.number().optional().describe("Minimum price (COP)"),
@@ -69,36 +80,22 @@ export function buildToolServer(deps: ToolDeps) {
       if (results.length === 0) {
         return text("No matching active products. Offer to save the inquiry as a lead.");
       }
-      return text(results.map(describeProduct).join("\n"));
+      return text(results.map((p) => describeProduct(p) + linkLineFor(config, p)).join("\n"));
     },
   );
 
   const getProduct = tool(
     "get_product",
-    "Get a single product by its code, including all facts. Use this when the customer references a specific code.",
+    "Get a single product by its code, including all facts, how many photos its page has, and a 'link' to that page on the storefront. Use this when the customer references a specific code.",
     { code: z.string().describe("The product code") },
     async ({ code }) => {
       const product = repo.getProductByCode(db, code);
       if (!product) return text(`No product found with code ${code}.`);
       const photos = repo.getProductPhotos(db, product.id);
-      return text(`${describeProduct(product)} | photos_available=${photos.length}`);
-    },
-  );
-
-  const sendProductPhotos = tool(
-    "send_product_photos",
-    `Send up to ${MAX_PHOTOS_PER_SEND} photos of a product to the current WhatsApp chat. Use when the customer asks to see the property or when offering photos.`,
-    { code: z.string().describe("The product code whose photos to send") },
-    async ({ code }) => {
-      const product = repo.getProductByCode(db, code);
-      if (!product) return text(`No product found with code ${code}.`);
-      const photos = repo.getProductPhotos(db, product.id).slice(0, MAX_PHOTOS_PER_SEND);
-      if (photos.length === 0) return text(`Product ${code} has no photos yet.`);
-      for (const [index, photo] of photos.entries()) {
-        const caption = index === 0 ? `${product.title} (código ${product.code})` : undefined;
-        await kapso.sendImage(ctx.phone, photo.public_path, caption);
-      }
-      return text(`Sent ${photos.length} photo(s) for código ${code} to the customer.`);
+      return text(
+        `${describeProduct(product)} | photos_available=${photos.length}` +
+          linkLineFor(config, product),
+      );
     },
   );
 
@@ -123,7 +120,7 @@ export function buildToolServer(deps: ToolDeps) {
     },
   );
 
-  const customerTools = [searchCatalog, getProduct, sendProductPhotos, saveLead];
+  const customerTools = [searchCatalog, getProduct, saveLead];
 
   if (ctx.role !== "owner") {
     return {
@@ -136,7 +133,7 @@ export function buildToolServer(deps: ToolDeps) {
 
   const upsertProduct = tool(
     "upsert_product",
-    "Create a draft product or update an existing one by code. Only pass the fields you want to set or change. attributes_json is a JSON object merged into existing attributes (keys: area_m2, bedrooms, bathrooms, neighborhood, city, features[], admin_fee, estrato, levels, floor, elevator, negotiable). Set status to 'active' to publish it to the storefront.",
+    "Create a draft product or update an existing one by code. This is a MERGE, not a rewrite: pass ONLY the fields you are setting or changing — omitted fields keep their stored value, and attributes_json merges key by key into the stored attributes. To change only the status, pass just code and status. attributes_json is a JSON object of attributes (keys: area_m2 (built area m²), lot_m2 (lot size m²), bedrooms, bathrooms, neighborhood, city, features[], admin_fee (monthly COP), property_tax (annual predial COP), estrato, levels, floor, elevator, negotiable); every fact the owner states that has a key here MUST go in attributes_json — the storefront only renders these, so a fact left in the description alone is invisible. Include ONLY attributes the owner explicitly stated — never infer or complete one the owner did not give. To REMOVE an attribute that is stored but wrong or was never stated, pass an explicit null for that key, e.g. {\"bathrooms\":null} — omitting the key leaves the stored value untouched, so null is the only way to clear one. Set status to 'active' to publish it to the storefront. While it is not active, the result includes a preview link to send to the OWNER so they can see the page before publishing.",
     {
       code: z.string().describe("Product code (required, unique identifier)"),
       title: z.string().optional(),
@@ -149,21 +146,27 @@ export function buildToolServer(deps: ToolDeps) {
         .describe("JSON object of attributes to merge, e.g. {\"bedrooms\":3,\"neighborhood\":\"Belén\"}"),
     },
     async ({ code, title, description, price, status, attributes_json }) => {
-      let attributes: ProductAttributes | undefined;
+      let attributes: ProductAttributeUpdates | undefined;
       if (attributes_json) {
         try {
-          attributes = JSON.parse(attributes_json) as ProductAttributes;
+          attributes = JSON.parse(attributes_json) as ProductAttributeUpdates;
         } catch {
           return text("attributes_json was not valid JSON. Ask again or send it differently.");
         }
       }
+      const previousStatus = repo.getProductByCode(db, code)?.status;
       const { product, created } = repo.upsertProduct(
         db,
         { code, title, description, price, status, attributes },
         ctx.phone,
       );
+      // Publishing marks the end of a unit of work: ask runAgentTurn to start
+      // the next message on a fresh session, so the history stays lean and one
+      // product's details cannot bleed into the next one.
+      if (isPublishTransition(previousStatus, product.status)) ctx.sessionAfterTurn = "reset";
       return text(
-        `${created ? "Created" : "Updated"} product: ${describeProduct(product)}`,
+        `${created ? "Created" : "Updated"} product: ${describeProduct(product)}` +
+          previewLineFor(config, product),
       );
     },
   );

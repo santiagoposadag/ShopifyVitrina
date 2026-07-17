@@ -2,7 +2,7 @@ import { createReadStream, existsSync, mkdirSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import type { FastifyInstance } from "fastify";
-import type { Config } from "./config.js";
+import type { Config } from "../config.js";
 
 /** Build the public URL WhatsApp can fetch for a stored media file. */
 export function publicPathFor(config: Pick<Config, "publicBaseUrl">, fileName: string): string {

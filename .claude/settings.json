@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "ask": [
+      "Bash(gopass show*)",
+      "Bash(gopass cat*)",
+      "Bash(gopass grep*)",
+      "Bash(gopass env*)",
+      "Bash(gopass edit*)",
+      "Bash(gpg --decrypt*)",
+      "Bash(gpg -d *)"
+    ]
+  }
+}

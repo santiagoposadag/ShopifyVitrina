@@ -1,15 +1,14 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import type { Config } from "./config.js";
-import type { DB } from "./db.js";
-import type { KapsoClient } from "./kapso.js";
-import { saveMedia } from "./media.js";
-import { addPendingMedia, markProcessed } from "./repo.js";
-import type { PerPhoneQueue } from "./queue.js";
-import type { TurnContext } from "./types.js";
+import { PHOTO_PLACEHOLDER, type InboxBatcher } from "./batcher.js";
+import type { Config } from "../config.js";
+import type { DB } from "../data/db.js";
+import type { KapsoClient } from "../whatsapp/kapso.js";
+import { saveMedia } from "../whatsapp/media.js";
+import { addPendingMedia, insertInboxMessage } from "../data/repo.js";
+import type { TurnContext } from "../types.js";
 
 export const SIGNATURE_HEADER = "x-webhook-signature";
-export const IDEMPOTENCY_HEADER = "x-idempotency-key";
 
 // Total wall-clock budget for downloading inbound media during a single webhook
 // request. Kept well under Kapso's 10s ACK deadline so the response never waits
@@ -147,7 +146,7 @@ export function extractInbound(event: Record<string, unknown>): InboundMessage |
       from,
       id,
       kind: "image",
-      agentText: caption || "(El usuario envió una foto)",
+      agentText: caption || PHOTO_PLACEHOLDER,
       media: { url: mediaUrl, filename, contentType },
     };
   }
@@ -161,15 +160,14 @@ export interface WebhookDeps {
   config: Config;
   db: DB;
   kapso: KapsoClient;
-  queue: PerPhoneQueue;
-  /** Async worker invoked (via the queue) once per inbound message. */
-  onMessage: (ctx: TurnContext, text: string) => Promise<void>;
+  /** Coalesces each phone's burst into a single agent turn, off the ACK path. */
+  batcher: InboxBatcher;
   /** Maps a phone number to its role (owner vs customer). */
   roleFor: (phone: string) => TurnContext["role"];
 }
 
 export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
-  const { config, db, kapso, queue, onMessage, roleFor } = deps;
+  const { config, db, kapso, batcher, roleFor } = deps;
 
   // Keep the raw body so we can verify the signature over exact bytes.
   app.addContentTypeParser(
@@ -195,14 +193,6 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
       return reply.code(401).send({ error: "invalid_signature" });
     }
 
-    // Idempotency: drop duplicates that Kapso retries at 10/40/90s.
-    const idemHeader = request.headers[IDEMPOTENCY_HEADER];
-    const idemKey = Array.isArray(idemHeader) ? idemHeader[0] : idemHeader;
-    if (idemKey) {
-      const fresh = markProcessed(db, idemKey);
-      if (!fresh) return reply.code(200).send({ status: "duplicate" });
-    }
-
     const events = normalizeEvents(request.body);
 
     // Shared budget so the ACK never blocks on unbounded media downloads, even
@@ -212,18 +202,23 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
     for (const event of events) {
       const inbound = extractInbound(event);
       if (!inbound) continue;
+      // No agent-worthy content and no media side effects: skip entirely.
+      if (inbound.agentText.trim().length === 0 && inbound.kind !== "image") continue;
 
-      // Per-event dedupe with a stable fallback key: makes Kapso's 10/40/90s
-      // retries idempotent even when the request-level header is absent.
-      const dedupeKey = stableEventKey(event, inbound.id);
-      if (!markProcessed(db, dedupeKey)) continue;
-
-      const ctx: TurnContext = { phone: inbound.from, role: roleFor(inbound.from) };
+      // Persist BEFORE processing: the UNIQUE dedupe key absorbs Kapso's
+      // 10/40/90s retries, and a crash before the agent runs is replayed on
+      // boot instead of silently losing the message (at-least-once).
+      const row = insertInboxMessage(db, {
+        dedupe_key: stableEventKey(event, inbound.id),
+        phone: inbound.from,
+        agent_text: inbound.agentText,
+      });
+      if (!row) continue; // Retry of an event we already persisted.
 
       // Persist inbound media ONLY for owners (they ingest listings). Customers'
       // images are acknowledged in the agent context but never stored/served.
       // Download is bounded and non-fatal so a slow fetch cannot delay the ACK.
-      if (inbound.media && ctx.role === "owner") {
+      if (inbound.media && roleFor(inbound.from) === "owner") {
         try {
           const buffer = await kapso.downloadMedia(inbound.media.url, mediaDeadline);
           const saved = await saveMedia(config, buffer, {
@@ -242,10 +237,11 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
         }
       }
 
-      if (inbound.agentText.trim().length === 0 && inbound.kind !== "image") continue;
-
-      // Enqueue with per-phone serialization; do NOT await the agent inline.
-      void queue.enqueue(ctx.phone, () => onMessage(ctx, inbound.agentText));
+      // Hand the row to the batcher; it debounces and runs the agent on the
+      // async worker. Only the timer state is touched here, so the ACK stays
+      // fast. The media flag comes from the parsed event — a photo burst needs
+      // a much longer window than chat (see InboxBatcher).
+      batcher.schedule(row.phone, inbound.media ? "media" : "text");
     }
 
     // ACK fast; the agent runs on the async worker.

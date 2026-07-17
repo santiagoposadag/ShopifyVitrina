@@ -1,15 +1,15 @@
 import { copyFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadDotEnv, resolveDataPath } from "./config.js";
-import { openDb, type DB } from "./db.js";
-import { publicPathFor } from "./media.js";
+import { loadDotEnv, resolveDataPath } from "../config.js";
+import { openDb, type DB } from "../data/db.js";
+import { publicPathFor } from "../whatsapp/media.js";
 import { parseListing } from "./parse-listing.js";
-import { insertPhoto, upsertProduct } from "./repo.js";
-import type { ProductAttributes } from "./types.js";
+import { insertPhoto, upsertProduct } from "../data/repo.js";
+import type { ProductAttributes } from "../types.js";
 
 // Repo root is two levels up from server/src.
-const REPO_ROOT = resolve(fileURLToPath(new URL(".", import.meta.url)), "../../");
+const REPO_ROOT = resolve(fileURLToPath(new URL(".", import.meta.url)), "../../../");
 
 interface SeedConfig {
   dbPath: string;

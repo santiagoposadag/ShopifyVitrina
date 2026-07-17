@@ -1,13 +1,31 @@
 import Fastify from "fastify";
-import { runAgentTurn } from "./agent.js";
+import { runAgentTurn } from "./agent/agent.js";
+import { ConsecutiveFailureAlert } from "./inbox/alerts.js";
+import { InboxBatcher } from "./inbox/batcher.js";
 import { isOwner, loadConfig, loadDotEnv } from "./config.js";
-import { openDb } from "./db.js";
-import { KapsoClient } from "./kapso.js";
-import { registerMediaRoutes } from "./media.js";
-import { PerPhoneQueue } from "./queue.js";
-import { deleteStalePendingMedia, upsertContact } from "./repo.js";
-import { registerWebhook } from "./webhook.js";
+import { openDb } from "./data/db.js";
+import { KapsoClient } from "./whatsapp/kapso.js";
+import { registerMediaRoutes } from "./whatsapp/media.js";
+import { PerPhoneQueue } from "./inbox/queue.js";
+import { RateLimiter } from "./inbox/rate-limit.js";
+import {
+  deleteStaleInboxRows,
+  deleteStalePendingMedia,
+  listSessions,
+  upsertContact,
+} from "./data/repo.js";
+import { sweepOrphanedTranscripts, transcriptsDir } from "./data/transcripts.js";
+import { registerWebhook, type WebhookDeps } from "./inbox/webhook.js";
 import type { TurnContext } from "./types.js";
+
+const RATE_LIMIT_NOTICE =
+  "Estamos recibiendo muchos mensajes tuyos en poco tiempo. Dame unos minutos y escríbeme de nuevo, por favor.";
+const CUSTOMER_UNAVAILABLE_NOTICE =
+  "Hola, gracias por escribirnos. En este momento nuestro asistente de ventas no está disponible. Por favor intenta más tarde.";
+const AGENT_ERROR_APOLOGY =
+  "Disculpa, tuve un inconveniente para responder. ¿Podrías intentarlo de nuevo?";
+const OWNER_FAILURE_ALERT =
+  "⚠️ Vitrina: hubo varios errores consecutivos al responder mensajes. Revisa los logs del servidor.";
 
 async function main(): Promise<void> {
   loadDotEnv();
@@ -15,50 +33,137 @@ async function main(): Promise<void> {
   const db = openDb(config.dbPath);
   const kapso = new KapsoClient(config);
   const queue = new PerPhoneQueue();
+  const rateLimiter = new RateLimiter({
+    perPhonePerHour: config.rateLimitPerPhonePerHour,
+    globalPerDay: config.rateLimitGlobalPerDay,
+  });
+  const failureAlert = new ConsecutiveFailureAlert();
 
   const app = Fastify({ logger: true });
 
-  // Purge unattached inbound media older than 48h, on boot and hourly.
+  // Housekeeping on boot and hourly: purge unattached inbound media older than
+  // 48h, settled inbox rows past their TTL, and agent transcripts no session row
+  // can resume any more. The transcript sweep is what keeps expired sessions from
+  // leaking files onto the sessions volume forever — clearing a session id only
+  // drops the SQLite row, and nothing else ever deletes what it pointed at.
+  // Inert unless AGENT_TRANSCRIPTS_DIR is set (see data/transcripts.ts).
   const PENDING_MEDIA_TTL_HOURS = 48;
-  const runPendingMediaCleanup = (): void => {
+  const runHousekeeping = (): void => {
     try {
-      const removed = deleteStalePendingMedia(db, PENDING_MEDIA_TTL_HOURS);
-      if (removed > 0) app.log.info(`Cleaned up ${removed} stale pending media file(s)`);
+      const media = deleteStalePendingMedia(db, PENDING_MEDIA_TTL_HOURS);
+      const inbox = deleteStaleInboxRows(db);
+      const root = transcriptsDir();
+      const transcripts = root
+        ? sweepOrphanedTranscripts(
+            root,
+            listSessions(db).map((s) => s.agent_session_id),
+            config.sessionMaxAgeDays,
+          )
+        : 0;
+      if (media > 0 || inbox > 0 || transcripts > 0) {
+        app.log.info(
+          `Housekeeping: removed ${media} stale pending media file(s), ${inbox} settled inbox row(s), ${transcripts} orphaned transcript(s)`,
+        );
+      }
     } catch (err) {
-      app.log.error({ err }, "pending media cleanup failed");
+      app.log.error({ err }, "housekeeping failed");
     }
   };
-  runPendingMediaCleanup();
-  const cleanupTimer = setInterval(runPendingMediaCleanup, 60 * 60 * 1000);
-  cleanupTimer.unref();
+  runHousekeeping();
+  const housekeepingTimer = setInterval(runHousekeeping, 60 * 60 * 1000);
+  housekeepingTimer.unref();
 
   app.get("/health", async () => ({ status: "ok", time: new Date().toISOString() }));
 
   registerMediaRoutes(app, config);
 
-  registerWebhook(app, {
-    config,
+  const notifyOwnersOfFailures = async (): Promise<void> => {
+    for (const owner of config.ownerPhoneNumbers) {
+      try {
+        await kapso.sendText(owner, OWNER_FAILURE_ALERT);
+      } catch {
+        // Best effort; the failure is already in the logs.
+      }
+    }
+  };
+
+  const roleFor = (phone: string): TurnContext["role"] =>
+    isOwner(config, phone) ? "owner" : "customer";
+
+  const batcher = new InboxBatcher({
     db,
-    kapso,
     queue,
-    roleFor: (phone) => (isOwner(config, phone) ? "owner" : "customer"),
+    log: app.log,
+    debounceMs: config.batchDebounceMs,
+    maxWaitMs: config.batchMaxWaitMs,
+    mediaDebounceMs: config.batchMediaDebounceMs,
+    mediaMaxWaitMs: config.batchMediaMaxWaitMs,
+    roleFor,
     onMessage: async (ctx: TurnContext, text: string) => {
       upsertContact(db, ctx.phone, ctx.role);
-      try {
-        await runAgentTurn({ db, kapso, config }, ctx, text);
-      } catch (err) {
-        app.log.error({ err, phone: ctx.phone }, "agent turn failed");
+
+      // Kill switch: with the customer path disabled, non-owners get a static
+      // notice and the agent never runs (no Claude call). One reply per
+      // coalesced burst, so a message barrage cannot turn this into spam.
+      if (ctx.role !== "owner" && !config.customerAgentEnabled) {
         try {
-          await kapso.sendText(
-            ctx.phone,
-            "Disculpa, tuve un inconveniente para responder. ¿Podrías intentarlo de nuevo?",
-          );
+          await kapso.sendText(ctx.phone, CUSTOMER_UNAVAILABLE_NOTICE);
         } catch {
-          // Best effort; nothing else to do if the send also fails.
+          // Best effort.
         }
+        return; // Deliberately consumed; the inbox batch settles as done.
+      }
+
+      // Cost protection: customers are rate limited; owners are exempt.
+      if (ctx.role !== "owner") {
+        const decision = rateLimiter.check(ctx.phone);
+        if (decision !== "ok") {
+          app.log.warn({ phone: ctx.phone, decision }, "agent turn rate limited");
+          if (decision === "phone_limited" && rateLimiter.shouldNotify(ctx.phone)) {
+            try {
+              await kapso.sendText(ctx.phone, RATE_LIMIT_NOTICE);
+            } catch {
+              // Best effort.
+            }
+          }
+          return; // Deliberately consumed; the inbox batch settles as done.
+        }
+      }
+
+      // A throw here reaches the batcher, which retries the batch with backoff
+      // and settles it as failed once the attempt budget is spent — the
+      // user-facing side effects live in onBatchFailure below.
+      await runAgentTurn({ db, kapso, config, log: app.log }, ctx, text);
+      failureAlert.recordSuccess();
+    },
+    onBatchFailure: async (ctx, { final }) => {
+      // The streak counts EVERY failed attempt, not only terminal ones: this
+      // alert is the pilot's outage monitor, and waiting for terminal failures
+      // would delay detection by the whole retry budget. The cooldown plus the
+      // success reset keep it from spamming.
+      if (failureAlert.recordFailure()) void notifyOwnersOfFailures();
+      if (!final) return; // the retry may still answer; apologize only when it cannot
+      try {
+        await kapso.sendText(ctx.phone, AGENT_ERROR_APOLOGY);
+      } catch {
+        // Best effort; the failure is already in the logs.
       }
     },
   });
+
+  const deps: WebhookDeps = { config, db, kapso, batcher, roleFor };
+
+  registerWebhook(app, deps);
+
+  // Un-flushed bursts must not hold the process open on shutdown; their rows
+  // stay pending and are replayed on the next boot.
+  app.addHook("onClose", async () => {
+    batcher.stop();
+  });
+
+  // Recover messages a previous process accepted but never finished, before
+  // taking new traffic so per-phone ordering holds.
+  batcher.replayPending();
 
   await app.listen({ port: config.port, host: "0.0.0.0" });
   app.log.info(`Vitrina server listening on :${config.port}`);

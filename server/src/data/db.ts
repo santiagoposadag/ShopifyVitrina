@@ -74,9 +74,19 @@ export function createSchema(db: DB): void {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
-    CREATE TABLE IF NOT EXISTS processed_messages (
-      idempotency_key TEXT PRIMARY KEY,
-      processed_at TEXT NOT NULL DEFAULT (datetime('now'))
+    -- Persisted inbound messages (at-least-once processing). The UNIQUE
+    -- dedupe_key absorbs Kapso's 10/40/90s retries; rows left 'pending' or
+    -- 'processing' by a crash are re-enqueued on the next boot.
+    CREATE TABLE IF NOT EXISTS inbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      dedupe_key TEXT UNIQUE NOT NULL,
+      phone TEXT NOT NULL,
+      agent_text TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','processing','done','failed')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      received_at TEXT NOT NULL DEFAULT (datetime('now')),
+      processed_at TEXT
     );
 
     -- Inbound media received on a conversation but not yet attached to a
@@ -92,7 +102,11 @@ export function createSchema(db: DB): void {
     );
 
     CREATE INDEX IF NOT EXISTS idx_products_status ON products(status);
+    CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
+    -- Every batch flush claims one phone's un-settled rows by (phone, status).
+    CREATE INDEX IF NOT EXISTS idx_inbox_phone_status ON inbox(phone, status);
     CREATE INDEX IF NOT EXISTS idx_leads_created_at ON leads(created_at);
     CREATE INDEX IF NOT EXISTS idx_pending_media_phone ON pending_media(phone);
   `);
 }
+

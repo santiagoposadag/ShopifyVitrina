@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { openDb, type DB } from "../src/db.js";
+import { openDb, type DB } from "../src/data/db.js";
 import {
   attachPendingPhotos,
   addPendingMedia,
@@ -8,7 +8,7 @@ import {
   listLeads,
   searchCatalog,
   upsertProduct,
-} from "../src/repo.js";
+} from "../src/data/repo.js";
 
 function seed(db: DB): void {
   upsertProduct(
@@ -115,6 +115,62 @@ describe("upsertProduct", () => {
     expect(p?.attributes.bedrooms).toBe(3);
     expect(p?.attributes.bathrooms).toBe(2);
     expect(p?.attributes.city).toBe("Medellín");
+    db.close();
+  });
+
+  it("removes an attribute the owner un-says, keeping the rest", () => {
+    const db = openDb(":memory:");
+    upsertProduct(db, { code: "1", attributes: { bedrooms: 3, bathrooms: 2 } }, null);
+
+    // "No, nunca dije cuántos baños" — an explicit null clears the key.
+    upsertProduct(db, { code: "1", attributes: { bathrooms: null } }, null);
+
+    const p = getProductByCode(db, "1");
+    expect(p?.attributes.bathrooms).toBeUndefined();
+    expect("bathrooms" in (p?.attributes ?? {})).toBe(false); // gone, not tombstoned as null
+    expect(p?.attributes.bedrooms).toBe(3); // the merge still protects the rest
+    db.close();
+  });
+
+  it("does not store a null attribute on create", () => {
+    const db = openDb(":memory:");
+    upsertProduct(db, { code: "1", attributes: { bedrooms: 3, bathrooms: null } }, null);
+    const p = getProductByCode(db, "1");
+    expect("bathrooms" in (p?.attributes ?? {})).toBe(false);
+    expect(p?.attributes.bedrooms).toBe(3);
+    db.close();
+  });
+
+  it("clearing an attribute that was never set is a no-op", () => {
+    const db = openDb(":memory:");
+    upsertProduct(db, { code: "1", attributes: { bedrooms: 3 } }, null);
+    upsertProduct(db, { code: "1", attributes: { bathrooms: null } }, null);
+    const p = getProductByCode(db, "1");
+    expect("bathrooms" in (p?.attributes ?? {})).toBe(false);
+    expect(p?.attributes.bedrooms).toBe(3);
+    db.close();
+  });
+
+  it("round-trips lot size and property tax as structured attributes", () => {
+    const db = openDb(":memory:");
+    // The owner said "Lote 1.400 mts" and "Predial 7'300.000 anuales" — both
+    // are decision factors for a house, so both belong in the schema.
+    upsertProduct(db, { code: "0195", attributes: { lot_m2: 1400, property_tax: 7_300_000 } }, null);
+
+    const p = getProductByCode(db, "0195");
+
+    expect(p?.attributes.lot_m2).toBe(1400);
+    expect(p?.attributes.property_tax).toBe(7_300_000);
+    db.close();
+  });
+
+  it("keeps falsy attribute values that are real data", () => {
+    const db = openDb(":memory:");
+    // 0 and false are values the owner stated; only null means "clear this".
+    upsertProduct(db, { code: "1", attributes: { admin_fee: 0, elevator: false } }, null);
+    const p = getProductByCode(db, "1");
+    expect(p?.attributes.admin_fee).toBe(0);
+    expect(p?.attributes.elevator).toBe(false);
     db.close();
   });
 });

@@ -1,23 +1,12 @@
 import Database from "better-sqlite3";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
+// Shared with the server (both read the same SQLite rows) — type-only,
+// erased at compile time (see shared/index.d.ts).
+import type { ProductAttributes } from "@vitrina/shared";
 import { dbPath } from "./paths";
 
-export interface ProductAttributes {
-  area_m2?: number;
-  bedrooms?: number;
-  bathrooms?: number;
-  neighborhood?: string;
-  city?: string;
-  features?: string[];
-  admin_fee?: number;
-  estrato?: number;
-  levels?: number;
-  floor?: number;
-  elevator?: boolean;
-  negotiable?: boolean;
-  [key: string]: unknown;
-}
+export type { ProductAttributes };
 
 export interface Product {
   id: number;
@@ -102,6 +91,25 @@ export function getProductByCode(code: string): Product | null {
     const row = db
       .prepare(`SELECT * FROM products WHERE code = ? AND status = 'active'`)
       .get(code) as ProductRow | undefined;
+    return row ? hydrate(db, row) : null;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Read a product of ANY status, for the owner's preview page — the only way to
+ * see a draft, since the catalog renders active products only. Deliberately
+ * does NOT filter on status; that is the entire point of this function, so
+ * never call it from a customer-facing page.
+ */
+export function getProductForPreview(code: string): Product | null {
+  const db = openReadonly();
+  if (!db) return null;
+  try {
+    const row = db.prepare(`SELECT * FROM products WHERE code = ?`).get(code) as
+      | ProductRow
+      | undefined;
     return row ? hydrate(db, row) : null;
   } finally {
     db.close();

@@ -17,6 +17,9 @@ export function attributeSummary(product: Product): string {
   if (a.bedrooms != null) parts.push(`${a.bedrooms} hab.`);
   if (a.bathrooms != null) parts.push(`${a.bathrooms} baños`);
   if (a.area_m2 != null) parts.push(`${a.area_m2} m²`);
+  // Lot size only in the summary line for properties that have one (a house);
+  // for an apartment the key is simply absent, so nothing is added.
+  if (a.lot_m2 != null) parts.push(`lote ${a.lot_m2} m²`);
   return parts.join(" · ");
 }
 
