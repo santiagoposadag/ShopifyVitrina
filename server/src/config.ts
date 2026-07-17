@@ -84,13 +84,22 @@ export function normalizePhone(raw: string): string {
   return raw.replace(/[^\d]/g, "");
 }
 
-export function loadConfig(): Config {
-  const ownerPhoneNumbers = new Set(
+/**
+ * The OWNER_PHONE_NUMBERS allowlist, parsed. Exported so one-off tools can
+ * resolve roles without loadConfig's required secrets — deleting a session
+ * should not depend on a WhatsApp key being present.
+ */
+export function loadOwnerPhoneNumbers(): Set<string> {
+  return new Set(
     optional("OWNER_PHONE_NUMBERS", "")
       .split(",")
       .map((p) => normalizePhone(p))
       .filter((p) => p.length > 0),
   );
+}
+
+export function loadConfig(): Config {
+  const ownerPhoneNumbers = loadOwnerPhoneNumbers();
 
   return {
     anthropicApiKey: required("ANTHROPIC_API_KEY"),
@@ -115,7 +124,7 @@ export function loadConfig(): Config {
   };
 }
 
-export function isOwner(config: Config, phone: string): boolean {
+export function isOwner(config: Pick<Config, "ownerPhoneNumbers">, phone: string): boolean {
   return config.ownerPhoneNumbers.has(normalizePhone(phone));
 }
 

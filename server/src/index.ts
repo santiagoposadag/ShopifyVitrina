@@ -8,7 +8,13 @@ import { KapsoClient } from "./whatsapp/kapso.js";
 import { registerMediaRoutes } from "./whatsapp/media.js";
 import { PerPhoneQueue } from "./inbox/queue.js";
 import { RateLimiter } from "./inbox/rate-limit.js";
-import { deleteStaleInboxRows, deleteStalePendingMedia, upsertContact } from "./data/repo.js";
+import {
+  deleteStaleInboxRows,
+  deleteStalePendingMedia,
+  listSessions,
+  upsertContact,
+} from "./data/repo.js";
+import { sweepOrphanedTranscripts, transcriptsDir } from "./data/transcripts.js";
 import { registerWebhook, type WebhookDeps } from "./inbox/webhook.js";
 import type { TurnContext } from "./types.js";
 
@@ -36,15 +42,27 @@ async function main(): Promise<void> {
   const app = Fastify({ logger: true });
 
   // Housekeeping on boot and hourly: purge unattached inbound media older than
-  // 48h and settled inbox rows past their TTL.
+  // 48h, settled inbox rows past their TTL, and agent transcripts no session row
+  // can resume any more. The transcript sweep is what keeps expired sessions from
+  // leaking files onto the sessions volume forever — clearing a session id only
+  // drops the SQLite row, and nothing else ever deletes what it pointed at.
+  // Inert unless AGENT_TRANSCRIPTS_DIR is set (see data/transcripts.ts).
   const PENDING_MEDIA_TTL_HOURS = 48;
   const runHousekeeping = (): void => {
     try {
       const media = deleteStalePendingMedia(db, PENDING_MEDIA_TTL_HOURS);
       const inbox = deleteStaleInboxRows(db);
-      if (media > 0 || inbox > 0) {
+      const root = transcriptsDir();
+      const transcripts = root
+        ? sweepOrphanedTranscripts(
+            root,
+            listSessions(db).map((s) => s.agent_session_id),
+            config.sessionMaxAgeDays,
+          )
+        : 0;
+      if (media > 0 || inbox > 0 || transcripts > 0) {
         app.log.info(
-          `Housekeeping: removed ${media} stale pending media file(s), ${inbox} settled inbox row(s)`,
+          `Housekeeping: removed ${media} stale pending media file(s), ${inbox} settled inbox row(s), ${transcripts} orphaned transcript(s)`,
         );
       }
     } catch (err) {

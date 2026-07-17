@@ -39,6 +39,13 @@ services:
       # Kill switch for the customer path: false auto-replies "assistant
       # unavailable" to non-owners without running the agent. Default true.
       CUSTOMER_AGENT_ENABLED: ${CUSTOMER_AGENT_ENABLED:-}
+      # Where the Agent SDK keeps its transcripts, so hourly housekeeping can
+      # delete the ones no session row can resume any more (dropping a session id
+      # leaves its transcript behind forever otherwise). Deliberately explicit
+      # and NOT defaulted in code: the path the SDK would derive on a developer's
+      # machine is that developer's own Claude Code history for this repo. Unset,
+      # the sweep does nothing. See server/src/data/transcripts.ts.
+      AGENT_TRANSCRIPTS_DIR: /home/node/.claude/projects
       # Coalescing of a phone's message burst into one agent turn. Empty values
       # fall back to the defaults in server/src/config.ts (8s silence, 45s cap
       # for text; 45s silence, 120s cap once a burst contains photos).
@@ -58,7 +65,8 @@ services:
       # session, so replies survive, but the conversation history does not).
       # Mounting the whole directory also persists the SDK's .cache — intended.
       # Only the server runs the agent; seed and backup share the image but not
-      # this volume.
+      # this volume. The purge-sessions profile mounts it too, because deleting a
+      # conversation means deleting the transcript, not just the SQLite row.
       - vitrina-sessions:/home/node/.claude
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
@@ -129,6 +137,34 @@ services:
     volumes:
       - vitrina-data:/data
     profiles: ["backup"]
+
+  # Drop every CUSTOMER conversation history — session rows and the transcripts
+  # behind them — and collect transcripts orphaned by earlier resets. Customers
+  # start fresh on their next message; OWNER sessions are kept (an owner
+  # mid-listing would lose in-progress work). Needs the secrets wrapper: it reads
+  # OWNER_PHONE_NUMBERS to tell the two apart.
+  #   ./scripts/with-secrets.sh docker compose --profile purge run --rm purge-sessions
+  #
+  # A command rather than an env flag on the server, on purpose: a purge checked
+  # at boot would re-fire on every restart and wipe live conversations each time.
+  purge-sessions:
+    image: vitrina-server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      <<: *data-env
+      OWNER_PHONE_NUMBERS: ${OWNER_PHONE_NUMBERS:-}
+      SESSION_MAX_AGE_DAYS: ${SESSION_MAX_AGE_DAYS:-}
+      AGENT_TRANSCRIPTS_DIR: /home/node/.claude/projects
+    command: ["node", "server/dist/data/purge-sessions.js"]
+    volumes:
+      - vitrina-data:/data
+      # Both volumes: the session id lives in SQLite on vitrina-data, the
+      # transcript it points at lives here. Purging one without the other either
+      # leaves a resumable conversation or leaks the file forever.
+      - vitrina-sessions:/home/node/.claude
+    profiles: ["purge"]
 
 volumes:
   # A named volume (not a host bind mount): the image already creates /data

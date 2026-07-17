@@ -61,6 +61,8 @@ Customer / Owner (WhatsApp)
 - `src/inbox/rate-limit.ts` — cost protection: per-phone sliding-hour limit + global daily cap for customer turns (owners exempt).
 - `src/inbox/alerts.ts` — notifies the owner's WhatsApp after consecutive agent failures.
 - `src/data/backup.ts` — consistent SQLite snapshot (online backup API) with pruning.
+- `src/data/transcripts.ts` — the Agent SDK's transcripts on disk: delete one session's, or sweep the ones no session row can resume any more. Inert unless `AGENT_TRANSCRIPTS_DIR` is set, which it deliberately does not default (see the file's header).
+- `src/data/purge.ts` / `src/data/purge-sessions.ts` — ops lever: drop every **customer** conversation history so they start fresh; owner sessions are kept. `docker compose --profile purge run --rm purge-sessions`, or `npm run purge:sessions -w server`.
 - `src/agent/tools.ts` — in-process MCP tools. Customer: `search_catalog`, `get_product`, `save_lead`. Owner (allowlist): the above plus `upsert_product`, `attach_pending_photos`, `list_products`, `list_leads`. The tool server has no Kapso client: tools read and write data, they never message the chat.
 - `src/agent/preview.ts` — the storefront URL shapes: `/propiedad/<code>` for customers (active only), `/preview/<code>` for the owner's pre-publish review. Both ride back on tool results, since the agent may only state what a tool returned.
 - `src/whatsapp/media.ts` — serves `MEDIA_DIR` under `/media/*`; saves inbound media.

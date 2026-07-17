@@ -9,6 +9,7 @@
     "seed": "tsx src/seed/seed.ts",
     "seed:dist": "node dist/seed/seed.js",
     "backup": "tsx src/data/backup.ts",
+    "purge:sessions": "tsx src/data/purge-sessions.ts",
     "build": "tsc --noEmit && tsc -p tsconfig.build.json",
     "test": "vitest run"
   },

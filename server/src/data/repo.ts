@@ -313,6 +313,20 @@ export function getSessionId(db: DB, phone: string, maxAgeDays?: number): string
 }
 
 /**
+ * Every stored session, regardless of age. Deliberately unfiltered, unlike
+ * getSessionId: the callers are housekeeping and the purge tool, and a session
+ * too old to RESUME still owns a transcript on disk that must not be swept as
+ * an orphan until its row is actually gone.
+ */
+export function listSessions(db: DB): { phone: string; agent_session_id: string }[] {
+  return db
+    .prepare(
+      `SELECT phone, agent_session_id FROM sessions WHERE agent_session_id IS NOT NULL`,
+    )
+    .all() as { phone: string; agent_session_id: string }[];
+}
+
+/**
  * Forget a phone's stored session id. Used when the SDK cannot resume it — the
  * transcript is gone, so keeping the id only guarantees the next turn fails the
  * same way (a replayed inbox row would resume the same dead session).
