@@ -8,7 +8,7 @@ import {
   markInboxBatchFailed,
   markInboxBatchPending,
 } from "../data/repo.js";
-import type { TurnContext } from "../types.js";
+import type { MessageKind, TurnContext } from "../types.js";
 
 /**
  * Total processing attempts a batch's rows get before settling as 'failed'.
@@ -27,10 +27,10 @@ export const MAX_BATCH_ATTEMPTS = 3;
 export const RETRY_DELAY_MS = 30_000;
 
 /**
- * Placeholder text stored for an inbound photo with no caption. The agent never
- * sees the image itself, so a burst of 10 photos would otherwise repeat this
- * line 10 times — noise the model tends to answer literally. buildBatchText
- * collapses runs of it into a single counted line.
+ * How an uncaptioned photo is announced to the agent, which never sees the image
+ * itself. A burst of 10 would otherwise repeat this line 10 times — noise the
+ * model tends to answer literally — so buildBatchText collapses runs into a
+ * single counted line.
  */
 export const PHOTO_PLACEHOLDER = "(El usuario envió una foto)";
 
@@ -38,25 +38,44 @@ function photoLine(count: number): string {
   return count === 1 ? PHOTO_PLACEHOLDER : `(El usuario envió ${count} fotos)`;
 }
 
+/** The fields buildBatchText needs from a claimed inbox row. */
+export interface BatchRow {
+  agent_text: string;
+  kind: MessageKind;
+}
+
 /**
  * Join one phone's coalesced messages into a single prompt. Rows arrive in
  * arrival order; empty ones (non-media, non-text events) contribute nothing.
+ *
+ * Photos are recognised by their persisted `kind`, NEVER by their text. WhatsApp
+ * stores a photo's caption as that message's text, so matching the placeholder
+ * wording counted only uncaptioned photos: an owner who captioned every photo of
+ * a listing produced a batch that read as plain chat, the agent was never told a
+ * single image had arrived, and the files sat unattached in pending_media.
  */
-export function buildBatchText(texts: string[]): string {
+export function buildBatchText(rows: BatchRow[]): string {
   const lines: string[] = [];
   let photos = 0;
+  let captions: string[] = [];
   const flushPhotos = (): void => {
-    if (photos > 0) lines.push(photoLine(photos));
+    if (photos > 0) lines.push(photoLine(photos), ...captions);
     photos = 0;
+    captions = [];
   };
 
-  for (const raw of texts) {
-    const trimmed = raw.trim();
-    if (trimmed.length === 0) continue;
-    if (trimmed === PHOTO_PLACEHOLDER) {
+  for (const row of rows) {
+    const trimmed = row.agent_text.trim();
+    // Rows written before `kind` existed default to 'text' and carry the
+    // placeholder as their wording; keep reading those as the photos they were.
+    if (row.kind === "media" || trimmed === PHOTO_PLACEHOLDER) {
       photos += 1;
+      // The caption describes the image ("Vestier alcoba principal") and is the
+      // only thing the agent can learn from it — keep it, grouped with its run.
+      if (trimmed.length > 0 && trimmed !== PHOTO_PLACEHOLDER) captions.push(trimmed);
       continue;
     }
+    if (trimmed.length === 0) continue;
     flushPhotos();
     lines.push(trimmed);
   }
@@ -65,11 +84,7 @@ export function buildBatchText(texts: string[]): string {
   return lines.join("\n");
 }
 
-/**
- * Whether an inbound message carried media. The webhook already knows this from
- * the event it parsed, so the batcher is told rather than sniffing agent_text.
- */
-export type MessageKind = "text" | "media";
+export type { MessageKind };
 
 export interface InboxBatcherDeps {
   db: DB;
@@ -298,7 +313,7 @@ export class InboxBatcher {
       return;
     }
 
-    const text = buildBatchText(rows.map((row) => row.agent_text));
+    const text = buildBatchText(rows);
     // Nothing for the agent to answer (e.g. only unsupported event kinds):
     // settle the rows rather than spending a turn on an empty prompt.
     if (text.length === 0) {

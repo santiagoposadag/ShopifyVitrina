@@ -1,5 +1,6 @@
+import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { openDb } from "../src/data/db.js";
+import { createSchema, openDb } from "../src/data/db.js";
 import {
   claimInboxBatch,
   deleteStaleInboxRows,
@@ -13,6 +14,61 @@ import {
 } from "../src/data/repo.js";
 
 const MSG = { dedupe_key: "msg:wamid.1", phone: "573001", agent_text: "hola" };
+
+describe("inbox message kind", () => {
+  // The kind is what tells the batcher a row was a photo. Deriving it from the
+  // text instead lost every captioned photo, so it is stored as data.
+  it("defaults to text and round-trips media", () => {
+    const db = openDb(":memory:");
+    expect(insertInboxMessage(db, MSG)?.kind).toBe("text");
+    const photo = insertInboxMessage(db, {
+      ...MSG,
+      dedupe_key: "msg:wamid.2",
+      agent_text: "Vestier alcoba principal",
+      kind: "media",
+    });
+    expect(photo?.kind).toBe("media");
+    expect(getInboxRow(db, photo!.id)?.kind).toBe("media");
+    db.close();
+  });
+
+  it("survives a claim, which is where the batcher reads it", () => {
+    const db = openDb(":memory:");
+    insertInboxMessage(db, { ...MSG, agent_text: "Zona de ropas", kind: "media" });
+    expect(claimInboxBatch(db, MSG.phone).map((r) => r.kind)).toEqual(["media"]);
+    db.close();
+  });
+
+  // The pilot's database predates this column and holds live rows. createSchema
+  // only runs CREATE TABLE IF NOT EXISTS, so it would never add it: the column
+  // needs an explicit, idempotent migration or the server breaks on boot.
+  it("is added to a database created before the column existed", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE inbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dedupe_key TEXT UNIQUE NOT NULL,
+        phone TEXT NOT NULL,
+        agent_text TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending','processing','done','failed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        received_at TEXT NOT NULL DEFAULT (datetime('now')),
+        processed_at TEXT
+      );
+    `);
+    db.prepare(`INSERT INTO inbox (dedupe_key, phone, agent_text) VALUES ('legacy','573001','hola')`).run();
+
+    createSchema(db);
+
+    const row = db.prepare(`SELECT * FROM inbox WHERE dedupe_key = 'legacy'`).get() as {
+      kind: string;
+    };
+    expect(row.kind).toBe("text"); // existing rows keep working, as chat
+    createSchema(db); // idempotent: a second boot must not throw
+    db.close();
+  });
+});
 
 describe("inbox lifecycle (at-least-once)", () => {
   it("persists a message as pending and replays it", () => {

@@ -3,6 +3,7 @@ import type { DB } from "./db.js";
 import type {
   Lead,
   LeadType,
+  MessageKind,
   Product,
   ProductAttributes,
   ProductAttributeUpdates,
@@ -354,6 +355,8 @@ export interface InboxRow {
   dedupe_key: string;
   phone: string;
   agent_text: string;
+  /** What the event was, straight from the webhook — never re-derived from the text. */
+  kind: MessageKind;
   status: InboxStatus;
   attempts: number;
   received_at: string;
@@ -363,17 +366,20 @@ export interface InboxRow {
 /**
  * Persist an inbound message for processing. Returns the new row, or null when
  * the dedupe key was already recorded (a Kapso retry of a persisted event).
+ *
+ * `kind` defaults to "text" so callers that deal only in chat stay unchanged;
+ * the webhook always passes what it parsed.
  */
 export function insertInboxMessage(
   db: DB,
-  input: { dedupe_key: string; phone: string; agent_text: string },
+  input: { dedupe_key: string; phone: string; agent_text: string; kind?: MessageKind },
 ): InboxRow | null {
   const info = db
     .prepare(
-      `INSERT OR IGNORE INTO inbox (dedupe_key, phone, agent_text)
-       VALUES (@dedupe_key, @phone, @agent_text)`,
+      `INSERT OR IGNORE INTO inbox (dedupe_key, phone, agent_text, kind)
+       VALUES (@dedupe_key, @phone, @agent_text, @kind)`,
     )
-    .run(input);
+    .run({ kind: "text", ...input });
   if (info.changes === 0) return null;
   return getInboxRow(db, Number(info.lastInsertRowid));
 }

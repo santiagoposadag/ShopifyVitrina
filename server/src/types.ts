@@ -9,6 +9,16 @@ export type Role = "owner" | "customer";
 export type LeadType = "inquiry" | "visit_request";
 
 /**
+ * Whether an inbound message carried media. The webhook knows this from the
+ * event it parsed, so it is PERSISTED with the row rather than re-derived from
+ * agent_text later: a photo's caption is stored as its text, so any attempt to
+ * recognise a photo by its wording silently misses every captioned one.
+ * Lives here, not in the batcher, so data/repo.ts can type the column without
+ * importing back from a module that already imports it.
+ */
+export type MessageKind = "text" | "media";
+
+/**
  * Attributes as they arrive from the agent, where an explicit null means "clear
  * this key" — the owner never stated it, or un-said it. Stored attributes never
  * contain null (upsertProduct strips the keys), so ProductAttributes above stays

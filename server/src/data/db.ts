@@ -82,6 +82,10 @@ export function createSchema(db: DB): void {
       dedupe_key TEXT UNIQUE NOT NULL,
       phone TEXT NOT NULL,
       agent_text TEXT NOT NULL,
+      -- Whether the message carried media, as parsed from the event. NOT derived
+      -- from agent_text: a photo's caption is stored as its text.
+      kind TEXT NOT NULL DEFAULT 'text'
+        CHECK (kind IN ('text','media')),
       status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending','processing','done','failed')),
       attempts INTEGER NOT NULL DEFAULT 0,
@@ -108,5 +112,29 @@ export function createSchema(db: DB): void {
     CREATE INDEX IF NOT EXISTS idx_leads_created_at ON leads(created_at);
     CREATE INDEX IF NOT EXISTS idx_pending_media_phone ON pending_media(phone);
   `);
+
+  migrate(db);
+}
+
+/**
+ * Bring a database created by an older build up to the schema above.
+ *
+ * CREATE TABLE IF NOT EXISTS never alters a table that already exists, so a
+ * column added to the definition above reaches new databases only — the running
+ * pilot would keep its original table and every query naming the new column
+ * would throw at runtime. Each step here is idempotent and runs on every boot.
+ */
+function migrate(db: DB): void {
+  // Added when a captioned photo was found to be indistinguishable from chat:
+  // the caption is stored as agent_text, so the photo signal had to become data.
+  // Existing rows default to 'text', which is exactly how they read today.
+  addColumn(db, "inbox", "kind", "TEXT NOT NULL DEFAULT 'text' CHECK (kind IN ('text','media'))");
+}
+
+/** Add a column unless the table already has it. Table/column names are literals. */
+function addColumn(db: DB, table: string, column: string, definition: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (columns.some((c) => c.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
 

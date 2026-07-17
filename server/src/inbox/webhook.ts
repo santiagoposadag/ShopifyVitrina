@@ -1,8 +1,9 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import { PHOTO_PLACEHOLDER, type InboxBatcher } from "./batcher.js";
+import type { InboxBatcher } from "./batcher.js";
 import type { Config } from "../config.js";
 import type { DB } from "../data/db.js";
+import { downloadInboundMedia, type MediaDownloadBudget } from "./media-download.js";
 import type { KapsoClient } from "../whatsapp/kapso.js";
 import { saveMedia } from "../whatsapp/media.js";
 import { addPendingMedia, insertInboxMessage } from "../data/repo.js";
@@ -10,10 +11,19 @@ import type { TurnContext } from "../types.js";
 
 export const SIGNATURE_HEADER = "x-webhook-signature";
 
-// Total wall-clock budget for downloading inbound media during a single webhook
-// request. Kept well under Kapso's 10s ACK deadline so the response never waits
-// on an unbounded network call. Shared across all media in one request.
-export const MEDIA_DOWNLOAD_BUDGET_MS = 6000;
+/**
+ * Time budget for downloading inbound media during a single webhook request.
+ *
+ * `totalMs` is wall-clock for the whole burst and stays well under Kapso's 10s
+ * ACK deadline, so the response never waits on an unbounded network call.
+ * `perDownloadMs` bounds each file separately: with only a shared budget, the
+ * first slow photo drained it and every other photo in the burst failed without
+ * being attempted. See downloadInboundMedia.
+ */
+export const MEDIA_DOWNLOAD_BUDGET: MediaDownloadBudget = {
+  totalMs: 6000,
+  perDownloadMs: 5000,
+};
 
 /**
  * Verify a Kapso webhook HMAC-SHA256 signature against the RAW request body.
@@ -146,7 +156,13 @@ export function extractInbound(event: Record<string, unknown>): InboundMessage |
       from,
       id,
       kind: "image",
-      agentText: caption || PHOTO_PLACEHOLDER,
+      // The caption and nothing else. An uncaptioned photo carries no text: the
+      // row's `kind` is what says a photo arrived, and buildBatchText is what
+      // announces it. Substituting the placeholder here made a photo's text
+      // indistinguishable from a caption the owner actually wrote — it was then
+      // stored as the photo's caption, and a captioned photo, having no
+      // placeholder, stopped counting as a photo at all.
+      agentText: caption,
       media: { url: mediaUrl, filename, contentType },
     };
   }
@@ -155,6 +171,57 @@ export function extractInbound(event: Record<string, unknown>): InboundMessage |
 }
 
 const rawBodies = new WeakMap<FastifyRequest, string>();
+
+/**
+ * Download an owner's inbound photos and record them as pending, ready for
+ * attach_pending_photos. Never throws: one unreachable file must not cost the
+ * ACK or the rest of the listing.
+ *
+ * Rows are written in arrival order even though the fetches race, because photo
+ * order is the listing's order — the first photo becomes the storefront's cover.
+ */
+async function storeInboundMedia(
+  items: InboundMessage[],
+  deps: {
+    config: Config;
+    db: DB;
+    kapso: KapsoClient;
+    log: Pick<FastifyRequest["log"], "warn">;
+  },
+): Promise<void> {
+  if (items.length === 0) return;
+
+  const results = await downloadInboundMedia(
+    items,
+    (item, signal) => deps.kapso.downloadMedia(item.media!.url, signal),
+    MEDIA_DOWNLOAD_BUDGET,
+  );
+
+  for (const [index, result] of results.entries()) {
+    const item = items[index]!;
+    if (!result.ok) {
+      // Timeout, network failure, or a rejected host: record and move on. The
+      // message still reaches the agent — it just arrives without its image.
+      deps.log.warn({ err: result.error, phone: item.from }, "inbound media not stored");
+      continue;
+    }
+    try {
+      const saved = await saveMedia(deps.config, result.buffer, {
+        mimeType: item.media!.contentType,
+        suggestedName: item.media!.filename,
+      });
+      addPendingMedia(deps.db, {
+        phone: item.from,
+        file_path: saved.filePath,
+        public_path: saved.publicPath,
+        // Only what the owner actually wrote about this photo, or nothing.
+        caption: item.agentText.trim() || null,
+      });
+    } catch (err) {
+      deps.log.warn({ err, phone: item.from }, "inbound media not stored");
+    }
+  }
+}
 
 export interface WebhookDeps {
   config: Config;
@@ -195,9 +262,10 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
 
     const events = normalizeEvents(request.body);
 
-    // Shared budget so the ACK never blocks on unbounded media downloads, even
-    // across a batch. Media tokens expire in ~4 min, so we still download now.
-    const mediaDeadline = AbortSignal.timeout(MEDIA_DOWNLOAD_BUDGET_MS);
+    // Media to fetch once every row is persisted. Collected rather than
+    // downloaded inline so the whole burst can be fetched concurrently under one
+    // budget; downloading inside this loop meant photo N+1 waited on photo N.
+    const toDownload: InboundMessage[] = [];
 
     for (const event of events) {
       const inbound = extractInbound(event);
@@ -212,30 +280,15 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
         dedupe_key: stableEventKey(event, inbound.id),
         phone: inbound.from,
         agent_text: inbound.agentText,
+        // Stored, not inferred later: a captioned photo's text IS the caption,
+        // so nothing downstream could tell it apart from someone typing.
+        kind: inbound.media ? "media" : "text",
       });
       if (!row) continue; // Retry of an event we already persisted.
 
       // Persist inbound media ONLY for owners (they ingest listings). Customers'
       // images are acknowledged in the agent context but never stored/served.
-      // Download is bounded and non-fatal so a slow fetch cannot delay the ACK.
-      if (inbound.media && roleFor(inbound.from) === "owner") {
-        try {
-          const buffer = await kapso.downloadMedia(inbound.media.url, mediaDeadline);
-          const saved = await saveMedia(config, buffer, {
-            mimeType: inbound.media.contentType,
-            suggestedName: inbound.media.filename,
-          });
-          addPendingMedia(db, {
-            phone: inbound.from,
-            file_path: saved.filePath,
-            public_path: saved.publicPath,
-            caption: inbound.agentText,
-          });
-        } catch (err) {
-          // Timeout, network failure, or a rejected host: record and move on.
-          request.log.warn({ err, phone: inbound.from }, "inbound media not stored");
-        }
-      }
+      if (inbound.media && roleFor(inbound.from) === "owner") toDownload.push(inbound);
 
       // Hand the row to the batcher; it debounces and runs the agent on the
       // async worker. Only the timer state is touched here, so the ACK stays
@@ -243,6 +296,8 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
       // a much longer window than chat (see InboxBatcher).
       batcher.schedule(row.phone, inbound.media ? "media" : "text");
     }
+
+    await storeInboundMedia(toDownload, { config, db, kapso, log: request.log });
 
     // ACK fast; the agent runs on the async worker.
     return reply.code(200).send({ status: "ok" });

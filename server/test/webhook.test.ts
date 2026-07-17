@@ -136,6 +136,29 @@ describe("extractInbound", () => {
     expect(inbound?.agentText).toBe("Mira esta casa");
   });
 
+  // An uncaptioned photo has NO text. It used to be given the placeholder
+  // wording here, which then got stored as the photo's own caption — 47 rows in
+  // the pilot database read "(El usuario envió una foto)" as if the owner had
+  // described them that way. The placeholder is how a photo is ANNOUNCED to the
+  // agent, so it belongs to buildBatchText; the row carries kind instead.
+  it("leaves an uncaptioned image with no text of its own", () => {
+    const event = {
+      message: {
+        type: "image",
+        from: "573001112233",
+        image: { id: "media_2" },
+        kapso: {
+          direction: "inbound",
+          media_data: { url: "https://api.kapso.ai/media/def", content_type: "image/jpeg" },
+        },
+      },
+    };
+    const inbound = extractInbound(event);
+    expect(inbound?.kind).toBe("image");
+    expect(inbound?.media?.url).toBe("https://api.kapso.ai/media/def");
+    expect(inbound?.agentText).toBe("");
+  });
+
   it("extracts an interactive button reply", () => {
     const event = {
       message: {
