@@ -54,15 +54,32 @@ GitHub repo**. No server, no SaaS.
 
 ### Layout
 
-| Secret | gopass path |
-|--------|-------------|
-| `ANTHROPIC_API_KEY` | `vitrina/anthropic_api_key` |
-| `KAPSO_API_KEY` | `vitrina/kapso_api_key` |
-| `KAPSO_PHONE_NUMBER_ID` | `vitrina/kapso_phone_number_id` |
-| `KAPSO_WEBHOOK_SECRET` | `vitrina/kapso_webhook_secret` |
+| Secret | gopass path | Provider |
+|--------|-------------|----------|
+| `ANTHROPIC_API_KEY` | `vitrina/anthropic_api_key` | always |
+| `KAPSO_API_KEY` | `vitrina/kapso_api_key` | `kapso` |
+| `KAPSO_PHONE_NUMBER_ID` | `vitrina/kapso_phone_number_id` | `kapso` |
+| `KAPSO_WEBHOOK_SECRET` | `vitrina/kapso_webhook_secret` | `kapso` |
+| `BRIDGE_WEBHOOK_SECRET` | `vitrina/bridge_webhook_secret` | `whatsmeow` |
+| `BRIDGE_API_TOKEN` | `vitrina/bridge_api_token` | `whatsmeow` |
 
-Non-secret config (`OWNER_PHONE_NUMBERS`, `PUBLIC_BASE_URL`, `NEXT_PUBLIC_*`)
-stays out of the vault — shell env or `.env` fallback.
+`WHATSAPP_PROVIDER` selects which set the wrapper fetches, so running one
+provider never requires the other's credentials to exist in the vault. Both
+bridge secrets are ours to invent rather than issued by anyone, so generate them:
+
+```sh
+gopass generate -n vitrina/bridge_webhook_secret 48   # signs bridge → server events
+gopass generate -n vitrina/bridge_api_token 48        # guards the bridge's /send
+gopass git push
+```
+
+Treat `BRIDGE_API_TOKEN` as the most sensitive value here: anyone holding it can
+send WhatsApp messages as the business, with no Meta account in the loop to
+revoke. Rotating it means restarting both containers together — they must agree.
+
+Non-secret config (`OWNER_PHONE_NUMBERS`, `PUBLIC_BASE_URL`, `NEXT_PUBLIC_*`,
+`WHATSAPP_PROVIDER`, `BRIDGE_PAIR_PHONE`) stays out of the vault — shell env or
+`.env` fallback.
 
 ### Daily use
 
