@@ -1,4 +1,5 @@
 import type { Config } from "../config.js";
+import type { WhatsAppChannel } from "./channel.js";
 
 /**
  * Minimal REST client for Kapso's WhatsApp Cloud API proxy.
@@ -39,7 +40,7 @@ export function isAllowedMediaHost(url: string): boolean {
   }
 }
 
-export class KapsoClient {
+export class KapsoClient implements WhatsAppChannel {
   private readonly apiKey: string;
   private readonly phoneNumberId: string;
 
@@ -104,6 +105,8 @@ export class KapsoClient {
    * Download an inbound media file from its signed url. The url is short-lived
    * (~4 min). We send the API key too; the signed token authorizes it either
    * way but this is harmless and covers both Kapso auth modes.
+   *
+   * The WhatsAppChannel ref is a URL for this provider; see channel.ts.
    */
   async downloadMedia(downloadUrl: string, signal?: AbortSignal): Promise<Buffer> {
     if (!isAllowedMediaHost(downloadUrl)) {

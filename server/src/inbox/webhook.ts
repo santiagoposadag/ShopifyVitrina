@@ -4,7 +4,7 @@ import type { InboxBatcher } from "./batcher.js";
 import type { Config } from "../config.js";
 import type { DB } from "../data/db.js";
 import { downloadInboundMedia, type MediaDownloadBudget } from "./media-download.js";
-import type { KapsoClient } from "../whatsapp/kapso.js";
+import type { WhatsAppChannel } from "../whatsapp/channel.js";
 import { saveMedia } from "../whatsapp/media.js";
 import { addPendingMedia, insertInboxMessage } from "../data/repo.js";
 import type { TurnContext } from "../types.js";
@@ -97,6 +97,11 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
 /**
  * Extract an inbound WhatsApp message from a single event. Returns null for
  * events that are not inbound received messages (status updates, contacts...).
+ *
+ * This parses KAPSO's envelope specifically, and deliberately so: WhatsAppChannel
+ * abstracts sending and media fetching, not the wire format a provider posts to
+ * us. A second provider brings its own extractor and both produce InboundMessage,
+ * which is the shape the rest of the pipeline actually depends on.
  */
 export function extractInbound(event: Record<string, unknown>): InboundMessage | null {
   // The message may sit at event.data.message, event.message, or event itself.
@@ -185,7 +190,7 @@ async function storeInboundMedia(
   deps: {
     config: Config;
     db: DB;
-    kapso: KapsoClient;
+    channel: WhatsAppChannel;
     log: Pick<FastifyRequest["log"], "warn">;
   },
 ): Promise<void> {
@@ -193,7 +198,7 @@ async function storeInboundMedia(
 
   const results = await downloadInboundMedia(
     items,
-    (item, signal) => deps.kapso.downloadMedia(item.media!.url, signal),
+    (item, signal) => deps.channel.downloadMedia(item.media!.url, signal),
     MEDIA_DOWNLOAD_BUDGET,
   );
 
@@ -226,7 +231,7 @@ async function storeInboundMedia(
 export interface WebhookDeps {
   config: Config;
   db: DB;
-  kapso: KapsoClient;
+  channel: WhatsAppChannel;
   /** Coalesces each phone's burst into a single agent turn, off the ACK path. */
   batcher: InboxBatcher;
   /** Maps a phone number to its role (owner vs customer). */
@@ -234,7 +239,7 @@ export interface WebhookDeps {
 }
 
 export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
-  const { config, db, kapso, batcher, roleFor } = deps;
+  const { config, db, channel, batcher, roleFor } = deps;
 
   // Keep the raw body so we can verify the signature over exact bytes.
   app.addContentTypeParser(
@@ -297,7 +302,7 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
       batcher.schedule(row.phone, inbound.media ? "media" : "text");
     }
 
-    await storeInboundMedia(toDownload, { config, db, kapso, log: request.log });
+    await storeInboundMedia(toDownload, { config, db, channel, log: request.log });
 
     // ACK fast; the agent runs on the async worker.
     return reply.code(200).send({ status: "ok" });

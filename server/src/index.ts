@@ -4,6 +4,7 @@ import { ConsecutiveFailureAlert } from "./inbox/alerts.js";
 import { InboxBatcher } from "./inbox/batcher.js";
 import { isOwner, loadConfig, loadDotEnv } from "./config.js";
 import { openDb } from "./data/db.js";
+import type { WhatsAppChannel } from "./whatsapp/channel.js";
 import { KapsoClient } from "./whatsapp/kapso.js";
 import { registerMediaRoutes } from "./whatsapp/media.js";
 import { PerPhoneQueue } from "./inbox/queue.js";
@@ -31,7 +32,10 @@ async function main(): Promise<void> {
   loadDotEnv();
   const config = loadConfig();
   const db = openDb(config.dbPath);
-  const kapso = new KapsoClient(config);
+  // The composition root is the ONLY place that names a WhatsApp provider.
+  // Everything below takes the WhatsAppChannel interface, so a second provider
+  // is a new implementation wired in here, not an edit to the pipeline.
+  const channel: WhatsAppChannel = new KapsoClient(config);
   const queue = new PerPhoneQueue();
   const rateLimiter = new RateLimiter({
     perPhonePerHour: config.rateLimitPerPhonePerHour,
@@ -80,7 +84,7 @@ async function main(): Promise<void> {
   const notifyOwnersOfFailures = async (): Promise<void> => {
     for (const owner of config.ownerPhoneNumbers) {
       try {
-        await kapso.sendText(owner, OWNER_FAILURE_ALERT);
+        await channel.sendText(owner, OWNER_FAILURE_ALERT);
       } catch {
         // Best effort; the failure is already in the logs.
       }
@@ -107,7 +111,7 @@ async function main(): Promise<void> {
       // coalesced burst, so a message barrage cannot turn this into spam.
       if (ctx.role !== "owner" && !config.customerAgentEnabled) {
         try {
-          await kapso.sendText(ctx.phone, CUSTOMER_UNAVAILABLE_NOTICE);
+          await channel.sendText(ctx.phone, CUSTOMER_UNAVAILABLE_NOTICE);
         } catch {
           // Best effort.
         }
@@ -121,7 +125,7 @@ async function main(): Promise<void> {
           app.log.warn({ phone: ctx.phone, decision }, "agent turn rate limited");
           if (decision === "phone_limited" && rateLimiter.shouldNotify(ctx.phone)) {
             try {
-              await kapso.sendText(ctx.phone, RATE_LIMIT_NOTICE);
+              await channel.sendText(ctx.phone, RATE_LIMIT_NOTICE);
             } catch {
               // Best effort.
             }
@@ -133,7 +137,7 @@ async function main(): Promise<void> {
       // A throw here reaches the batcher, which retries the batch with backoff
       // and settles it as failed once the attempt budget is spent — the
       // user-facing side effects live in onBatchFailure below.
-      await runAgentTurn({ db, kapso, config, log: app.log }, ctx, text);
+      await runAgentTurn({ db, channel, config, log: app.log }, ctx, text);
       failureAlert.recordSuccess();
     },
     onBatchFailure: async (ctx, { final }) => {
@@ -144,14 +148,14 @@ async function main(): Promise<void> {
       if (failureAlert.recordFailure()) void notifyOwnersOfFailures();
       if (!final) return; // the retry may still answer; apologize only when it cannot
       try {
-        await kapso.sendText(ctx.phone, AGENT_ERROR_APOLOGY);
+        await channel.sendText(ctx.phone, AGENT_ERROR_APOLOGY);
       } catch {
         // Best effort; the failure is already in the logs.
       }
     },
   });
 
-  const deps: WebhookDeps = { config, db, kapso, batcher, roleFor };
+  const deps: WebhookDeps = { config, db, channel, batcher, roleFor };
 
   registerWebhook(app, deps);
 

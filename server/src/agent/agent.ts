@@ -2,7 +2,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { FastifyBaseLogger } from "fastify";
 import type { Config } from "../config.js";
 import type { DB } from "../data/db.js";
-import type { KapsoClient } from "../whatsapp/kapso.js";
+import type { WhatsAppChannel } from "../whatsapp/channel.js";
 import { clearSessionId, getSessionId, setSessionId } from "../data/repo.js";
 import { buildToolServer, MCP_SERVER_NAME } from "./tools.js";
 import type { Role, TurnContext } from "../types.js";
@@ -93,7 +93,7 @@ Be warm, concise, and helpful.`;
 
 export interface AgentDeps {
   db: DB;
-  kapso: KapsoClient;
+  channel: WhatsAppChannel;
   config: Config;
   /** Only the level this module uses — a session fallback is worth seeing. */
   log: Pick<FastifyBaseLogger, "warn">;
@@ -196,7 +196,7 @@ export async function runAgentTurn(
   ctx: TurnContext,
   incomingText: string,
 ): Promise<string> {
-  const { db, kapso, config, log } = deps;
+  const { db, channel, config, log } = deps;
   const resumeId = getSessionId(db, ctx.phone, config.sessionMaxAgeDays);
 
   let result: TurnResult;
@@ -225,7 +225,7 @@ export async function runAgentTurn(
     setSessionId(db, ctx.phone, result.sessionId);
   }
   if (result.reply.length > 0) {
-    await kapso.sendText(ctx.phone, result.reply);
+    await channel.sendText(ctx.phone, result.reply);
   }
   return result.reply;
 }
