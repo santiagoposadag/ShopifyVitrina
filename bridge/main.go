@@ -55,6 +55,21 @@ func openSQLite(path string) (*sql.DB, error) {
 	return db, nil
 }
 
+// The display name WhatsApp shows for a code-paired device.
+//
+// This is NOT free text. WhatsApp validates it server-side and rejects anything
+// that is not `Browser (OS)` naming a browser and OS it recognises — the failure
+// is an opaque `info query returned status 400: bad-request` with nothing to say
+// the name was the problem. A product name here ("Vitrina Bridge") makes pairing
+// impossible. pairClientType must agree with the browser named here.
+//
+// The device still appears under a recognisable name on the phone: that comes
+// from store.DeviceProps.Os, which is set separately and is not validated.
+const (
+	pairDisplayName = "Chrome (Linux)"
+	pairClientType  = whatsmeow.PairClientChrome
+)
+
 // runPairing drives a first-time link. Returns once the pairing channel closes.
 //
 // Phone-code pairing is preferred over QR: it needs no image, no exposed web UI,
@@ -76,7 +91,7 @@ func runPairing(ctx context.Context, client *whatsmeow.Client, qrChan <-chan wha
 				continue
 			}
 			requested = true
-			code, err := client.PairPhone(ctx, pairPhone, true, whatsmeow.PairClientChrome, "Vitrina Bridge")
+			code, err := client.PairPhone(ctx, pairPhone, true, pairClientType, pairDisplayName)
 			if err != nil {
 				log.Errorf("could not request a pairing code for %s: %v", pairPhone, err)
 				continue
