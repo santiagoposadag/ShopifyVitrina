@@ -186,10 +186,18 @@ instead.
 Confirm it took:
 
 ```bash
-docker compose exec bridge /bridge -healthcheck && echo "process alive"
-curl -s -H "Authorization: Bearer $BRIDGE_API_TOKEN" http://localhost:3002/status
+docker compose exec bridge /bridge -status
 # {"connected":true,"loggedOut":false,"pairedAs":"57300...:12@s.whatsapp.net",...}
 ```
+
+The binary probes itself because the bridge publishes no port and the image has
+no shell — there is nothing to `curl`, from outside or in. `-healthcheck` is the
+same idea for liveness, and is what Docker runs.
+
+> **You cannot test by messaging the paired number from that same number.**
+> Those arrive with `IsFromMe` set and the bridge drops them, exactly as it drops
+> its own outgoing messages — otherwise every reply would loop back in as a new
+> message. Pair one number, message it from a different phone.
 
 A tunnel is still needed for **outbound links**, not for messages: the storefront
 URLs the assistant sends must resolve on the recipient's phone. Set

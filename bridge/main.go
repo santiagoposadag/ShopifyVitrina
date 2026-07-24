@@ -11,6 +11,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -98,21 +99,34 @@ func runPairing(ctx context.Context, client *whatsmeow.Client, qrChan <-chan wha
 // It lives in this binary because the runtime image is distroless: there is no
 // shell, no curl, and nothing else a Docker HEALTHCHECK could run. Without it the
 // container reports "running" even when the HTTP server is dead.
-func healthcheck(addr string) error {
+//
+// The same reasoning gives us -status: the bridge publishes no port and the image
+// has no shell, so without this there is NO way to ask a deployed bridge whether
+// it is still linked to WhatsApp — which is the one failure that matters and the
+// one a restart cannot fix.
+func probe(addr, path, token string) (string, error) {
 	// Compose gives an addr like ":3002"; dial it on the loopback interface.
 	if strings.HasPrefix(addr, ":") {
 		addr = "127.0.0.1" + addr
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
-	res, err := client.Get("http://" + addr + "/health")
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr+path, nil)
 	if err != nil {
-		return err
+		return "", err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return "", err
 	}
 	defer res.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(res.Body, 8192))
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("health returned %d", res.StatusCode)
+		return "", fmt.Errorf("%s returned %d: %s", path, res.StatusCode, string(body))
 	}
-	return nil
+	return string(body), nil
 }
 
 func run() error {
@@ -121,10 +135,21 @@ func run() error {
 		return err
 	}
 
-	// Probe mode: no store, no WhatsApp connection, just ask the running process
-	// whether it is serving. Must come after LoadConfig so it uses the same addr.
-	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
-		return healthcheck(cfg.Addr)
+	// Probe modes: no store, no WhatsApp connection — just ask the process that is
+	// already running. They come after LoadConfig so they reuse its addr and token.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-healthcheck":
+			_, err := probe(cfg.Addr, "/health", "")
+			return err
+		case "-status":
+			body, err := probe(cfg.Addr, "/status", cfg.APIToken)
+			if err != nil {
+				return err
+			}
+			fmt.Println(body)
+			return nil
+		}
 	}
 
 	level := "INFO"
