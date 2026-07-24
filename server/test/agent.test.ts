@@ -20,9 +20,13 @@ const CTX: TurnContext = { phone: PHONE, role: "customer" };
 
 const CONFIG: Config = {
   anthropicApiKey: "sk-test",
+  whatsappProvider: "kapso",
+  webhookSecret: "whsec",
   kapsoApiKey: "kapso-test",
   kapsoPhoneNumberId: "123",
-  kapsoWebhookSecret: "whsec",
+  bridgeUrl: "",
+  bridgeApiToken: "",
+  bridgeStagingDir: "",
   ownerPhoneNumbers: new Set<string>(),
   dbPath: ":memory:",
   mediaDir: "/tmp/media",

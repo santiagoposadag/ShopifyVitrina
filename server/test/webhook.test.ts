@@ -131,7 +131,7 @@ describe("extractInbound", () => {
     };
     const inbound = extractInbound(event);
     expect(inbound?.kind).toBe("image");
-    expect(inbound?.media?.url).toBe("https://api.kapso.ai/media/abc");
+    expect(inbound?.media?.ref).toBe("https://api.kapso.ai/media/abc");
     expect(inbound?.media?.contentType).toBe("image/jpeg");
     expect(inbound?.agentText).toBe("Mira esta casa");
   });
@@ -155,7 +155,7 @@ describe("extractInbound", () => {
     };
     const inbound = extractInbound(event);
     expect(inbound?.kind).toBe("image");
-    expect(inbound?.media?.url).toBe("https://api.kapso.ai/media/def");
+    expect(inbound?.media?.ref).toBe("https://api.kapso.ai/media/def");
     expect(inbound?.agentText).toBe("");
   });
 

@@ -77,7 +77,12 @@ export interface InboundMessage {
   id?: string;
   /** Text to feed the agent (button title, caption, or body). */
   agentText: string;
-  media?: { url: string; filename?: string; contentType?: string };
+  /**
+   * `ref` rather than `url` because it is provider-shaped and only the active
+   * channel knows how to resolve it: Kapso yields a short-lived signed URL,
+   * the bridge a path in its staging directory. See whatsapp/channel.ts.
+   */
+  media?: { ref: string; filename?: string; contentType?: string };
 }
 
 /**
@@ -168,7 +173,7 @@ export function extractInbound(event: Record<string, unknown>): InboundMessage |
       // stored as the photo's caption, and a captioned photo, having no
       // placeholder, stopped counting as a photo at all.
       agentText: caption,
-      media: { url: mediaUrl, filename, contentType },
+      media: { ref: mediaUrl, filename, contentType },
     };
   }
 
@@ -198,7 +203,7 @@ async function storeInboundMedia(
 
   const results = await downloadInboundMedia(
     items,
-    (item, signal) => deps.channel.downloadMedia(item.media!.url, signal),
+    (item, signal) => deps.channel.downloadMedia(item.media!.ref, signal),
     MEDIA_DOWNLOAD_BUDGET,
   );
 
@@ -232,6 +237,12 @@ export interface WebhookDeps {
   config: Config;
   db: DB;
   channel: WhatsAppChannel;
+  /**
+   * Parses this provider's wire format into an InboundMessage. Injected because
+   * the format is the one thing WhatsAppChannel deliberately does NOT abstract:
+   * see extractInbound (Kapso) and extractInboundWhatsmeow (the bridge).
+   */
+  extract: (event: Record<string, unknown>) => InboundMessage | null;
   /** Coalesces each phone's burst into a single agent turn, off the ACK path. */
   batcher: InboxBatcher;
   /** Maps a phone number to its role (owner vs customer). */
@@ -239,7 +250,7 @@ export interface WebhookDeps {
 }
 
 export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
-  const { config, db, channel, batcher, roleFor } = deps;
+  const { config, db, channel, batcher, roleFor, extract } = deps;
 
   // Keep the raw body so we can verify the signature over exact bytes.
   app.addContentTypeParser(
@@ -261,7 +272,7 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
     const signature = request.headers[SIGNATURE_HEADER];
     const signatureValue = Array.isArray(signature) ? signature[0] : signature;
 
-    if (!verifySignature(rawBody, signatureValue, config.kapsoWebhookSecret)) {
+    if (!verifySignature(rawBody, signatureValue, config.webhookSecret)) {
       return reply.code(401).send({ error: "invalid_signature" });
     }
 
@@ -271,9 +282,13 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
     // downloaded inline so the whole burst can be fetched concurrently under one
     // budget; downloading inside this loop meant photo N+1 waited on photo N.
     const toDownload: InboundMessage[] = [];
+    // Media we deliberately will not fetch. Under Kapso this stays empty and
+    // costs nothing; under the bridge these are files already sitting on the
+    // volume, and nothing else would ever delete them.
+    const toRelease: string[] = [];
 
     for (const event of events) {
-      const inbound = extractInbound(event);
+      const inbound = extract(event);
       if (!inbound) continue;
       // No agent-worthy content and no media side effects: skip entirely.
       if (inbound.agentText.trim().length === 0 && inbound.kind !== "image") continue;
@@ -289,11 +304,20 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
         // so nothing downstream could tell it apart from someone typing.
         kind: inbound.media ? "media" : "text",
       });
-      if (!row) continue; // Retry of an event we already persisted.
+      if (!row) {
+        // Retry of an event we already persisted. Its media was dealt with on
+        // the first pass, so this copy is released rather than left behind.
+        if (inbound.media) toRelease.push(inbound.media.ref);
+        continue;
+      }
 
       // Persist inbound media ONLY for owners (they ingest listings). Customers'
-      // images are acknowledged in the agent context but never stored/served.
-      if (inbound.media && roleFor(inbound.from) === "owner") toDownload.push(inbound);
+      // images are acknowledged in the agent context but never stored/served —
+      // and under the bridge, "never stored" still means a file to clean up.
+      if (inbound.media) {
+        if (roleFor(inbound.from) === "owner") toDownload.push(inbound);
+        else toRelease.push(inbound.media.ref);
+      }
 
       // Hand the row to the batcher; it debounces and runs the agent on the
       // async worker. Only the timer state is touched here, so the ACK stays
@@ -303,6 +327,15 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
     }
 
     await storeInboundMedia(toDownload, { config, db, channel, log: request.log });
+
+    for (const ref of toRelease) {
+      try {
+        await channel.releaseMedia?.(ref);
+      } catch (err) {
+        // Tidying up is never worth the ACK or the message.
+        request.log.warn({ err, ref }, "could not release unused inbound media");
+      }
+    }
 
     // ACK fast; the agent runs on the async worker.
     return reply.code(200).send({ status: "ok" });

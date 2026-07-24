@@ -15,11 +15,38 @@ export function resolveDataPath(p: string): string {
  * Runtime configuration, read once from the environment at boot.
  * Fails fast with a clear message when a required variable is missing.
  */
+/**
+ * Which WhatsApp provider is live. Exactly one at a time: both would compete for
+ * the same /webhook route and the same conversations.
+ *
+ * `kapso` is Meta's Cloud API behind Kapso's proxy — official, per-conversation
+ * pricing, requires WhatsApp Business onboarding. `whatsmeow` is the local bridge
+ * sidecar speaking the linked-device protocol — no onboarding, no fees, and no
+ * official standing with Meta.
+ */
+export type WhatsAppProvider = "kapso" | "whatsmeow";
+
 export interface Config {
   anthropicApiKey: string;
+  whatsappProvider: WhatsAppProvider;
+  /**
+   * HMAC secret for the ACTIVE provider's inbound webhook. Not named after a
+   * provider: both sign the same way over the same raw body, and the route that
+   * verifies it must not care which one is wired up.
+   */
+  webhookSecret: string;
+  /** Kapso only; empty when the whatsmeow bridge is the active provider. */
   kapsoApiKey: string;
   kapsoPhoneNumberId: string;
-  kapsoWebhookSecret: string;
+  /** Bridge only; empty under Kapso. Internal URL of the sidecar, e.g. http://bridge:3002 */
+  bridgeUrl: string;
+  bridgeApiToken: string;
+  /**
+   * Directory the bridge writes decrypted inbound media into. The server reads
+   * from here and unlinks; nothing outside this directory is ever readable
+   * through a media ref (see whatsapp/bridge.ts).
+   */
+  bridgeStagingDir: string;
   ownerPhoneNumbers: Set<string>;
   dbPath: string;
   mediaDir: string;
@@ -98,14 +125,30 @@ export function loadOwnerPhoneNumbers(): Set<string> {
   );
 }
 
+/** Exported for tests. Rejects anything that is not a provider we implement. */
+export function loadProvider(): WhatsAppProvider {
+  const raw = optional("WHATSAPP_PROVIDER", "kapso").toLowerCase();
+  if (raw === "kapso" || raw === "whatsmeow") return raw;
+  throw new Error(`Invalid value for WHATSAPP_PROVIDER: expected kapso or whatsmeow, got "${raw}"`);
+}
+
 export function loadConfig(): Config {
   const ownerPhoneNumbers = loadOwnerPhoneNumbers();
+  const whatsappProvider = loadProvider();
+  const usingKapso = whatsappProvider === "kapso";
 
+  // Only the ACTIVE provider's credentials are required. Demanding all of them
+  // would mean inventing dummy Kapso keys just to run the bridge — and a dummy
+  // key that boots is a key nobody notices is wrong.
   return {
     anthropicApiKey: required("ANTHROPIC_API_KEY"),
-    kapsoApiKey: required("KAPSO_API_KEY"),
-    kapsoPhoneNumberId: required("KAPSO_PHONE_NUMBER_ID"),
-    kapsoWebhookSecret: required("KAPSO_WEBHOOK_SECRET"),
+    whatsappProvider,
+    webhookSecret: usingKapso ? required("KAPSO_WEBHOOK_SECRET") : required("BRIDGE_WEBHOOK_SECRET"),
+    kapsoApiKey: usingKapso ? required("KAPSO_API_KEY") : "",
+    kapsoPhoneNumberId: usingKapso ? required("KAPSO_PHONE_NUMBER_ID") : "",
+    bridgeUrl: usingKapso ? "" : required("BRIDGE_URL").replace(/\/+$/, ""),
+    bridgeApiToken: usingKapso ? "" : required("BRIDGE_API_TOKEN"),
+    bridgeStagingDir: usingKapso ? "" : resolveDataPath(required("BRIDGE_STAGING_DIR")),
     ownerPhoneNumbers,
     dbPath: resolveDataPath(optional("DB_PATH", "./data/vitrina.db")),
     mediaDir: resolveDataPath(optional("MEDIA_DIR", "./data/media")),

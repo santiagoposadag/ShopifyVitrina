@@ -7,9 +7,14 @@
 # (exports the secrets from gopass); a plain .env still works as fallback.
 x-secrets-env: &secrets-env
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-  KAPSO_API_KEY: ${KAPSO_API_KEY}
-  KAPSO_PHONE_NUMBER_ID: ${KAPSO_PHONE_NUMBER_ID}
-  KAPSO_WEBHOOK_SECRET: ${KAPSO_WEBHOOK_SECRET}
+  KAPSO_API_KEY: ${KAPSO_API_KEY:-}
+  KAPSO_PHONE_NUMBER_ID: ${KAPSO_PHONE_NUMBER_ID:-}
+  KAPSO_WEBHOOK_SECRET: ${KAPSO_WEBHOOK_SECRET:-}
+  # Bridge (whatsmeow) credentials. Only the ACTIVE provider's secrets are
+  # required — server/src/config.ts checks WHATSAPP_PROVIDER and demands one set
+  # or the other, so both are passed through empty-tolerant here.
+  BRIDGE_WEBHOOK_SECRET: ${BRIDGE_WEBHOOK_SECRET:-}
+  BRIDGE_API_TOKEN: ${BRIDGE_API_TOKEN:-}
   OWNER_PHONE_NUMBERS: ${OWNER_PHONE_NUMBERS:-}
 
 # Absolute paths inside the containers. server/src/config.ts short-circuits on
@@ -26,6 +31,13 @@ services:
       dockerfile: server/Dockerfile
     environment:
       <<: [*secrets-env, *data-env]
+      # kapso (default) or whatsmeow. Switching providers is a redeploy, not a
+      # rewrite: it selects both the outbound client and the inbound parser.
+      WHATSAPP_PROVIDER: ${WHATSAPP_PROVIDER:-kapso}
+      # Only read when the provider is whatsmeow. The bridge is reachable on the
+      # compose network only — it is never published or given a domain.
+      BRIDGE_URL: http://bridge:3002
+      BRIDGE_STAGING_DIR: /data/inbound
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
       # The STOREFRONT's URL, not this server's — the two are different hosts.
       # Used to build the owner's private draft-preview links.
@@ -102,6 +114,44 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # WhatsApp channel via the whatsmeow linked-device protocol — an alternative to
+  # Kapso that needs no WhatsApp Business onboarding and no per-conversation fee.
+  # Excluded from a plain `docker compose up` by its profile; bring it up with:
+  #   ./scripts/with-secrets.sh docker compose --profile whatsmeow up -d
+  # and set WHATSAPP_PROVIDER=whatsmeow so the server actually routes through it.
+  #
+  # DELIBERATELY NOT PUBLISHED: no `ports:` and, on Coolify, no domain. Anyone who
+  # can reach /send can send WhatsApp messages as the business. The only exposure
+  # it needs is to the server, on the compose network.
+  bridge:
+    image: vitrina-bridge
+    build:
+      context: ./bridge
+      dockerfile: Dockerfile
+    environment:
+      BRIDGE_WEBHOOK_SECRET: ${BRIDGE_WEBHOOK_SECRET}
+      BRIDGE_API_TOKEN: ${BRIDGE_API_TOKEN}
+      BRIDGE_WEBHOOK_URL: http://server:3001/webhook
+      BRIDGE_STAGING_DIR: /data/inbound
+      BRIDGE_STORE_PATH: /session/whatsmeow.db
+      BRIDGE_OUTBOX_PATH: /session/outbox.db
+      BRIDGE_ADDR: ":3002"
+      # Bare E.164 digits: pairs by 8-character code instead of QR, which keeps
+      # the whole flow inside the container logs. Unset falls back to a QR code
+      # rendered into the logs.
+      BRIDGE_PAIR_PHONE: ${BRIDGE_PAIR_PHONE:-}
+      BRIDGE_DEBUG: ${BRIDGE_DEBUG:-}
+    volumes:
+      # The pairing and the delivery queue. Losing this volume means re-pairing
+      # the number by hand — it is NOT disposable like vitrina-sessions.
+      - vitrina-whatsapp:/session
+      # Shared with the server: the bridge writes decrypted inbound media here
+      # and the server reads it, then unlinks. This is why a 37-photo burst moves
+      # zero image bytes over HTTP.
+      - vitrina-data:/data
+    restart: unless-stopped
+    profiles: ["whatsmeow"]
+
   # Seeds the two example properties. Excluded from `docker compose up` via
   # the "seed" profile — run it explicitly with:
   #   docker compose --profile seed run --rm seed
@@ -177,3 +227,7 @@ volumes:
   # Separate from vitrina-data because it is disposable — losing it costs
   # conversation history, not business data, and the storefront never reads it.
   vitrina-sessions: {}
+  # whatsmeow's device store (the pairing) and its delivery outbox. The one
+  # volume here that is NOT disposable: losing it unlinks the number and someone
+  # has to re-pair by hand, with the owner's phone in reach.
+  vitrina-whatsapp: {}

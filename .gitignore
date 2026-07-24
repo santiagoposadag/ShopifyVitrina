@@ -14,3 +14,6 @@ dist/
 
 # Local scratch template for .env (see env.sample for the committed reference)
 env.txt
+
+# Go build artifact: `go build ./...` drops the binary next to its source.
+/bridge/bridge

@@ -4,8 +4,10 @@ import { ConsecutiveFailureAlert } from "./inbox/alerts.js";
 import { InboxBatcher } from "./inbox/batcher.js";
 import { isOwner, loadConfig, loadDotEnv } from "./config.js";
 import { openDb } from "./data/db.js";
+import { BridgeChannel, sweepStagedMedia } from "./whatsapp/bridge.js";
 import type { WhatsAppChannel } from "./whatsapp/channel.js";
 import { KapsoClient } from "./whatsapp/kapso.js";
+import { extractInboundWhatsmeow } from "./inbox/whatsmeow.js";
 import { registerMediaRoutes } from "./whatsapp/media.js";
 import { PerPhoneQueue } from "./inbox/queue.js";
 import { RateLimiter } from "./inbox/rate-limit.js";
@@ -16,7 +18,7 @@ import {
   upsertContact,
 } from "./data/repo.js";
 import { sweepOrphanedTranscripts, transcriptsDir } from "./data/transcripts.js";
-import { registerWebhook, type WebhookDeps } from "./inbox/webhook.js";
+import { extractInbound, registerWebhook, type WebhookDeps } from "./inbox/webhook.js";
 import type { TurnContext } from "./types.js";
 
 const RATE_LIMIT_NOTICE =
@@ -35,7 +37,13 @@ async function main(): Promise<void> {
   // The composition root is the ONLY place that names a WhatsApp provider.
   // Everything below takes the WhatsAppChannel interface, so a second provider
   // is a new implementation wired in here, not an edit to the pipeline.
-  const channel: WhatsAppChannel = new KapsoClient(config);
+  //
+  // The pair moves together on purpose: the channel resolves media refs that only
+  // its own extractor produces, so a mismatched pair would pass typecheck and
+  // then fail on the first photo.
+  const usingBridge = config.whatsappProvider === "whatsmeow";
+  const channel: WhatsAppChannel = usingBridge ? new BridgeChannel(config) : new KapsoClient(config);
+  const extract = usingBridge ? extractInboundWhatsmeow : extractInbound;
   const queue = new PerPhoneQueue();
   const rateLimiter = new RateLimiter({
     perPhonePerHour: config.rateLimitPerPhonePerHour,
@@ -52,7 +60,12 @@ async function main(): Promise<void> {
   // drops the SQLite row, and nothing else ever deletes what it pointed at.
   // Inert unless AGENT_TRANSCRIPTS_DIR is set (see data/transcripts.ts).
   const PENDING_MEDIA_TTL_HOURS = 48;
-  const runHousekeeping = (): void => {
+  // Staged files are normally consumed within seconds. This TTL only catches the
+  // ones orphaned by a crash between the bridge writing and us reading, and it is
+  // generous on purpose: the bridge's outbox retries indefinitely, so a file may
+  // legitimately wait out a long server outage before its event arrives.
+  const STAGED_MEDIA_TTL_HOURS = 24;
+  const runHousekeeping = async (): Promise<void> => {
     try {
       const media = deleteStalePendingMedia(db, PENDING_MEDIA_TTL_HOURS);
       const inbox = deleteStaleInboxRows(db);
@@ -64,17 +77,18 @@ async function main(): Promise<void> {
             config.sessionMaxAgeDays,
           )
         : 0;
-      if (media > 0 || inbox > 0 || transcripts > 0) {
+      const staged = await sweepStagedMedia(config.bridgeStagingDir, STAGED_MEDIA_TTL_HOURS);
+      if (media > 0 || inbox > 0 || transcripts > 0 || staged > 0) {
         app.log.info(
-          `Housekeeping: removed ${media} stale pending media file(s), ${inbox} settled inbox row(s), ${transcripts} orphaned transcript(s)`,
+          `Housekeeping: removed ${media} stale pending media file(s), ${inbox} settled inbox row(s), ${transcripts} orphaned transcript(s), ${staged} orphaned staged file(s)`,
         );
       }
     } catch (err) {
       app.log.error({ err }, "housekeeping failed");
     }
   };
-  runHousekeeping();
-  const housekeepingTimer = setInterval(runHousekeeping, 60 * 60 * 1000);
+  void runHousekeeping();
+  const housekeepingTimer = setInterval(() => void runHousekeeping(), 60 * 60 * 1000);
   housekeepingTimer.unref();
 
   app.get("/health", async () => ({ status: "ok", time: new Date().toISOString() }));
@@ -155,7 +169,7 @@ async function main(): Promise<void> {
     },
   });
 
-  const deps: WebhookDeps = { config, db, channel, batcher, roleFor };
+  const deps: WebhookDeps = { config, db, channel, batcher, roleFor, extract };
 
   registerWebhook(app, deps);
 

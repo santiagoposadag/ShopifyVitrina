@@ -4,11 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Vitrina: a WhatsApp-native sales & inventory assistant for a real-estate pilot. One npm-workspaces monorepo, three workspaces:
+Vitrina: a WhatsApp-native sales & inventory assistant for a real-estate pilot. One npm-workspaces monorepo, three workspaces plus a Go sidecar:
 
-- `server/` — Fastify + Claude Agent SDK. Receives WhatsApp webhooks (via Kapso), runs agent turns, owns the SQLite schema.
+- `server/` — Fastify + Claude Agent SDK. Receives WhatsApp webhooks, runs agent turns, owns the SQLite schema.
 - `web/` — Next.js 15 storefront (App Router, Tailwind v4). Reads the **same SQLite file** directly, read-only; there is no API between them.
 - `shared/` — **types-only** package (`@vitrina/shared`, a single `.d.ts`). It has no `main` on purpose: a runtime import must fail. Import from it with `import type` only.
+- `bridge/` — Go sidecar (whatsmeow). The alternative WhatsApp transport; **not** an npm workspace. See "WhatsApp providers" below.
 
 ## Commands
 
@@ -20,15 +21,34 @@ npm run build -w server                # tsc --noEmit + emit build to dist/
 npx tsc --noEmit                       # typecheck (run in server/ or web/)
 npm run dev:server / npm run dev:web   # local dev (tsx watch / next dev)
 npm run seed -w server                 # seed catalog from propiedad_1/, propiedad_2/
+
+go test ./...                          # bridge suite (run from bridge/)
+go build ./... && go vet ./...         # bridge typecheck
 ```
 
-Docker: **`docker compose up`/`run` MUST go through `./scripts/with-secrets.sh`** — it injects ANTHROPIC/KAPSO secrets from gopass. A bare `up` recreates the server with blank secrets and it crash-loops. `docker compose build` works bare. Non-secret per-deploy config lives in `.env` (auto-loaded by compose; see `env.sample`; `env.txt` is a gitignored scratch template). `NEXT_PUBLIC_*` are **build args**: changing them requires rebuilding the web image.
+Docker: **`docker compose up`/`run` MUST go through `./scripts/with-secrets.sh`** — it injects ANTHROPIC/KAPSO secrets from gopass. A bare `up` recreates the server with blank secrets and it crash-loops. `docker compose build` works bare. Non-secret per-deploy config lives in `.env` (auto-loaded by compose; see `env.sample`; `env.txt` is a gitignored scratch template). `NEXT_PUBLIC_*` are **build args**: changing them requires rebuilding the web image. The whatsmeow bridge sits behind a compose **profile**, so a plain `up` never starts it: `./scripts/with-secrets.sh docker compose --profile whatsmeow up -d`, with `WHATSAPP_PROVIDER=whatsmeow` set so the server actually routes through it. The bridge is never published and never gets a Coolify domain — anyone who can reach `/send` can send WhatsApp messages as the business.
 
 ## Message pipeline (the core architecture)
 
 One inbound WhatsApp message travels: `inbox/webhook.ts` (HMAC verify over raw body → persist to `inbox` table with UNIQUE dedupe key → fast ACK) → `inbox/batcher.ts` (`InboxBatcher` debounces a phone's burst into ONE agent turn; the window is adaptive — bursts containing photos wait much longer because WhatsApp uploads photo sets in waves) → `inbox/queue.ts` (`PerPhoneQueue` serializes turns per phone; **this serialization is what makes `claimInboxBatch` safe** — batches for one phone must never overlap) → `agent/agent.ts` (`runAgentTurn`) → reply via `whatsapp/kapso.ts`.
 
 Delivery is at-least-once: rows are `pending`/`processing`/`done`/`failed`; unfinished rows are replayed on boot (`replayPending`), and a failed batch retries with backoff up to `MAX_BATCH_ATTEMPTS` total attempts tracked in `inbox.attempts` (incremented at claim time, so the cap survives restarts and stops poison-message boot loops). User-facing failure side effects (apology) fire only on the terminal attempt via the batcher's `onBatchFailure` hook in `index.ts`.
+
+## WhatsApp providers (the channel abstraction)
+
+`WHATSAPP_PROVIDER` picks the transport; exactly one is live at a time, and `index.ts` is the **only** file that names a provider.
+
+- **`kapso`** (default) — Meta's Cloud API behind Kapso's proxy. Official, per-conversation pricing, requires WhatsApp Business onboarding.
+- **`whatsmeow`** — the `bridge/` sidecar, a linked device speaking the WhatsApp Web multidevice protocol. No onboarding, no fees, **no official standing with Meta** — the paired number carries real ban risk, and it is unlinked if the primary phone stays offline past WhatsApp's window (a silent failure: watch the bridge's `/status`).
+
+Two things move together per provider, and they must match or a photo burst fails on the first file:
+
+- **`WhatsAppChannel`** (`whatsapp/channel.ts`) — `sendText` + `downloadMedia(ref)`, plus optional `releaseMedia`. This is the whole surface the pipeline uses. `sendInteractiveButtons` deliberately stays on `KapsoClient`: nothing calls it, and a linked-device client cannot render buttons on consumer WhatsApp.
+- **The extractor** — `extractInbound` (Kapso's envelope) or `extractInboundWhatsmeow` (the bridge's own shape), injected as `WebhookDeps.extract`. The channel abstracts sending and media fetching, **not** the wire format.
+
+A media `ref` is provider-shaped: Kapso yields a short-lived signed URL (validated by host), the bridge a path in the shared staging directory (validated by `isAllowedMediaPath`). Both are attacker-influenced values fed to a dereference — never skip the guard.
+
+The bridge owns an **outbox** (`bridge/outbox.go`), because Kapso's 10/40/90s webhook retries were load-bearing for at-least-once delivery and whatsmeow has no equivalent: it acks to WhatsApp the moment an event is handled, so anything not durable is lost. Delivery is strictly sequential by insertion id — photo order is listing order, and a concurrent dispatcher would silently reorder the owner's listing.
 
 ## Role boundary (owner vs customer)
 
@@ -56,9 +76,13 @@ Tools communicate back to `runAgentTurn` only through the shared mutable `TurnCo
 - **`AGENT_TRANSCRIPTS_DIR` must never get a default.** The Agent SDK stores transcripts at `$HOME/.claude/projects/<cwd-with-slashes-as-dashes>/`, which on a developer's machine is the same directory as *their own* Claude Code history for this repo — a default would make the transcript sweep delete real work. Compose sets it explicitly; unset, the sweep is inert (`data/transcripts.ts`).
 - **`loadDotEnv` anchors at `REPO_ROOT`, not the cwd**, and swallows a missing file. `npm run <script> -w server` runs from `server/`, so a cwd-relative `.env` silently misses and every variable falls back to its default — which for `OWNER_PHONE_NUMBERS` means an empty allowlist and every phone reading as a customer. The purge tool refuses to run on an empty allowlist for exactly this reason.
 - **Attribute keys are a closed list** duplicated in three places that must agree: `shared/index.d.ts` (`ProductAttributes`), the key list in the owner system prompt (`agent/agent.ts`), and the `upsert_product` tool description (`agent/tools.ts`). Adding an attribute means touching all three plus the storefront renderer (`web/app/components/PropertyDetail.tsx`).
+- **A LID is not a phone number.** WhatsApp addresses senders as `<id>@lid`, and those digits look exactly like a phone number to `normalizePhone` — so a LID reaching the server misses `OWNER_PHONE_NUMBERS` and the owner silently reads as a *customer*, while a reply addressed back to it goes to whoever really owns those digits. `bridge/inbound.go` `resolvePhone` tries `Sender`, then `SenderAlt`, then whatsmeow's LID map, and **drops the message** rather than guessing. Its sub-stores are nil until the device is paired, so the LID map must be looked up per call, never captured at construction.
+- **The bridge container runs as uid 1000**, matching the server image's `node` user, because both mount the staging volume: the bridge creates files there and the server unlinks them once read. Unlinking needs write permission on the *directory*, so mismatched uids mean the server reads every photo fine and silently leaks all of them (`releaseMedia` swallows errors by design).
 - Kapso webhooks have a ~10s ACK deadline: never do slow work in the request handler — debouncing/agent work happens on the async worker path only.
 - Agent replies and prompts are Spanish; code, comments, and prompt *instructions* are English.
 
 ## Testing conventions
 
 Vitest in `server/test/`, in-memory SQLite (`openDb(":memory:")`) per test. The batcher suite uses `vi.useFakeTimers()` + `advanceTimersByTimeAsync` and a `harness()` with injectable `onMessage`/`onBatchFailure`. `agent.test.ts` mocks only the SDK's `query` (`vi.hoisted` + `vi.mock`) so the real MCP tool server still builds. Behavior-motivated regression tests are the house style — e.g. the batcher pins the real 37-photo burst timeline that motivated the adaptive window, including a negative test proving the rejected 30s window would have split it.
+
+The bridge has its own Go suite (`go test ./...` from `bridge/`), covering the outbox's ordering and durability and every branch of LID resolution. One fixture spans both languages: the HMAC vector in `bridge/delivery_test.go` and `server/test/whatsmeow-webhook.test.ts` is the same secret, body, and signature, because the bridge signs in Go and the server verifies in Node — nothing else proves the two agree, and a one-sided change would break every inbound message with both suites still green.

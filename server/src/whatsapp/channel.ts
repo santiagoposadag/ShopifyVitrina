@@ -32,4 +32,18 @@ export interface WhatsAppChannel {
    * ACK (see inbox/media-download.ts).
    */
   downloadMedia(ref: string, signal?: AbortSignal): Promise<Buffer>;
+
+  /**
+   * Release whatever the provider is holding for a ref we will NOT download.
+   *
+   * Optional because it only exists for providers that hand over something they
+   * cannot clean up themselves. Kapso has no need for it: an unfetched signed
+   * URL simply expires. The bridge has already written a decrypted file to disk
+   * by the time we see it, and customers' photos are never stored — so without
+   * this, every customer photo would leak onto the volume forever.
+   *
+   * Implementations must not throw: failing to tidy up is a logged warning, not
+   * a reason to lose the message.
+   */
+  releaseMedia?(ref: string): Promise<void>;
 }
