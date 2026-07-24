@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import { runAgentTurn } from "./agent/agent.js";
+import { checkAnthropicKey } from "./agent/preflight.js";
 import { ConsecutiveFailureAlert } from "./inbox/alerts.js";
 import { InboxBatcher } from "./inbox/batcher.js";
 import { isOwner, loadConfig, loadDotEnv } from "./config.js";
@@ -84,6 +85,22 @@ async function main(): Promise<void> {
   housekeepingTimer.unref();
 
   app.get("/health", async () => ({ status: "ok", time: new Date().toISOString() }));
+
+  // Never blocks startup: a credential problem must not stop the server from
+  // accepting and PERSISTING inbound messages. The inbox is durable, so messages
+  // that arrive during an outage are replayed once the key is fixed — refusing to
+  // boot would drop them on the floor instead.
+  void checkAnthropicKey(config.anthropicApiKey).then((result) => {
+    if (result.status === "invalid") {
+      app.log.error(
+        { detail: result.detail },
+        "ANTHROPIC_API_KEY is REJECTED by the API — every agent turn will fail with " +
+          '"Claude Code process exited with code 1". Fix the key and restart.',
+      );
+    } else if (result.status === "unknown") {
+      app.log.warn({ detail: result.detail }, "could not verify ANTHROPIC_API_KEY at boot");
+    }
+  });
 
   registerMediaRoutes(app, config);
 
