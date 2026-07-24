@@ -1,12 +1,11 @@
-import type { InboundMessage } from "./webhook.js";
+import type { InboundMessage } from "../types.js";
 
 /**
  * Parser for the whatsmeow bridge's inbound events.
  *
- * The bridge posts OUR shape rather than an imitation of Kapso's envelope, so
- * this is a flat read with no probing for where the message might be hiding.
- * Both extractors produce InboundMessage, which is the only shape the rest of
- * the pipeline depends on.
+ * The bridge posts a shape we defined together with it, so this is a flat read
+ * with no probing for where the message might be hiding. It produces
+ * InboundMessage, which is the only shape the rest of the pipeline depends on.
  *
  * See bridge/inbound.go (InboundEvent) for the producing side.
  */
@@ -19,10 +18,10 @@ function asString(v: unknown): string {
   return typeof v === "string" ? v : "";
 }
 
-export function extractInboundWhatsmeow(event: Record<string, unknown>): InboundMessage | null {
-  // Guard the provider tag: with one provider live at a time, an event from the
-  // other one reaching this route means something is misconfigured, and parsing
-  // it anyway would produce a plausible-looking message from the wrong shape.
+export function extractInbound(event: Record<string, unknown>): InboundMessage | null {
+  // The bridge stamps every event. Anything without the tag did not come from
+  // it, and parsing an unknown shape anyway would manufacture a
+  // plausible-looking message out of the wrong fields.
   if (event["provider"] !== "whatsmeow") return null;
 
   const from = asString(event["from"]);

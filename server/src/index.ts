@@ -6,8 +6,6 @@ import { isOwner, loadConfig, loadDotEnv } from "./config.js";
 import { openDb } from "./data/db.js";
 import { BridgeChannel, sweepStagedMedia } from "./whatsapp/bridge.js";
 import type { WhatsAppChannel } from "./whatsapp/channel.js";
-import { KapsoClient } from "./whatsapp/kapso.js";
-import { extractInboundWhatsmeow } from "./inbox/whatsmeow.js";
 import { registerMediaRoutes } from "./whatsapp/media.js";
 import { PerPhoneQueue } from "./inbox/queue.js";
 import { RateLimiter } from "./inbox/rate-limit.js";
@@ -18,7 +16,7 @@ import {
   upsertContact,
 } from "./data/repo.js";
 import { sweepOrphanedTranscripts, transcriptsDir } from "./data/transcripts.js";
-import { extractInbound, registerWebhook, type WebhookDeps } from "./inbox/webhook.js";
+import { registerWebhook, type WebhookDeps } from "./inbox/webhook.js";
 import type { TurnContext } from "./types.js";
 
 const RATE_LIMIT_NOTICE =
@@ -34,16 +32,10 @@ async function main(): Promise<void> {
   loadDotEnv();
   const config = loadConfig();
   const db = openDb(config.dbPath);
-  // The composition root is the ONLY place that names a WhatsApp provider.
-  // Everything below takes the WhatsAppChannel interface, so a second provider
-  // is a new implementation wired in here, not an edit to the pipeline.
-  //
-  // The pair moves together on purpose: the channel resolves media refs that only
-  // its own extractor produces, so a mismatched pair would pass typecheck and
-  // then fail on the first photo.
-  const usingBridge = config.whatsappProvider === "whatsmeow";
-  const channel: WhatsAppChannel = usingBridge ? new BridgeChannel(config) : new KapsoClient(config);
-  const extract = usingBridge ? extractInboundWhatsmeow : extractInbound;
+  // The composition root is the only place that names the transport. Everything
+  // below takes the WhatsAppChannel interface, which is what lets the pipeline
+  // be tested without an HTTP client or a paired device anywhere in sight.
+  const channel: WhatsAppChannel = new BridgeChannel(config);
   const queue = new PerPhoneQueue();
   const rateLimiter = new RateLimiter({
     perPhonePerHour: config.rateLimitPerPhonePerHour,
@@ -169,7 +161,7 @@ async function main(): Promise<void> {
     },
   });
 
-  const deps: WebhookDeps = { config, db, channel, batcher, roleFor, extract };
+  const deps: WebhookDeps = { config, db, channel, batcher, roleFor };
 
   registerWebhook(app, deps);
 

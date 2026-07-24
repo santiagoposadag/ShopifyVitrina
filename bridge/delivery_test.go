@@ -10,7 +10,7 @@ import (
 )
 
 // The server verifies this exact signature with the code it already had. These
-// constants are duplicated in server/test/whatsmeow-webhook.test.ts on purpose:
+// constants are duplicated in server/test/webhook.test.ts on purpose:
 // they are the contract between the two languages, and a change on either side
 // that is not mirrored breaks inbound delivery in a way neither suite would
 // otherwise catch.

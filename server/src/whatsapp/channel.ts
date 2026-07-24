@@ -1,15 +1,16 @@
 /**
- * The provider-agnostic seam between the message pipeline and WhatsApp.
+ * The seam between the message pipeline and WhatsApp.
  *
  * Everything downstream of the webhook — batcher, queue, agent — talks to this
- * interface and never to a provider's client, so adding a second channel is a
- * new implementation rather than an edit to the pipeline.
+ * interface and never to an HTTP client. BridgeChannel is the only
+ * implementation, and the interface still earns its place: it is what lets the
+ * whole pipeline be exercised with a plain object, no HTTP and no paired device
+ * anywhere in the tests.
  *
- * The surface is deliberately two methods wide. KapsoClient also carries
- * sendInteractiveButtons, and it stays there rather than moving here: nothing
- * calls it, and interactive buttons are a Cloud API feature that a linked-device
- * client cannot render on consumer WhatsApp. Promoting it would promise every
- * future provider something only one of them can keep.
+ * The surface is deliberately narrow. Interactive buttons and list messages are
+ * absent on purpose rather than unimplemented: they are a Cloud API feature that
+ * a linked-device client cannot render on consumer WhatsApp, so promising them
+ * here would be promising something the transport cannot keep.
  */
 export interface WhatsAppChannel {
   /**
@@ -19,28 +20,26 @@ export interface WhatsAppChannel {
   sendText(to: string, body: string): Promise<void>;
 
   /**
-   * Fetch one inbound media file by the reference this provider's own webhook
-   * produced.
+   * Fetch one inbound media file by the reference its own webhook produced.
    *
-   * The reference is opaque and provider-shaped — hence `ref`, not `url`. Kapso
-   * yields a short-lived signed URL, so its implementation validates the host
-   * before attaching credentials; a provider that decrypts media itself would
-   * hand back a local path and validate nothing.
+   * `ref` rather than `url`: the bridge decrypts media itself and hands over a
+   * path in its staging directory. The name stays neutral because the value is
+   * whatever the transport produced, and only the transport knows how to
+   * resolve it — or how to validate it, which it MUST.
    *
    * `signal` carries the caller's deadline and implementations MUST honour it:
-   * this runs inside the webhook request, where an unbounded fetch costs the
-   * ACK (see inbox/media-download.ts).
+   * this runs inside the webhook request, and the bridge's outbox is strictly
+   * sequential, so a stalled read holds up every message behind it.
    */
   downloadMedia(ref: string, signal?: AbortSignal): Promise<Buffer>;
 
   /**
-   * Release whatever the provider is holding for a ref we will NOT download.
+   * Release whatever the transport is holding for a ref we will NOT download.
    *
-   * Optional because it only exists for providers that hand over something they
-   * cannot clean up themselves. Kapso has no need for it: an unfetched signed
-   * URL simply expires. The bridge has already written a decrypted file to disk
-   * by the time we see it, and customers' photos are never stored — so without
-   * this, every customer photo would leak onto the volume forever.
+   * The bridge has already written a decrypted file to disk by the time we see
+   * it, and customers' photos are never stored — so without this, every customer
+   * photo would leak onto the volume forever. Optional because a transport that
+   * holds nothing on our behalf has nothing to release.
    *
    * Implementations must not throw: failing to tidy up is a logged warning, not
    * a reason to lose the message.

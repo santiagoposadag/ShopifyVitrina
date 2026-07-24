@@ -7,14 +7,11 @@
 # (exports the secrets from gopass); a plain .env still works as fallback.
 x-secrets-env: &secrets-env
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-  KAPSO_API_KEY: ${KAPSO_API_KEY:-}
-  KAPSO_PHONE_NUMBER_ID: ${KAPSO_PHONE_NUMBER_ID:-}
-  KAPSO_WEBHOOK_SECRET: ${KAPSO_WEBHOOK_SECRET:-}
-  # Bridge (whatsmeow) credentials. Only the ACTIVE provider's secrets are
-  # required — server/src/config.ts checks WHATSAPP_PROVIDER and demands one set
-  # or the other, so both are passed through empty-tolerant here.
-  BRIDGE_WEBHOOK_SECRET: ${BRIDGE_WEBHOOK_SECRET:-}
-  BRIDGE_API_TOKEN: ${BRIDGE_API_TOKEN:-}
+  # Shared with the bridge: it signs inbound events with the first and accepts
+  # the second on /send. Both sides must see the SAME values or the channel is
+  # silently one-way, so they are interpolated once here and reused below.
+  BRIDGE_WEBHOOK_SECRET: ${BRIDGE_WEBHOOK_SECRET}
+  BRIDGE_API_TOKEN: ${BRIDGE_API_TOKEN}
   OWNER_PHONE_NUMBERS: ${OWNER_PHONE_NUMBERS:-}
 
 # Absolute paths inside the containers. server/src/config.ts short-circuits on
@@ -31,11 +28,8 @@ services:
       dockerfile: server/Dockerfile
     environment:
       <<: [*secrets-env, *data-env]
-      # kapso (default) or whatsmeow. Switching providers is a redeploy, not a
-      # rewrite: it selects both the outbound client and the inbound parser.
-      WHATSAPP_PROVIDER: ${WHATSAPP_PROVIDER:-kapso}
-      # Only read when the provider is whatsmeow. The bridge is reachable on the
-      # compose network only — it is never published or given a domain.
+      # The bridge is reachable on the compose network only — never published,
+      # never given a domain.
       BRIDGE_URL: http://bridge:3002
       BRIDGE_STAGING_DIR: /data/inbound
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
@@ -114,11 +108,10 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # WhatsApp channel via the whatsmeow linked-device protocol — an alternative to
-  # Kapso that needs no WhatsApp Business onboarding and no per-conversation fee.
-  # Excluded from a plain `docker compose up` by its profile; bring it up with:
-  #   ./scripts/with-secrets.sh docker compose --profile whatsmeow up -d
-  # and set WHATSAPP_PROVIDER=whatsmeow so the server actually routes through it.
+  # The WhatsApp channel: a linked device speaking the whatsmeow (WhatsApp Web
+  # multidevice) protocol. No WhatsApp Business onboarding, no per-conversation
+  # fee — and no official standing with Meta, so the paired number carries real
+  # ban risk and is unlinked if the primary phone stays offline too long.
   #
   # DELIBERATELY NOT PUBLISHED: no `ports:` and, on Coolify, no domain. Anyone who
   # can reach /send can send WhatsApp messages as the business. The only exposure
@@ -141,6 +134,16 @@ services:
       # rendered into the logs.
       BRIDGE_PAIR_PHONE: ${BRIDGE_PAIR_PHONE:-}
       BRIDGE_DEBUG: ${BRIDGE_DEBUG:-}
+    healthcheck:
+      # The binary probes itself: the image is distroless, so there is no shell
+      # and no curl for a HEALTHCHECK to use. Liveness only — /health ignores the
+      # WhatsApp connection on purpose, because a restart cannot fix being
+      # unlinked and failing health on it would crash-loop over the real problem.
+      test: ["CMD", "/bridge", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
     volumes:
       # The pairing and the delivery queue. Losing this volume means re-pairing
       # the number by hand — it is NOT disposable like vitrina-sessions.
@@ -150,7 +153,6 @@ services:
       # zero image bytes over HTTP.
       - vitrina-data:/data
     restart: unless-stopped
-    profiles: ["whatsmeow"]
 
   # Seeds the two example properties. Excluded from `docker compose up` via
   # the "seed" profile — run it explicitly with:

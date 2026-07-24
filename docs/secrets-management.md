@@ -54,18 +54,18 @@ GitHub repo**. No server, no SaaS.
 
 ### Layout
 
-| Secret | gopass path | Provider |
-|--------|-------------|----------|
-| `ANTHROPIC_API_KEY` | `vitrina/anthropic_api_key` | always |
-| `KAPSO_API_KEY` | `vitrina/kapso_api_key` | `kapso` |
-| `KAPSO_PHONE_NUMBER_ID` | `vitrina/kapso_phone_number_id` | `kapso` |
-| `KAPSO_WEBHOOK_SECRET` | `vitrina/kapso_webhook_secret` | `kapso` |
-| `BRIDGE_WEBHOOK_SECRET` | `vitrina/bridge_webhook_secret` | `whatsmeow` |
-| `BRIDGE_API_TOKEN` | `vitrina/bridge_api_token` | `whatsmeow` |
+| Secret | gopass path |
+|--------|-------------|
+| `ANTHROPIC_API_KEY` | `vitrina/anthropic_api_key` |
+| `BRIDGE_WEBHOOK_SECRET` | `vitrina/bridge_webhook_secret` |
+| `BRIDGE_API_TOKEN` | `vitrina/bridge_api_token` |
 
-`WHATSAPP_PROVIDER` selects which set the wrapper fetches, so running one
-provider never requires the other's credentials to exist in the vault. Both
-bridge secrets are ours to invent rather than issued by anyone, so generate them:
+> The `vitrina/kapso_*` entries are obsolete — Kapso was dropped in favour of the
+> whatsmeow bridge. Leave them in the vault or `gopass rm` them; nothing reads
+> them any more.
+
+Both bridge secrets are ours to invent rather than issued by anyone, so generate
+them:
 
 ```sh
 gopass generate -n vitrina/bridge_webhook_secret 48   # signs bridge → server events

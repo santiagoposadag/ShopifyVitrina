@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -92,10 +93,38 @@ func runPairing(ctx context.Context, client *whatsmeow.Client, qrChan <-chan wha
 	log.Infof("pairing channel closed")
 }
 
+// healthcheck probes our own /health and reports it through the exit code.
+//
+// It lives in this binary because the runtime image is distroless: there is no
+// shell, no curl, and nothing else a Docker HEALTHCHECK could run. Without it the
+// container reports "running" even when the HTTP server is dead.
+func healthcheck(addr string) error {
+	// Compose gives an addr like ":3002"; dial it on the loopback interface.
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	res, err := client.Get("http://" + addr + "/health")
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("health returned %d", res.StatusCode)
+	}
+	return nil
+}
+
 func run() error {
 	cfg, err := LoadConfig()
 	if err != nil {
 		return err
+	}
+
+	// Probe mode: no store, no WhatsApp connection, just ask the running process
+	// whether it is serving. Must come after LoadConfig so it uses the same addr.
+	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
+		return healthcheck(cfg.Addr)
 	}
 
 	level := "INFO"

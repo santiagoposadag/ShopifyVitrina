@@ -18,10 +18,10 @@ import (
 
 // InboundEvent is the wire format the bridge POSTs to the server.
 //
-// It is deliberately OUR shape rather than an imitation of Kapso's envelope. The
-// server's WhatsAppChannel abstracts sending and media fetching, not the wire
-// format, so each provider brings its own extractor and both produce the same
-// InboundMessage on the far side.
+// Both ends of this contract live in this repo, so the shape is flat and says
+// exactly what it means — no envelope to unwrap, no probing for where the message
+// might be hiding. server/src/inbox/whatsmeow.ts is the consuming side, and
+// server/test/webhook.test.ts pins the signature that protects it.
 type InboundEvent struct {
 	Provider string `json:"provider"`
 	// ID is the WhatsApp message id. The server dedupes on it, which is what

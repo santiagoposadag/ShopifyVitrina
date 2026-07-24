@@ -16,12 +16,12 @@ type Logger = waLog.Logger
 
 // Outbox is the bridge's durable delivery queue.
 //
-// Kapso gave the server at-least-once delivery for free: it retried our webhook
-// at 10/40/90s, so a message survived the server being mid-restart. whatsmeow
-// has no such thing — it acks to WhatsApp as soon as the event is handled, and
-// an event dropped here is gone for good. It never reaches the inbox table, so
-// replayPending cannot recover it either. This queue is that guarantee, moved
-// into our own process: an event is durable BEFORE it is delivered.
+// whatsmeow acks to WhatsApp as soon as an event is handled, so an event dropped
+// here is gone for good — WhatsApp will not send it again. It never reaches the
+// server's inbox table either, so the boot-time replay cannot recover it. Nothing
+// else in the system provides at-least-once delivery for the hop between this
+// process and the server; this queue is it. An event is durable BEFORE it is
+// delivered, and stays durable until the server confirms.
 //
 // Delivery is strictly sequential in insertion order, and that is a requirement
 // rather than a simplification. Photo order is listing order — the first photo

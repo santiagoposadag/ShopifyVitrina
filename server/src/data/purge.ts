@@ -6,7 +6,8 @@ import { deleteTranscript, sweepOrphanedTranscripts } from "./transcripts.js";
 
 /**
  * Only what the purge actually reads — so the ops tool can run without
- * loadConfig's required secrets (same reasoning as KapsoClient's narrow deps).
+ * loadConfig's required secrets: deleting a session should not depend on a
+ * WhatsApp credential being present.
  * The full Config satisfies this structurally.
  */
 export type PurgeConfig = Pick<Config, "ownerPhoneNumbers" | "sessionMaxAgeDays">;

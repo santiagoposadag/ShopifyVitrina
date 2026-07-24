@@ -37,18 +37,22 @@ with the same care as the private key.
 
 - [ ] Store `gpg-private-key-backup.asc` in Google Drive (file currently only
       in the session scratchpad on the Mac mini — a temp directory).
-- [ ] Insert the four secrets (vault is still EMPTY):
-      `gopass insert vitrina/anthropic_api_key`,
-      `gopass insert vitrina/kapso_api_key`,
-      `gopass insert vitrina/kapso_phone_number_id`,
-      `gopass insert vitrina/kapso_webhook_secret`
+- [x] Insert `gopass insert vitrina/anthropic_api_key`.
+- [ ] Generate the bridge secrets — these are ours to invent, not issued by a
+      provider, so generate rather than insert:
+      `gopass generate -n vitrina/bridge_webhook_secret 48`,
+      `gopass generate -n vitrina/bridge_api_token 48`
 - [ ] `gopass git push` after inserting.
+
+> The `vitrina/kapso_*` entries listed here previously are obsolete — Kapso was
+> dropped in favour of the whatsmeow bridge. Nothing reads them any more.
 - [ ] End-to-end verify: delete/rename `.env`, then
       `./scripts/with-secrets.sh docker compose up -d` and check
       `curl localhost:3001/health` + storefront.
 - [ ] Brain test: with the real `ANTHROPIC_API_KEY` injected, fire a signed
-      simulated WhatsApp webhook at `localhost:3001` and confirm a Claude
-      reply lands in SQLite.
+      simulated bridge event at `localhost:3001/webhook` and confirm a Claude
+      reply lands in SQLite. Sign it with `BRIDGE_WEBHOOK_SECRET` — see the
+      pinned fixture in `server/test/webhook.test.ts` for the exact shape.
 
 ## Onboarding a new machine (e.g. the laptop)
 
