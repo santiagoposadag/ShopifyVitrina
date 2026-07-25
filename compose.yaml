@@ -6,7 +6,12 @@
 # Preferred flow: ./scripts/with-secrets.sh docker compose up -d
 # (exports the secrets from gopass); a plain .env still works as fallback.
 x-secrets-env: &secrets-env
-  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  # Either credential is enough and NEITHER is individually required — a
+  # DeepSeek deployment has no Anthropic key at all. server/src/config.ts
+  # refuses to boot when both are empty, so a blank-secrets `up` still fails
+  # loudly instead of crash-looping on the first customer message.
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-}
   # Shared with the bridge: it signs inbound events with the first and accepts
   # the second on /send. Both sides must see the SAME values or the channel is
   # silently one-way, so they are interpolated once here and reused below.
@@ -37,6 +42,18 @@ services:
       # Used to build the owner's private draft-preview links.
       STOREFRONT_BASE_URL: ${STOREFRONT_BASE_URL:-http://localhost:3000}
       PORT: "3001"
+      # Provider routing. Empty values fall back to the defaults in
+      # server/src/config.ts (Anthropic's endpoint, claude-haiku-4-5). Set them
+      # by sourcing a profile: ./scripts/with-secrets.sh --profile deepseek ...
+      # See docs/provider-swap.md.
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      MODEL: ${MODEL:-}
+      SMALL_FAST_MODEL: ${SMALL_FAST_MODEL:-}
+      MAX_THINKING_TOKENS: ${MAX_THINKING_TOKENS:-}
+      # JSON merged into every request body — the only knob that reaches
+      # DeepSeek's reasoning effort. Validated at boot, so a malformed value
+      # fails the container instead of silently doing nothing.
+      AGENT_EXTRA_BODY: ${AGENT_EXTRA_BODY:-}
       # Cost/abuse protection and session lifetime. Empty values fall back to
       # the defaults in server/src/config.ts (20/hour, 500/day, 7 days).
       RATE_LIMIT_PER_PHONE_PER_HOUR: ${RATE_LIMIT_PER_PHONE_PER_HOUR:-}

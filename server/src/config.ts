@@ -16,7 +16,22 @@ export function resolveDataPath(p: string): string {
  * Fails fast with a clear message when a required variable is missing.
  */
 export interface Config {
+  /**
+   * Anthropic-style API key (`x-api-key`). Empty when the deployment
+   * authenticates with agentAuthToken instead — see loadConfig's credential rule.
+   */
   anthropicApiKey: string;
+  /**
+   * Bearer token (`Authorization: Bearer`). DeepSeek's Claude Code guide
+   * prescribes this form; its endpoint accepts either.
+   */
+  agentAuthToken: string;
+  /**
+   * Where the Agent SDK sends /v1/messages. Anthropic by default; point it at
+   * an Anthropic-compatible endpoint (e.g. https://api.deepseek.com/anthropic)
+   * to serve every turn from another provider without a code change.
+   */
+  agentBaseUrl: string;
   /** HMAC secret the bridge signs inbound events with (bridge/delivery.go). */
   webhookSecret: string;
   /** Internal URL of the bridge sidecar, e.g. http://bridge:3002 */
@@ -34,7 +49,32 @@ export interface Config {
   mediaDir: string;
   publicBaseUrl: string;
   port: number;
+  /** Model for the agent turn itself. */
   model: string;
+  /**
+   * Model for the SDK's own utility calls — compaction, summarisation,
+   * subagents. Historically a Haiku-tier model, and invisible in our code: the
+   * bundled CLI picks it up from the environment, so an unset value keeps that
+   * path asking for `claude-haiku-4-5` even when `model` points elsewhere.
+   *
+   * Deliberately a SEPARATE value from `model` rather than one shared literal,
+   * so the two tiers can be split again without touching code.
+   */
+  smallFastModel: string;
+  /**
+   * JSON merged into every request body by the bundled CLI
+   * (CLAUDE_CODE_EXTRA_BODY). The escape hatch for provider-specific fields the
+   * SDK has no option for — notably DeepSeek's `output_config.effort`, which is
+   * its ONLY thinking knob: it ignores `thinking.budget_tokens` outright.
+   * Empty object means "send nothing extra".
+   */
+  agentExtraBody: Record<string, unknown>;
+  /**
+   * Extended-thinking budget (MAX_THINKING_TOKENS). Any value > 0 turns
+   * thinking on. Portable and honoured by Anthropic; DeepSeek ignores the
+   * number, so steer effort there with agentExtraBody. 0 = leave unset.
+   */
+  maxThinkingTokens: number;
   /** Agent sessions idle longer than this many days start fresh. */
   sessionMaxAgeDays: number;
   /** Max agent turns per customer phone per sliding hour (owners exempt). */
@@ -80,6 +120,40 @@ function optionalInt(name: string, fallback: number): number {
   return value;
 }
 
+/** Like optionalInt, but 0 is legal and means "leave this knob unset". */
+function optionalCountOrZero(name: string, fallback: number): number {
+  const raw = optional(name, String(fallback));
+  const value = Number.parseInt(raw, 10);
+  if (Number.isNaN(value) || value < 0) {
+    throw new Error(`Invalid value for ${name}: expected a non-negative integer, got "${raw}"`);
+  }
+  return value;
+}
+
+/**
+ * Parse a JSON object from the environment. Exported for tests.
+ *
+ * Validated HERE rather than left to the consumer because the bundled CLI only
+ * logs an error and carries on when CLAUDE_CODE_EXTRA_BODY will not parse — a
+ * typo would silently disable the knob for the life of the deploy instead of
+ * failing the boot.
+ */
+export function optionalJsonObject(name: string, fallback: Record<string, unknown>) {
+  const raw = optional(name, "");
+  if (raw === "") return fallback;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(`Invalid value for ${name}: expected a JSON object (${detail})`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`Invalid value for ${name}: expected a JSON object, got "${raw}"`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
 /** Exported for tests. Accepts true/false/1/0 (case-insensitive); empty → fallback. */
 export function optionalBool(name: string, fallback: boolean): boolean {
   const raw = optional(name, String(fallback)).toLowerCase();
@@ -110,8 +184,26 @@ export function loadOwnerPhoneNumbers(): Set<string> {
 export function loadConfig(): Config {
   const ownerPhoneNumbers = loadOwnerPhoneNumbers();
 
+  // Either credential is enough, and NEITHER is individually required: a
+  // DeepSeek deployment has no Anthropic key at all, so demanding
+  // ANTHROPIC_API_KEY would make the provider swap impossible to actually
+  // deploy. Requiring at least one keeps the old fail-fast guarantee — a
+  // credential-less boot still dies here rather than on the first customer
+  // message, which is the whole reason the check exists.
+  const anthropicApiKey = optional("ANTHROPIC_API_KEY", "");
+  const agentAuthToken = optional("ANTHROPIC_AUTH_TOKEN", "");
+  if (anthropicApiKey === "" && agentAuthToken === "") {
+    throw new Error(
+      "Missing agent credential: set ANTHROPIC_API_KEY (x-api-key) or ANTHROPIC_AUTH_TOKEN (Bearer)",
+    );
+  }
+
+  const model = optional("MODEL", "claude-haiku-4-5");
+
   return {
-    anthropicApiKey: required("ANTHROPIC_API_KEY"),
+    anthropicApiKey,
+    agentAuthToken,
+    agentBaseUrl: optional("ANTHROPIC_BASE_URL", "https://api.anthropic.com").replace(/\/+$/, ""),
     webhookSecret: required("BRIDGE_WEBHOOK_SECRET"),
     bridgeUrl: required("BRIDGE_URL").replace(/\/+$/, ""),
     bridgeApiToken: required("BRIDGE_API_TOKEN"),
@@ -121,7 +213,12 @@ export function loadConfig(): Config {
     mediaDir: resolveDataPath(optional("MEDIA_DIR", "./data/media")),
     publicBaseUrl: optional("PUBLIC_BASE_URL", "http://localhost:3001").replace(/\/+$/, ""),
     port: Number.parseInt(optional("PORT", "3001"), 10),
-    model: optional("MODEL", "claude-haiku-4-5"),
+    model,
+    // Defaults to `model` so a single-model deployment needs one variable, and
+    // so today's behaviour is unchanged when neither is set.
+    smallFastModel: optional("SMALL_FAST_MODEL", model),
+    agentExtraBody: optionalJsonObject("AGENT_EXTRA_BODY", {}),
+    maxThinkingTokens: optionalCountOrZero("MAX_THINKING_TOKENS", 0),
     sessionMaxAgeDays: optionalInt("SESSION_MAX_AGE_DAYS", 7),
     rateLimitPerPhonePerHour: optionalInt("RATE_LIMIT_PER_PHONE_PER_HOUR", 20),
     rateLimitGlobalPerDay: optionalInt("RATE_LIMIT_GLOBAL_PER_DAY", 500),

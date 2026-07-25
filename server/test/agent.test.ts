@@ -20,6 +20,8 @@ const CTX: TurnContext = { phone: PHONE, role: "customer" };
 
 const CONFIG: Config = {
   anthropicApiKey: "sk-test",
+  agentAuthToken: "",
+  agentBaseUrl: "https://api.anthropic.com",
   webhookSecret: "whsec",
   bridgeUrl: "http://bridge:3002",
   bridgeApiToken: "bridge-token",
@@ -30,6 +32,9 @@ const CONFIG: Config = {
   publicBaseUrl: "http://localhost:3001",
   port: 3001,
   model: "claude-haiku-4-5",
+  smallFastModel: "claude-haiku-4-5",
+  agentExtraBody: {},
+  maxThinkingTokens: 0,
   sessionMaxAgeDays: 7,
   rateLimitPerPhonePerHour: 20,
   rateLimitGlobalPerDay: 500,
@@ -99,6 +104,7 @@ describe("runAgentTurn session fallback", () => {
         warn: () => {
           warnings += 1;
         },
+        info: () => undefined,
       } as never,
       channel: fakeChannel(sent),
     };
@@ -263,7 +269,7 @@ describe("runAgentTurn session reset after publish", () => {
     deps = {
       db,
       config: CONFIG,
-      log: { warn: () => undefined } as never,
+      log: { warn: () => undefined, info: () => undefined } as never,
       channel: fakeChannel(sent),
     };
   });

@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 import { runAgentTurn } from "./agent/agent.js";
-import { checkAnthropicKey } from "./agent/preflight.js";
+import { checkAgentCredential } from "./agent/preflight.js";
 import { ConsecutiveFailureAlert } from "./inbox/alerts.js";
 import { InboxBatcher } from "./inbox/batcher.js";
 import { isOwner, loadConfig, loadDotEnv } from "./config.js";
@@ -90,15 +90,19 @@ async function main(): Promise<void> {
   // accepting and PERSISTING inbound messages. The inbox is durable, so messages
   // that arrive during an outage are replayed once the key is fixed — refusing to
   // boot would drop them on the floor instead.
-  void checkAnthropicKey(config.anthropicApiKey).then((result) => {
+  const credentialName = config.agentAuthToken ? "ANTHROPIC_AUTH_TOKEN" : "ANTHROPIC_API_KEY";
+  void checkAgentCredential(config).then((result) => {
     if (result.status === "invalid") {
       app.log.error(
-        { detail: result.detail },
-        "ANTHROPIC_API_KEY is REJECTED by the API — every agent turn will fail with " +
-          '"Claude Code process exited with code 1". Fix the key and restart.',
+        { detail: result.detail, endpoint: config.agentBaseUrl },
+        `${credentialName} is REJECTED by the API — every agent turn will fail with ` +
+          '"Claude Code process exited with code 1". Fix the credential and restart.',
       );
     } else if (result.status === "unknown") {
-      app.log.warn({ detail: result.detail }, "could not verify ANTHROPIC_API_KEY at boot");
+      app.log.warn(
+        { detail: result.detail, endpoint: config.agentBaseUrl },
+        `could not verify ${credentialName} at boot`,
+      );
     }
   });
 
