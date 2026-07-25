@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../src/config.js";
 import { openDb, type DB } from "../src/data/db.js";
-import type { KapsoClient } from "../src/whatsapp/kapso.js";
+import type { WhatsAppChannel } from "../src/whatsapp/channel.js";
 import { getSessionId, setSessionId } from "../src/data/repo.js";
 import type { TurnContext } from "../src/types.js";
 
@@ -20,15 +20,21 @@ const CTX: TurnContext = { phone: PHONE, role: "customer" };
 
 const CONFIG: Config = {
   anthropicApiKey: "sk-test",
-  kapsoApiKey: "kapso-test",
-  kapsoPhoneNumberId: "123",
-  kapsoWebhookSecret: "whsec",
+  agentAuthToken: "",
+  agentBaseUrl: "https://api.anthropic.com",
+  webhookSecret: "whsec",
+  bridgeUrl: "http://bridge:3002",
+  bridgeApiToken: "bridge-token",
+  bridgeStagingDir: "/tmp/inbound",
   ownerPhoneNumbers: new Set<string>(),
   dbPath: ":memory:",
   mediaDir: "/tmp/media",
   publicBaseUrl: "http://localhost:3001",
   port: 3001,
   model: "claude-haiku-4-5",
+  smallFastModel: "claude-haiku-4-5",
+  agentExtraBody: {},
+  maxThinkingTokens: 0,
   sessionMaxAgeDays: 7,
   rateLimitPerPhonePerHour: 20,
   rateLimitGlobalPerDay: 500,
@@ -39,6 +45,25 @@ const CONFIG: Config = {
   storefrontBaseUrl: "http://localhost:3000",
   customerAgentEnabled: true,
 };
+
+/**
+ * A WhatsApp channel that records what was sent. Typed as the interface with no
+ * cast — the point of WhatsAppChannel is that a turn needs nothing provider-
+ * specific, so if this ever needs `as unknown as`, the seam has leaked.
+ *
+ * downloadMedia throws on purpose: fetching inbound media is the webhook's job,
+ * inside its ACK budget. A turn reaching for it is a bug, and this surfaces it.
+ */
+function fakeChannel(sent: string[]): WhatsAppChannel {
+  return {
+    sendText: async (_phone, text) => {
+      sent.push(text);
+    },
+    downloadMedia: () => {
+      throw new Error("an agent turn must not download media");
+    },
+  };
+}
 
 /** A successful SDK stream: an assistant block plus the final result message. */
 async function* successStream(sessionId: string, reply: string): AsyncGenerator<unknown> {
@@ -79,12 +104,9 @@ describe("runAgentTurn session fallback", () => {
         warn: () => {
           warnings += 1;
         },
+        info: () => undefined,
       } as never,
-      kapso: {
-        sendText: async (_phone: string, text: string) => {
-          sent.push(text);
-        },
-      } as unknown as KapsoClient,
+      channel: fakeChannel(sent),
     };
   });
 
@@ -247,12 +269,8 @@ describe("runAgentTurn session reset after publish", () => {
     deps = {
       db,
       config: CONFIG,
-      log: { warn: () => undefined } as never,
-      kapso: {
-        sendText: async (_phone: string, text: string) => {
-          sent.push(text);
-        },
-      } as unknown as KapsoClient,
+      log: { warn: () => undefined, info: () => undefined } as never,
+      channel: fakeChannel(sent),
     };
   });
 

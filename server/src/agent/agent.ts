@@ -2,7 +2,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { FastifyBaseLogger } from "fastify";
 import type { Config } from "../config.js";
 import type { DB } from "../data/db.js";
-import type { KapsoClient } from "../whatsapp/kapso.js";
+import type { WhatsAppChannel } from "../whatsapp/channel.js";
 import { clearSessionId, getSessionId, setSessionId } from "../data/repo.js";
 import { buildToolServer, MCP_SERVER_NAME } from "./tools.js";
 import type { Role, TurnContext } from "../types.js";
@@ -93,31 +93,155 @@ Be warm, concise, and helpful.`;
 
 export interface AgentDeps {
   db: DB;
-  kapso: KapsoClient;
+  channel: WhatsAppChannel;
   config: Config;
-  /** Only the level this module uses — a session fallback is worth seeing. */
-  log: Pick<FastifyBaseLogger, "warn">;
+  /** Only the levels this module uses: a session fallback, and per-turn usage. */
+  log: Pick<FastifyBaseLogger, "warn" | "info">;
+}
+
+/**
+ * The environment the Agent SDK's subprocess runs with.
+ *
+ * The SDK spawns the bundled Claude Code CLI, which reads its endpoint,
+ * credential and model tiers from environment variables — so swapping providers
+ * needs no abstraction layer, only the right variables. We pass them explicitly
+ * instead of relying on the ambient process environment for two reasons: config
+ * stays the single source of truth (a stray shell variable cannot outvote it),
+ * and the mapping becomes a pure function a test can assert on directly.
+ *
+ * The `...process.env` spread is NOT optional. The SDK's `env` option REPLACES
+ * the environment rather than merging into it, so omitting the spread strips
+ * PATH and the subprocess never starts.
+ *
+ * Exported for tests.
+ */
+export function buildAgentEnv(config: Config): Record<string, string | undefined> {
+  // Both keys are always written, one of them to undefined, because the
+  // process.env spread below would otherwise leave a leftover credential from
+  // the shell sitting next to the configured one — and the CLI would pick
+  // whichever it resolves first. A coin-flip between providers is not a
+  // deployment. `delete` rather than `undefined`: unset must mean unset.
+  const credential = config.agentAuthToken
+    ? { ANTHROPIC_AUTH_TOKEN: config.agentAuthToken, ANTHROPIC_API_KEY: undefined }
+    : { ANTHROPIC_API_KEY: config.anthropicApiKey, ANTHROPIC_AUTH_TOKEN: undefined };
+
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    ANTHROPIC_BASE_URL: config.agentBaseUrl,
+    ...credential,
+    ANTHROPIC_MODEL: config.model,
+    // All three, deliberately. The CLI resolves the utility tier through
+    // different code paths depending on the call, and an unset one keeps asking
+    // for the compiled-in Haiku default — which an Anthropic-compatible endpoint
+    // may serve with a silent substitution rather than an error, hiding the
+    // mistake behind a working reply from a model we did not choose.
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: config.smallFastModel,
+    ANTHROPIC_SMALL_FAST_MODEL: config.smallFastModel,
+    CLAUDE_CODE_SUBAGENT_MODEL: config.smallFastModel,
+    ...(config.maxThinkingTokens > 0
+      ? { MAX_THINKING_TOKENS: String(config.maxThinkingTokens) }
+      : {}),
+    ...(Object.keys(config.agentExtraBody).length > 0
+      ? { CLAUDE_CODE_EXTRA_BODY: JSON.stringify(config.agentExtraBody) }
+      : {}),
+  };
+
+  for (const [name, value] of Object.entries(env)) {
+    if (value === undefined) delete env[name];
+  }
+  return env;
 }
 
 interface AssistantBlock {
   type?: string;
   text?: string;
 }
+/** The SDK's per-model usage record, in the fields we actually report on. */
+interface ModelUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+}
+
 interface StreamMessage {
   type?: string;
   subtype?: string;
   session_id?: string;
   result?: string;
   message?: { content?: AssistantBlock[] };
+  /** Keyed by the model that actually answered — see TurnStats.servedModel. */
+  modelUsage?: Record<string, ModelUsage>;
+  total_cost_usd?: number;
+  duration_ms?: number;
+  duration_api_ms?: number;
+  num_turns?: number;
 }
 
 function isRecord(v: unknown): v is StreamMessage {
   return typeof v === "object" && v !== null;
 }
 
+/**
+ * What one turn cost and who served it. Collected from the SDK's terminal
+ * `result` message, which carries the only trustworthy record of what actually
+ * happened — the request we sent is not evidence, because an
+ * Anthropic-compatible endpoint may ignore or substitute what it will not honour
+ * and still answer 200.
+ */
+export interface TurnStats {
+  /**
+   * The model that answered, read from the keys of `modelUsage`. Asserted
+   * against the configured model rather than assumed: DeepSeek resolves an
+   * unrecognised model id to its own default SILENTLY, so a typo produces a
+   * perfectly good reply from the wrong model.
+   */
+  servedModel?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  /**
+   * The SDK's own cost estimate, from a compiled-in ANTHROPIC price table. It
+   * is wrong for any other provider — hence the name. Real per-provider cost is
+   * computed in the comparison harness from token counts.
+   */
+  estimatedCostUsdAnthropicTable?: number;
+  durationMs?: number;
+  durationApiMs?: number;
+  numTurns?: number;
+}
+
 interface TurnResult {
   reply: string;
   sessionId?: string;
+  stats: TurnStats;
+}
+
+/** Pull the usage record out of a terminal `result` message. */
+function readStats(raw: StreamMessage): TurnStats {
+  // One entry in practice; if a turn ever spans models, the joined key makes
+  // that visible instead of quietly reporting whichever came first.
+  const servedModel = raw.modelUsage ? Object.keys(raw.modelUsage).join(",") : undefined;
+  const usage = Object.values(raw.modelUsage ?? {}).reduce<ModelUsage>(
+    (acc, u) => ({
+      inputTokens: (acc.inputTokens ?? 0) + (u.inputTokens ?? 0),
+      outputTokens: (acc.outputTokens ?? 0) + (u.outputTokens ?? 0),
+      cacheReadInputTokens: (acc.cacheReadInputTokens ?? 0) + (u.cacheReadInputTokens ?? 0),
+      cacheCreationInputTokens:
+        (acc.cacheCreationInputTokens ?? 0) + (u.cacheCreationInputTokens ?? 0),
+    }),
+    {},
+  );
+
+  return {
+    servedModel: servedModel || undefined,
+    ...usage,
+    estimatedCostUsdAnthropicTable: raw.total_cost_usd,
+    durationMs: raw.duration_ms,
+    durationApiMs: raw.duration_api_ms,
+    numTurns: raw.num_turns,
+  };
 }
 
 /**
@@ -136,12 +260,15 @@ async function runQuery(
 
   let capturedSessionId: string | undefined;
   let resultText = "";
+  let stats: TurnStats = {};
   const assistantText: string[] = [];
 
   const response = query({
     prompt: incomingText,
     options: {
       model: config.model,
+      env: buildAgentEnv(config),
+      ...(config.maxThinkingTokens > 0 ? { maxThinkingTokens: config.maxThinkingTokens } : {}),
       systemPrompt: systemPrompt(ctx.role),
       mcpServers: { [MCP_SERVER_NAME]: server },
       allowedTools: toolNames,
@@ -165,12 +292,67 @@ async function runQuery(
         if (block.type === "text" && typeof block.text === "string") assistantText.push(block.text);
       }
     }
-    if (raw.type === "result" && raw.subtype === "success" && typeof raw.result === "string") {
-      resultText = raw.result;
+    if (raw.type === "result") {
+      // Read on EVERY result subtype, not just success: a turn that hit the
+      // turn cap or errored mid-execution still burned tokens and still tells
+      // us which endpoint served it.
+      stats = readStats(raw);
+      if (raw.subtype === "success" && typeof raw.result === "string") {
+        resultText = raw.result;
+      }
     }
   }
 
-  return { reply: (resultText || assistantText.join("\n")).trim(), sessionId: capturedSessionId };
+  return {
+    reply: (resultText || assistantText.join("\n")).trim(),
+    sessionId: capturedSessionId,
+    stats,
+  };
+}
+
+/** Host of the configured endpoint, for logs. Never the credential. */
+function endpointHost(baseUrl: string): string {
+  try {
+    return new URL(baseUrl).host;
+  } catch {
+    return baseUrl;
+  }
+}
+
+/**
+ * One structured line per turn: which endpoint and model served it, what it
+ * cost in tokens, how long it took, and whether thinking was on.
+ *
+ * `utcHour` is recorded because DeepSeek is reported to be moving to peak /
+ * off-peak pricing on UTC windows. That schedule is NOT on their official rate
+ * card and we could not confirm it, so this deliberately captures the data to
+ * correlate spend against later — and builds no scheduling on an unconfirmed
+ * claim.
+ */
+function logTurn(
+  log: Pick<FastifyBaseLogger, "info">,
+  config: Config,
+  ctx: TurnContext,
+  stats: TurnStats,
+  startedAt: Date,
+): void {
+  log.info(
+    {
+      phone: ctx.phone,
+      role: ctx.role,
+      endpointHost: endpointHost(config.agentBaseUrl),
+      configuredModel: config.model,
+      smallFastModel: config.smallFastModel,
+      // Compare these two: a mismatch means the endpoint substituted a model.
+      servedModel: stats.servedModel,
+      maxThinkingTokens: config.maxThinkingTokens,
+      extraBody: config.agentExtraBody,
+      startedAt: startedAt.toISOString(),
+      utcHour: startedAt.getUTCHours(),
+      ...stats,
+    },
+    "agent turn complete",
+  );
 }
 
 /**
@@ -196,8 +378,9 @@ export async function runAgentTurn(
   ctx: TurnContext,
   incomingText: string,
 ): Promise<string> {
-  const { db, kapso, config, log } = deps;
+  const { db, channel, config, log } = deps;
   const resumeId = getSessionId(db, ctx.phone, config.sessionMaxAgeDays);
+  const startedAt = new Date();
 
   let result: TurnResult;
   try {
@@ -214,6 +397,8 @@ export async function runAgentTurn(
     result = await runQuery(deps, ctx, incomingText, undefined);
   }
 
+  logTurn(log, config, ctx, result.stats, startedAt);
+
   // A publish ends the unit of work: drop the session instead of persisting
   // the new id, so the next owner message starts clean — history stays lean
   // and one product's details cannot bleed into the next one. The flag is not
@@ -225,7 +410,7 @@ export async function runAgentTurn(
     setSessionId(db, ctx.phone, result.sessionId);
   }
   if (result.reply.length > 0) {
-    await kapso.sendText(ctx.phone, result.reply);
+    await channel.sendText(ctx.phone, result.reply);
   }
   return result.reply;
 }

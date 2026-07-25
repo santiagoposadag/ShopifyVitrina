@@ -5,6 +5,7 @@ import {
   InboxBatcher,
   MAX_BATCH_ATTEMPTS,
   RETRY_DELAY_MS,
+  type BatchRow,
   type InboxBatcherDeps,
   type MessageKind,
 } from "../src/inbox/batcher.js";
@@ -61,36 +62,84 @@ function receive(h: Harness, phone: string, text: string, kind: MessageKind = "t
     dedupe_key: `msg:${phone}:${Math.random()}`,
     phone,
     agent_text: text,
+    kind,
   });
   if (!row) throw new Error("insert failed");
   h.batcher.schedule(phone, kind);
   return row.id;
 }
 
+/** A text message, as the webhook persists it. */
+const txt = (agent_text: string): BatchRow => ({ agent_text, kind: "text" });
+/** A photo, with an optional caption — the webhook stores the caption as the text. */
+const pic = (agent_text = ""): BatchRow => ({ agent_text, kind: "media" });
+
 describe("buildBatchText", () => {
   it("joins a burst of text messages in arrival order", () => {
-    expect(buildBatchText(["Hola", "busco apartamento", "en Belén"])).toBe(
+    expect(buildBatchText([txt("Hola"), txt("busco apartamento"), txt("en Belén")])).toBe(
       "Hola\nbusco apartamento\nen Belén",
     );
   });
 
-  it("collapses repeated photo placeholders into one line with the count", () => {
-    const texts = Array.from({ length: 10 }, () => PHOTO);
-    expect(buildBatchText(texts)).toBe("(El usuario envió 10 fotos)");
+  it("collapses a run of photos into one line with the count", () => {
+    expect(buildBatchText(Array.from({ length: 10 }, () => pic()))).toBe(
+      "(El usuario envió 10 fotos)",
+    );
   });
 
   it("keeps the singular wording for exactly one photo", () => {
-    expect(buildBatchText([PHOTO])).toBe(PHOTO);
+    expect(buildBatchText([pic()])).toBe(PHOTO);
   });
 
   it("reports photo groups separately when text interrupts them", () => {
-    expect(buildBatchText([PHOTO, PHOTO, "Es el 1912", PHOTO])).toBe(
+    expect(buildBatchText([pic(), pic(), txt("Es el 1912"), pic()])).toBe(
       "(El usuario envió 2 fotos)\nEs el 1912\n(El usuario envió una foto)",
     );
   });
 
   it("drops rows with no agent-worthy text", () => {
-    expect(buildBatchText(["", "   ", "Hola"])).toBe("Hola");
+    expect(buildBatchText([txt(""), txt("   "), txt("Hola")])).toBe("Hola");
+  });
+
+  // A photo's caption is stored AS its agent_text, so counting photos by
+  // matching the placeholder string missed every captioned one: the agent was
+  // told nothing had arrived and never called attach_pending_photos, while the
+  // files sat in pending_media. The kind comes from the parsed event, not the text.
+  it("counts a captioned photo as a photo and keeps its caption", () => {
+    expect(buildBatchText([pic("Vestier alcoba principal")])).toBe(
+      "(El usuario envió una foto)\nVestier alcoba principal",
+    );
+  });
+
+  it("counts photos whether or not they carry a caption", () => {
+    expect(buildBatchText([pic("Zona de ropas"), pic(), pic("Baño alcoba principal")])).toBe(
+      "(El usuario envió 3 fotos)\nZona de ropas\nBaño alcoba principal",
+    );
+  });
+
+  // The real burst that motivated this: every photo carried a caption, so the
+  // old placeholder match counted zero and the whole listing read as plain chat.
+  it("reports a fully captioned listing burst as photos, not as chat", () => {
+    const rows = [
+      pic("Salón comedor + balcón grande"),
+      pic("Barra cocina con campana extractora"),
+      pic("Alcoba 1: principal con baño y vestier"),
+      txt("Está en \n630.000.000\nNegociables"),
+    ];
+    expect(buildBatchText(rows)).toBe(
+      "(El usuario envió 3 fotos)\n" +
+        "Salón comedor + balcón grande\n" +
+        "Barra cocina con campana extractora\n" +
+        "Alcoba 1: principal con baño y vestier\n" +
+        "Está en \n630.000.000\nNegociables",
+    );
+  });
+
+  // Legacy rows written before `kind` existed carry the placeholder as their
+  // text and default to kind 'text'. They must still read as a photo, not as
+  // someone literally typing that sentence.
+  it("still recognises a legacy placeholder row stored as text", () => {
+    expect(buildBatchText([txt(PHOTO), txt(PHOTO)])).toBe("(El usuario envió 2 fotos)");
   });
 });
 

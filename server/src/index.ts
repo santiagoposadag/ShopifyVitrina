@@ -1,10 +1,12 @@
 import Fastify from "fastify";
 import { runAgentTurn } from "./agent/agent.js";
+import { checkAgentCredential } from "./agent/preflight.js";
 import { ConsecutiveFailureAlert } from "./inbox/alerts.js";
 import { InboxBatcher } from "./inbox/batcher.js";
 import { isOwner, loadConfig, loadDotEnv } from "./config.js";
 import { openDb } from "./data/db.js";
-import { KapsoClient } from "./whatsapp/kapso.js";
+import { BridgeChannel, sweepStagedMedia } from "./whatsapp/bridge.js";
+import type { WhatsAppChannel } from "./whatsapp/channel.js";
 import { registerMediaRoutes } from "./whatsapp/media.js";
 import { PerPhoneQueue } from "./inbox/queue.js";
 import { RateLimiter } from "./inbox/rate-limit.js";
@@ -31,7 +33,10 @@ async function main(): Promise<void> {
   loadDotEnv();
   const config = loadConfig();
   const db = openDb(config.dbPath);
-  const kapso = new KapsoClient(config);
+  // The composition root is the only place that names the transport. Everything
+  // below takes the WhatsAppChannel interface, which is what lets the pipeline
+  // be tested without an HTTP client or a paired device anywhere in sight.
+  const channel: WhatsAppChannel = new BridgeChannel(config);
   const queue = new PerPhoneQueue();
   const rateLimiter = new RateLimiter({
     perPhonePerHour: config.rateLimitPerPhonePerHour,
@@ -48,7 +53,12 @@ async function main(): Promise<void> {
   // drops the SQLite row, and nothing else ever deletes what it pointed at.
   // Inert unless AGENT_TRANSCRIPTS_DIR is set (see data/transcripts.ts).
   const PENDING_MEDIA_TTL_HOURS = 48;
-  const runHousekeeping = (): void => {
+  // Staged files are normally consumed within seconds. This TTL only catches the
+  // ones orphaned by a crash between the bridge writing and us reading, and it is
+  // generous on purpose: the bridge's outbox retries indefinitely, so a file may
+  // legitimately wait out a long server outage before its event arrives.
+  const STAGED_MEDIA_TTL_HOURS = 24;
+  const runHousekeeping = async (): Promise<void> => {
     try {
       const media = deleteStalePendingMedia(db, PENDING_MEDIA_TTL_HOURS);
       const inbox = deleteStaleInboxRows(db);
@@ -60,27 +70,48 @@ async function main(): Promise<void> {
             config.sessionMaxAgeDays,
           )
         : 0;
-      if (media > 0 || inbox > 0 || transcripts > 0) {
+      const staged = await sweepStagedMedia(config.bridgeStagingDir, STAGED_MEDIA_TTL_HOURS);
+      if (media > 0 || inbox > 0 || transcripts > 0 || staged > 0) {
         app.log.info(
-          `Housekeeping: removed ${media} stale pending media file(s), ${inbox} settled inbox row(s), ${transcripts} orphaned transcript(s)`,
+          `Housekeeping: removed ${media} stale pending media file(s), ${inbox} settled inbox row(s), ${transcripts} orphaned transcript(s), ${staged} orphaned staged file(s)`,
         );
       }
     } catch (err) {
       app.log.error({ err }, "housekeeping failed");
     }
   };
-  runHousekeeping();
-  const housekeepingTimer = setInterval(runHousekeeping, 60 * 60 * 1000);
+  void runHousekeeping();
+  const housekeepingTimer = setInterval(() => void runHousekeeping(), 60 * 60 * 1000);
   housekeepingTimer.unref();
 
   app.get("/health", async () => ({ status: "ok", time: new Date().toISOString() }));
+
+  // Never blocks startup: a credential problem must not stop the server from
+  // accepting and PERSISTING inbound messages. The inbox is durable, so messages
+  // that arrive during an outage are replayed once the key is fixed — refusing to
+  // boot would drop them on the floor instead.
+  const credentialName = config.agentAuthToken ? "ANTHROPIC_AUTH_TOKEN" : "ANTHROPIC_API_KEY";
+  void checkAgentCredential(config).then((result) => {
+    if (result.status === "invalid") {
+      app.log.error(
+        { detail: result.detail, endpoint: config.agentBaseUrl },
+        `${credentialName} is REJECTED by the API — every agent turn will fail with ` +
+          '"Claude Code process exited with code 1". Fix the credential and restart.',
+      );
+    } else if (result.status === "unknown") {
+      app.log.warn(
+        { detail: result.detail, endpoint: config.agentBaseUrl },
+        `could not verify ${credentialName} at boot`,
+      );
+    }
+  });
 
   registerMediaRoutes(app, config);
 
   const notifyOwnersOfFailures = async (): Promise<void> => {
     for (const owner of config.ownerPhoneNumbers) {
       try {
-        await kapso.sendText(owner, OWNER_FAILURE_ALERT);
+        await channel.sendText(owner, OWNER_FAILURE_ALERT);
       } catch {
         // Best effort; the failure is already in the logs.
       }
@@ -107,7 +138,7 @@ async function main(): Promise<void> {
       // coalesced burst, so a message barrage cannot turn this into spam.
       if (ctx.role !== "owner" && !config.customerAgentEnabled) {
         try {
-          await kapso.sendText(ctx.phone, CUSTOMER_UNAVAILABLE_NOTICE);
+          await channel.sendText(ctx.phone, CUSTOMER_UNAVAILABLE_NOTICE);
         } catch {
           // Best effort.
         }
@@ -121,7 +152,7 @@ async function main(): Promise<void> {
           app.log.warn({ phone: ctx.phone, decision }, "agent turn rate limited");
           if (decision === "phone_limited" && rateLimiter.shouldNotify(ctx.phone)) {
             try {
-              await kapso.sendText(ctx.phone, RATE_LIMIT_NOTICE);
+              await channel.sendText(ctx.phone, RATE_LIMIT_NOTICE);
             } catch {
               // Best effort.
             }
@@ -133,7 +164,7 @@ async function main(): Promise<void> {
       // A throw here reaches the batcher, which retries the batch with backoff
       // and settles it as failed once the attempt budget is spent — the
       // user-facing side effects live in onBatchFailure below.
-      await runAgentTurn({ db, kapso, config, log: app.log }, ctx, text);
+      await runAgentTurn({ db, channel, config, log: app.log }, ctx, text);
       failureAlert.recordSuccess();
     },
     onBatchFailure: async (ctx, { final }) => {
@@ -144,14 +175,14 @@ async function main(): Promise<void> {
       if (failureAlert.recordFailure()) void notifyOwnersOfFailures();
       if (!final) return; // the retry may still answer; apologize only when it cannot
       try {
-        await kapso.sendText(ctx.phone, AGENT_ERROR_APOLOGY);
+        await channel.sendText(ctx.phone, AGENT_ERROR_APOLOGY);
       } catch {
         // Best effort; the failure is already in the logs.
       }
     },
   });
 
-  const deps: WebhookDeps = { config, db, kapso, batcher, roleFor };
+  const deps: WebhookDeps = { config, db, channel, batcher, roleFor };
 
   registerWebhook(app, deps);
 

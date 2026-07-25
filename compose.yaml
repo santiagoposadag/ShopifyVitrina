@@ -6,10 +6,17 @@
 # Preferred flow: ./scripts/with-secrets.sh docker compose up -d
 # (exports the secrets from gopass); a plain .env still works as fallback.
 x-secrets-env: &secrets-env
-  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-  KAPSO_API_KEY: ${KAPSO_API_KEY}
-  KAPSO_PHONE_NUMBER_ID: ${KAPSO_PHONE_NUMBER_ID}
-  KAPSO_WEBHOOK_SECRET: ${KAPSO_WEBHOOK_SECRET}
+  # Either credential is enough and NEITHER is individually required — a
+  # DeepSeek deployment has no Anthropic key at all. server/src/config.ts
+  # refuses to boot when both are empty, so a blank-secrets `up` still fails
+  # loudly instead of crash-looping on the first customer message.
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-}
+  # Shared with the bridge: it signs inbound events with the first and accepts
+  # the second on /send. Both sides must see the SAME values or the channel is
+  # silently one-way, so they are interpolated once here and reused below.
+  BRIDGE_WEBHOOK_SECRET: ${BRIDGE_WEBHOOK_SECRET}
+  BRIDGE_API_TOKEN: ${BRIDGE_API_TOKEN}
   OWNER_PHONE_NUMBERS: ${OWNER_PHONE_NUMBERS:-}
 
 # Absolute paths inside the containers. server/src/config.ts short-circuits on
@@ -26,11 +33,27 @@ services:
       dockerfile: server/Dockerfile
     environment:
       <<: [*secrets-env, *data-env]
+      # The bridge is reachable on the compose network only — never published,
+      # never given a domain.
+      BRIDGE_URL: http://bridge:3002
+      BRIDGE_STAGING_DIR: /data/inbound
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
       # The STOREFRONT's URL, not this server's — the two are different hosts.
       # Used to build the owner's private draft-preview links.
       STOREFRONT_BASE_URL: ${STOREFRONT_BASE_URL:-http://localhost:3000}
       PORT: "3001"
+      # Provider routing. Empty values fall back to the defaults in
+      # server/src/config.ts (Anthropic's endpoint, claude-haiku-4-5). Set them
+      # by sourcing a profile: ./scripts/with-secrets.sh --profile deepseek ...
+      # See docs/provider-swap.md.
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      MODEL: ${MODEL:-}
+      SMALL_FAST_MODEL: ${SMALL_FAST_MODEL:-}
+      MAX_THINKING_TOKENS: ${MAX_THINKING_TOKENS:-}
+      # JSON merged into every request body — the only knob that reaches
+      # DeepSeek's reasoning effort. Validated at boot, so a malformed value
+      # fails the container instead of silently doing nothing.
+      AGENT_EXTRA_BODY: ${AGENT_EXTRA_BODY:-}
       # Cost/abuse protection and session lifetime. Empty values fall back to
       # the defaults in server/src/config.ts (20/hour, 500/day, 7 days).
       RATE_LIMIT_PER_PHONE_PER_HOUR: ${RATE_LIMIT_PER_PHONE_PER_HOUR:-}
@@ -100,6 +123,52 @@ services:
     depends_on:
       server:
         condition: service_healthy
+    restart: unless-stopped
+
+  # The WhatsApp channel: a linked device speaking the whatsmeow (WhatsApp Web
+  # multidevice) protocol. No WhatsApp Business onboarding, no per-conversation
+  # fee — and no official standing with Meta, so the paired number carries real
+  # ban risk and is unlinked if the primary phone stays offline too long.
+  #
+  # DELIBERATELY NOT PUBLISHED: no `ports:` and, on Coolify, no domain. Anyone who
+  # can reach /send can send WhatsApp messages as the business. The only exposure
+  # it needs is to the server, on the compose network.
+  bridge:
+    image: vitrina-bridge
+    build:
+      context: ./bridge
+      dockerfile: Dockerfile
+    environment:
+      BRIDGE_WEBHOOK_SECRET: ${BRIDGE_WEBHOOK_SECRET}
+      BRIDGE_API_TOKEN: ${BRIDGE_API_TOKEN}
+      BRIDGE_WEBHOOK_URL: http://server:3001/webhook
+      BRIDGE_STAGING_DIR: /data/inbound
+      BRIDGE_STORE_PATH: /session/whatsmeow.db
+      BRIDGE_OUTBOX_PATH: /session/outbox.db
+      BRIDGE_ADDR: ":3002"
+      # Bare E.164 digits: pairs by 8-character code instead of QR, which keeps
+      # the whole flow inside the container logs. Unset falls back to a QR code
+      # rendered into the logs.
+      BRIDGE_PAIR_PHONE: ${BRIDGE_PAIR_PHONE:-}
+      BRIDGE_DEBUG: ${BRIDGE_DEBUG:-}
+    healthcheck:
+      # The binary probes itself: the image is distroless, so there is no shell
+      # and no curl for a HEALTHCHECK to use. Liveness only — /health ignores the
+      # WhatsApp connection on purpose, because a restart cannot fix being
+      # unlinked and failing health on it would crash-loop over the real problem.
+      test: ["CMD", "/bridge", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    volumes:
+      # The pairing and the delivery queue. Losing this volume means re-pairing
+      # the number by hand — it is NOT disposable like vitrina-sessions.
+      - vitrina-whatsapp:/session
+      # Shared with the server: the bridge writes decrypted inbound media here
+      # and the server reads it, then unlinks. This is why a 37-photo burst moves
+      # zero image bytes over HTTP.
+      - vitrina-data:/data
     restart: unless-stopped
 
   # Seeds the two example properties. Excluded from `docker compose up` via
@@ -177,3 +246,7 @@ volumes:
   # Separate from vitrina-data because it is disposable — losing it costs
   # conversation history, not business data, and the storefront never reads it.
   vitrina-sessions: {}
+  # whatsmeow's device store (the pairing) and its delivery outbox. The one
+  # volume here that is NOT disposable: losing it unlinks the number and someone
+  # has to re-pair by hand, with the owner's phone in reach.
+  vitrina-whatsapp: {}

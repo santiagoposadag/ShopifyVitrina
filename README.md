@@ -18,10 +18,12 @@ First vertical: real estate. The pilot ships with two seed properties.
 Monorepo with npm workspaces:
 
 ```
-package.json          # workspaces: ["server", "web"]
+package.json          # workspaces: ["server", "web", "shared"]
 env.sample            # copy to .env and fill in  (see note below)
-server/               # Fastify + Claude Agent SDK + SQLite  (the brain + WhatsApp transport)
+server/               # Fastify + Claude Agent SDK + SQLite  (the brain)
 web/                  # Next.js App Router storefront (reads the same SQLite file)
+shared/               # types-only package (@vitrina/shared) — no runtime code
+bridge/               # Go sidecar: the WhatsApp transport (whatsmeow)
 data/                 # created at runtime: vitrina.db + media/  (git-ignored)
 ```
 
@@ -29,18 +31,18 @@ data/                 # created at runtime: vitrina.db + media/  (git-ignored)
 Customer / Owner (WhatsApp)
         │
         ▼
-   Kapso.ai  ──webhook (HMAC, ACK<10s, idempotent)──►  server (Fastify)
-   WhatsApp Cloud API                                    1. verify + dedupe
-        ▲                                                2. download media (token ~4 min)
-        └──────── REST send (text, image, buttons) ───── 3. enqueue per-phone, ACK
-                                                              │  async worker
-                                                              ▼
-                                                     Claude Agent SDK
-                                                     session per phone (resumable)
-                                                     role: owner | customer
-                                                     in-process tools ↓
-                                                              │
-                                             ┌────────────────┴───────────────┐
+  bridge (Go, whatsmeow) ──webhook (HMAC, one event)──►  server (Fastify)
+  linked device, not the Cloud API                        1. verify + dedupe
+        ▲            │                                    2. read staged media
+        │            └── decrypts media ──► /data/inbound  3. enqueue per-phone, ACK
+        │                                   (shared volume)     │  async worker
+        └──── POST /send (text) ◄──────────────────────────┐    ▼
+              internal network only                        │  Claude Agent SDK
+                                                           │  session per phone (resumable)
+                                                           │  role: owner | customer
+                                                           │  in-process tools ↓
+                                                           │         │
+                                             ┌─────────────┴─────────┴────────┐
                                              ▼                                 ▼
                                         SQLite (better-sqlite3)          MEDIA_DIR (photos)
                                              ▲
@@ -48,13 +50,20 @@ Customer / Owner (WhatsApp)
                                         Next.js storefront (landing + catalog)
 ```
 
+The bridge pairs a real number as a **linked device**. That means no WhatsApp
+Business onboarding and no per-conversation fee — and no official standing with
+Meta, so the number carries genuine ban risk and is unlinked if the primary
+phone stays offline too long. See `bridge/` and CLAUDE.md.
+
 ### server/ — the brain
 
 - `src/config.ts` — env loading and role detection (`OWNER_PHONE_NUMBERS` allowlist).
 - `src/data/db.ts` — SQLite (WAL), schema created on boot.
 - `src/data/repo.ts` — all catalog/lead/session queries.
-- `src/whatsapp/kapso.ts` — Kapso REST client: `sendText`, `sendInteractiveButtons`, `downloadMedia`. Outbound is text-only on purpose — photos are relayed as a storefront link, never pushed into the chat.
-- `src/inbox/webhook.ts` — `POST /webhook`: HMAC verify (raw body), batch envelope, persisted inbox (dedupe + at-least-once: unfinished messages are replayed on boot), immediate media download, fast ACK.
+- `src/whatsapp/channel.ts` — the transport seam: `sendText`, `downloadMedia(ref)`, optional `releaseMedia`. Outbound is text-only on purpose — photos are relayed as a storefront link, never pushed into the chat.
+- `src/whatsapp/bridge.ts` — the one implementation: posts replies to the sidecar, reads staged media off the shared volume (`isAllowedMediaPath` confines it), sweeps files orphaned by a crash.
+- `src/inbox/whatsmeow.ts` — parses the bridge's event shape into an `InboundMessage`.
+- `src/inbox/webhook.ts` — `POST /webhook`: HMAC verify (raw body), persisted inbox (dedupe + at-least-once: unfinished messages are replayed on boot), media handoff, fast ACK.
 - `src/inbox/batcher.ts` — coalesces each phone's message burst into ONE agent turn (`BATCH_DEBOUNCE_MS` of silence, `BATCH_MAX_WAIT_MS` ceiling) and settles its inbox rows.
 - `src/inbox/queue.ts` — in-process FIFO with per-phone serialization.
 - `src/agent/agent.ts` — Claude Agent SDK integration: resume per-phone session (idle sessions expire after `SESSION_MAX_AGE_DAYS`; an unresumable session falls back once to a fresh one), run tools, reply in Spanish.
@@ -63,7 +72,7 @@ Customer / Owner (WhatsApp)
 - `src/data/backup.ts` — consistent SQLite snapshot (online backup API) with pruning.
 - `src/data/transcripts.ts` — the Agent SDK's transcripts on disk: delete one session's, or sweep the ones no session row can resume any more. Inert unless `AGENT_TRANSCRIPTS_DIR` is set, which it deliberately does not default (see the file's header).
 - `src/data/purge.ts` / `src/data/purge-sessions.ts` — ops lever: drop every **customer** conversation history so they start fresh; owner sessions are kept. `docker compose --profile purge run --rm purge-sessions`, or `npm run purge:sessions -w server`.
-- `src/agent/tools.ts` — in-process MCP tools. Customer: `search_catalog`, `get_product`, `save_lead`. Owner (allowlist): the above plus `upsert_product`, `attach_pending_photos`, `list_products`, `list_leads`. The tool server has no Kapso client: tools read and write data, they never message the chat.
+- `src/agent/tools.ts` — in-process MCP tools. Customer: `search_catalog`, `get_product`, `save_lead`. Owner (allowlist): the above plus `upsert_product`, `attach_pending_photos`, `list_products`, `list_leads`. The tool server has no WhatsApp channel: tools read and write data, they never message the chat.
 - `src/agent/preview.ts` — the storefront URL shapes: `/propiedad/<code>` for customers (active only), `/preview/<code>` for the owner's pre-publish review. Both ride back on tool results, since the agent may only state what a tool returned.
 - `src/whatsapp/media.ts` — serves `MEDIA_DIR` under `/media/*`; saves inbound media.
 - `src/seed/seed.ts` — parses the two example properties and inserts them as **active** with photos.
@@ -120,8 +129,10 @@ Every variable is documented in `env.sample`. Key ones:
 | Variable | Purpose |
 |---|---|
 | `ANTHROPIC_API_KEY` | Runs the Claude model via the Agent SDK. |
-| `KAPSO_API_KEY`, `KAPSO_PHONE_NUMBER_ID` | Send messages / download media via Kapso. |
-| `KAPSO_WEBHOOK_SECRET` | Verify inbound webhook signatures. |
+| `BRIDGE_WEBHOOK_SECRET` | Shared with the bridge: it signs inbound events, the server verifies them. |
+| `BRIDGE_API_TOKEN` | Bearer token for the bridge's `/send`. Anyone holding it can message as the business. |
+| `BRIDGE_URL`, `BRIDGE_STAGING_DIR` | Where the sidecar lives, and the shared directory it stages decrypted media in. Set by compose. |
+| `BRIDGE_PAIR_PHONE` | The number to pair, bare E.164 digits. Set it to pair by code instead of QR. |
 | `OWNER_PHONE_NUMBERS` | Comma-separated allowlist (E.164 digits, no `+`) that gets the owner toolset. |
 | `DB_PATH`, `MEDIA_DIR` | Shared by server and web. Relative paths resolve to the **repo root**, so both apps agree regardless of the workspace they run from. |
 | `PUBLIC_BASE_URL` | Public URL of the server (a tunnel) — used to build photo URLs WhatsApp can fetch. |
@@ -153,29 +164,56 @@ npm run dev:server     # Fastify on :3001
 npm run dev:web        # Next.js on :3000  (open http://localhost:3000)
 ```
 
-### 5. Expose the server and register the webhook
+### 5. Pair the WhatsApp number
 
-WhatsApp/Kapso must reach your server, and photo URLs must be public:
+There is **no inbound webhook to expose and no dashboard to register**: the bridge
+runs beside the server and posts to it over the internal network. Nothing from
+the internet needs to reach `/webhook`.
 
 ```bash
-# example with cloudflared (or use ngrok)
-cloudflared tunnel --url http://localhost:3001
+# in .env
+BRIDGE_PAIR_PHONE=573001112233        # bare E.164 digits, no '+'
+
+./scripts/with-secrets.sh docker compose up -d --build
+docker compose logs -f bridge          # an 8-character pairing code appears here
 ```
 
-Set `PUBLIC_BASE_URL` in `.env` to the tunnel URL and restart the server. Then in
-the Kapso dashboard, point the webhook at `https://<tunnel>/webhook` and set the
-webhook secret to match `KAPSO_WEBHOOK_SECRET`.
+On the phone: **WhatsApp → Settings → Linked devices → Link with phone number**,
+then type the code. It expires in about 160 seconds, so have the phone ready
+before you start. Leave `BRIDGE_PAIR_PHONE` empty to get a QR code in the logs
+instead.
+
+Confirm it took:
+
+```bash
+docker compose exec bridge /bridge -status
+# {"connected":true,"loggedOut":false,"pairedAs":"57300...:12@s.whatsapp.net",...}
+```
+
+The binary probes itself because the bridge publishes no port and the image has
+no shell — there is nothing to `curl`, from outside or in. `-healthcheck` is the
+same idea for liveness, and is what Docker runs.
+
+> **You cannot test by messaging the paired number from that same number.**
+> Those arrive with `IsFromMe` set and the bridge drops them, exactly as it drops
+> its own outgoing messages — otherwise every reply would loop back in as a new
+> message. Pair one number, message it from a different phone.
+
+A tunnel is still needed for **outbound links**, not for messages: the storefront
+URLs the assistant sends must resolve on the recipient's phone. Set
+`PUBLIC_BASE_URL` / `STOREFRONT_BASE_URL` to public addresses.
 
 ---
 
-## Sandbox testing walkthrough
+## Testing walkthrough
 
-Kapso provides a shared sandbox number for development.
+Pair a **disposable number**, not the business line — this is an unofficial
+client and a ban takes the number with it.
 
-1. Start the server, open a tunnel, set `PUBLIC_BASE_URL`, register the webhook.
+1. Pair as above and confirm `/status` shows `connected: true`.
 2. Add your own phone number to `OWNER_PHONE_NUMBERS` to test the **owner** flow,
    or leave it out to test the **customer** flow.
-3. Message the sandbox number from WhatsApp.
+3. Message the paired number from WhatsApp.
 
 **Customer example**
 
@@ -204,41 +242,56 @@ You:  El código 008 no es. Ya es código 1912
 Bot:  (upsert_product) Corregido: el apartamento ahora tiene el código 1912.
 ```
 
-### Sandbox limitations
+### Limitations of a linked device
 
-- **Text + interactive only.** The sandbox cannot send WhatsApp **templates**, so
-  proactive/re-engagement messages ("a new listing matches your search") can only be
-  validated on a real, verified production number.
-- Media on the sandbox behaves like production: inbound media download tokens are
-  short-lived (~4 minutes), which is why the server downloads media at webhook
-  receipt, before running the agent.
+- **Text only.** Interactive buttons and list messages are a Cloud API feature;
+  a linked device cannot render them reliably on consumer WhatsApp. Outbound is
+  `sendText` and nothing else — which is what the product wanted anyway, since
+  photos are relayed as a storefront link.
+- **No templates**, so proactive re-engagement ("a new listing matches your
+  search") is not possible on this transport at all.
+- **The primary phone must stay reachable.** WhatsApp unlinks companion devices
+  after a long stretch with the main phone offline. The failure is silent: the
+  bridge keeps running and stops receiving. Watch `/status`, not `/health`.
+- **Ban risk is real.** Automated linked-device clients are detected
+  automatically, without anyone complaining. Pair a number you can afford to
+  lose.
 
 ---
 
 ## Testing, building, running
 
 ```bash
-npm test          # server unit tests (vitest) — no network, Kapso/Claude mocked
-npm run build     # server typecheck + tsc build (dist/) + next build
-npm run seed      # (re)seed the catalog
+npm test                        # server unit tests (vitest) — no network, SDK mocked
+npm run build                   # server typecheck + tsc build (dist/) + next build
+npm run seed                    # (re)seed the catalog
+cd bridge && go test ./...      # bridge suite (Go)
 ```
 
-Tests cover: webhook signature verification (valid / wrong-secret / tampered / missing),
-inbox dedupe + at-least-once lifecycle (replay of unfinished rows, TTL cleanup),
-batch-envelope parsing, inbound message extraction (text / image / interactive /
-outbound-ignored), per-phone queue ordering (including on failure) and cross-phone
-concurrency, rate limiting (sliding window, global cap, notice throttling), failure
-alerting, session expiry, the owner/customer tool privilege boundary, `search_catalog`
-filtering, `upsert_product` merge + audit trail, `attach_pending_photos`, and
-listing-parser sanity (including the 008→1912 correction).
+Server tests cover: webhook signature verification (valid / wrong-secret / tampered /
+missing), inbox dedupe + at-least-once lifecycle (replay of unfinished rows, TTL
+cleanup), inbound message extraction (text / image / interactive / foreign-provider),
+staging-path confinement and media release, per-phone queue ordering (including on
+failure) and cross-phone concurrency, rate limiting (sliding window, global cap, notice
+throttling), failure alerting, session expiry, the owner/customer tool privilege
+boundary, `search_catalog` filtering, `upsert_product` merge + audit trail,
+`attach_pending_photos`, and listing-parser sanity (including the 008→1912 correction).
+
+Bridge tests cover: outbox ordering, durability across a restart, retry with backoff,
+and poison-row discard; every branch of LID→phone resolution including the unpaired
+device; and delivery's retry-vs-discard classification. The HMAC fixture is duplicated
+into `server/test/webhook.test.ts` on purpose — the bridge signs in Go and the server
+verifies in Node, and nothing else would catch the two drifting apart.
 
 ---
 
 ## Docker
 
-`compose.yaml` runs `server` (Fastify) and `web` (Next.js) as separate images sharing
-one SQLite database + media directory over a named volume. Works the same for local
-testing and for a copy-paste deploy onto a real server.
+`compose.yaml` runs `server` (Fastify), `web` (Next.js), and `bridge` (Go) as separate
+images. The server and web share one SQLite database + media directory over a named
+volume; the bridge shares that same volume to hand over decrypted media, plus its own
+volume for the pairing. Works the same for local testing and for a copy-paste deploy
+onto a real server.
 
 ```bash
 docker compose build
@@ -255,14 +308,19 @@ repo-root `.env` into the same variables.
 Notes:
 
 - `seed` only runs when explicitly invoked with `--profile seed` — it never runs on a
-  plain `docker compose up`. It needs no Kapso/Anthropic keys, only `DB_PATH` /
-  `MEDIA_DIR` / `PUBLIC_BASE_URL` (all provided by compose or defaulted).
+  plain `docker compose up`. It needs no secrets, only `DB_PATH` / `MEDIA_DIR` /
+  `PUBLIC_BASE_URL` (all provided by compose or defaulted).
+- **`vitrina-whatsapp` is the one volume you cannot recreate.** It holds the pairing
+  and the delivery outbox. Dropping it (`docker compose down -v`) unlinks the number
+  and someone has to re-pair by hand, phone in reach.
+- The `bridge` is deliberately unpublished — no `ports:`, and no domain on Coolify.
+  Anyone who can reach `/send` can send WhatsApp messages as the business.
 - `NEXT_PUBLIC_BRAND_NAME` and `NEXT_PUBLIC_WHATSAPP_NUMBER` are inlined into the web
   bundle at **build** time. Set them in `.env` before `docker compose build`, not just in
   the running container's environment — otherwise the WhatsApp CTA silently breaks.
 - On a real server, `PUBLIC_BASE_URL` (in `.env`, used by the `server` and `seed`
-  services) must point at the public tunnel/domain that Kapso/WhatsApp can reach —
-  never `localhost` — or WhatsApp cannot fetch photo URLs.
+  services) must point at a public domain — never `localhost` — or the photo URLs and
+  storefront links the assistant sends will not resolve on the recipient's phone.
 - The data volume (`vitrina-data`) is a Docker-managed named volume, not a host bind
   mount, so it already has the right ownership for the containers' non-root user.
 - The `web` container mounts the data volume read-write even though it only reads: SQLite
@@ -288,30 +346,25 @@ Schedule the host script daily, e.g. with cron:
 
 ---
 
-## Assumptions to verify in sandbox
+## Assumptions to verify against a paired number
 
-External API details were checked against live docs (Kapso `send-messages/*`,
-`webhooks/*`; Claude Agent SDK TypeScript reference) and are isolated behind
-`src/whatsapp/kapso.ts`, `src/inbox/webhook.ts`, and `src/agent/agent.ts`. Confirm these against a real
-sandbox before production:
+The wire format between the bridge and the server is **ours**, so it needs no
+guessing — both ends are in this repo and pinned by a shared HMAC fixture. What
+remains unverified is whatsmeow's behaviour against live WhatsApp, which no unit
+test can cover:
 
-1. **Webhook signature basis.** Kapso docs express the signed content as
-   `JSON.stringify(payload)`; we verify the HMAC-SHA256 over the **raw request body**
-   (the robust choice — re-serializing can reorder keys). For Kapso-generated requests
-   these are identical. If Kapso ever signs a re-serialized form, adjust
-   `verifySignature` in `src/inbox/webhook.ts`. We accept both a bare hex digest and a
-   `sha256=`-prefixed value.
-2. **Inbound webhook envelope.** We read the message from `event.message`,
-   `event.data.message`, or the event itself, and unwrap the batch envelope
-   (`{ batch: true, data: [...] }`). Verify the exact nesting your Kapso account emits
-   (`extractInbound` / `normalizeEvents`).
-3. **Inbound media URL + auth.** We download from `message.kapso.media_data.url` (falling
-   back to `kapso.media_url`) and send `X-API-Key`. Confirm the field and whether the
-   signed token needs the header (`downloadMedia` in `src/whatsapp/kapso.ts`).
-4. **Interactive replies.** We read `interactive.button_reply` / `interactive.list_reply`.
-   Confirm inbound shape for list replies.
+1. **Outbound send.** `POST /send` → `client.SendMessage` has never run against a
+   real session; it needs a paired device to exercise at all.
+2. **LID addressing.** `resolvePhone` prefers `SenderAlt` and falls back to
+   whatsmeow's LID map. Confirm which of the three branches your contacts actually
+   take — if messages start getting dropped, the log line is
+   `dropping message <id>: could not resolve sender`.
+3. **Media types.** Only `ImageMessage` is downloaded; video, audio, documents, and
+   stickers currently fall through to `other`. Confirm that matches what owners send.
+4. **Reconnection and unlinking.** whatsmeow reconnects on its own, but the
+   `LoggedOut` path has only been reasoned about, not observed. Watch `/status`.
 5. **Agent session id.** We capture `session_id` from the SDK result message and resume
-   with it per phone. Confirm resume behavior across long gaps in your account.
+   with it per phone. Confirm resume behavior across long gaps.
 
 ## Notable implementation notes / deviations from the brief
 
@@ -323,11 +376,16 @@ sandbox before production:
   48h is purged on boot and hourly.
 - **Webhook hardening.** Every inbound message is persisted to an `inbox` table BEFORE
   processing: the unique per-event dedupe key (WhatsApp message id, else a content hash)
-  absorbs Kapso's 10/40/90s retries, and rows left unfinished by a crash are re-enqueued
-  on the next boot (at-least-once delivery instead of silent loss). Inbound media download
-  is bounded by a ~6s shared budget and is non-fatal, so the 200 ACK never waits on an
-  unbounded network call. Media downloads (which carry the API key) are refused unless the
-  URL host is `kapso.ai` or a `*.kapso.ai` subdomain.
+  absorbs the bridge's outbox retries, and rows left unfinished by a crash are re-enqueued
+  on the next boot (at-least-once delivery instead of silent loss). Reading staged media
+  is bounded and non-fatal, so the ACK never waits on a wedged filesystem, and the path is
+  refused unless it resolves inside the staging directory.
+- **At-least-once, twice over.** The Cloud API gave us webhook retries for free;
+  whatsmeow does not — it acknowledges to WhatsApp the instant an event is handled, so an
+  event that is not durable at that moment is gone, and it never reaches the `inbox` table
+  for the boot-time replay to find. `bridge/outbox.go` is that guarantee moved into our
+  own process: durable before delivery, strictly ordered, retried forever, with a
+  poison-row escape hatch so one bad payload cannot wedge the queue.
 - **Draft previews.** The catalog renders only `active` products, so an owner could
   otherwise review a new listing only as a text summary over WhatsApp — or by publishing
   it to customers first, which defeats the point of a draft. `/preview/<code>` renders the

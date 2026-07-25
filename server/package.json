@@ -11,7 +11,10 @@
     "backup": "tsx src/data/backup.ts",
     "purge:sessions": "tsx src/data/purge-sessions.ts",
     "build": "tsc --noEmit && tsc -p tsconfig.build.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:live": "LIVE_PROVIDER_TESTS=1 vitest run --config vitest.live.config.ts",
+    "compare": "tsx src/tools/compare-providers.ts",
+    "compare:dist": "node dist/tools/compare-providers.js"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.1.0",

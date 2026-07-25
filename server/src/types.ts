@@ -9,6 +9,16 @@ export type Role = "owner" | "customer";
 export type LeadType = "inquiry" | "visit_request";
 
 /**
+ * Whether an inbound message carried media. The webhook knows this from the
+ * event it parsed, so it is PERSISTED with the row rather than re-derived from
+ * agent_text later: a photo's caption is stored as its text, so any attempt to
+ * recognise a photo by its wording silently misses every captioned one.
+ * Lives here, not in the batcher, so data/repo.ts can type the column without
+ * importing back from a module that already imports it.
+ */
+export type MessageKind = "text" | "media";
+
+/**
  * Attributes as they arrive from the agent, where an explicit null means "clear
  * this key" — the owner never stated it, or un-said it. Stored attributes never
  * contain null (upsertProduct strips the keys), so ProductAttributes above stays
@@ -49,6 +59,26 @@ export interface Lead {
   note: string | null;
   status: string;
   created_at: string;
+}
+
+/**
+ * One inbound WhatsApp message, parsed out of the bridge's wire format.
+ *
+ * Lives here rather than next to the parser so the webhook route and the parser
+ * can both name it without importing each other.
+ */
+export interface InboundMessage {
+  from: string;
+  kind: "text" | "image" | "interactive" | "other";
+  /** WhatsApp message id, used for dedupe. */
+  id?: string;
+  /** Text to feed the agent (button title, caption, or body). */
+  agentText: string;
+  /**
+   * `ref` rather than `url`: it is a path in the bridge's staging directory,
+   * resolvable only by the channel that produced it (see whatsapp/channel.ts).
+   */
+  media?: { ref: string; filename?: string; contentType?: string };
 }
 
 /** Context bound to the tools for a single inbound message turn. */

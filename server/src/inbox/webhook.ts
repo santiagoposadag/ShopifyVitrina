@@ -1,27 +1,33 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import { PHOTO_PLACEHOLDER, type InboxBatcher } from "./batcher.js";
+import type { InboxBatcher } from "./batcher.js";
 import type { Config } from "../config.js";
 import type { DB } from "../data/db.js";
-import type { KapsoClient } from "../whatsapp/kapso.js";
+import { extractInbound } from "./whatsmeow.js";
+import type { WhatsAppChannel } from "../whatsapp/channel.js";
 import { saveMedia } from "../whatsapp/media.js";
 import { addPendingMedia, insertInboxMessage } from "../data/repo.js";
-import type { TurnContext } from "../types.js";
+import type { InboundMessage, TurnContext } from "../types.js";
 
 export const SIGNATURE_HEADER = "x-webhook-signature";
 
-// Total wall-clock budget for downloading inbound media during a single webhook
-// request. Kept well under Kapso's 10s ACK deadline so the response never waits
-// on an unbounded network call. Shared across all media in one request.
-export const MEDIA_DOWNLOAD_BUDGET_MS = 6000;
+/**
+ * Ceiling on reading one staged media file.
+ *
+ * Generous because it should never be reached: the bridge decrypts media itself
+ * and hands over a path on a volume this process already has mounted, so this is
+ * a local read, not a network fetch. It exists so a wedged filesystem cannot hold
+ * the request open forever.
+ */
+export const MEDIA_READ_TIMEOUT_MS = 5000;
 
 /**
- * Verify a Kapso webhook HMAC-SHA256 signature against the RAW request body.
+ * Verify a webhook HMAC-SHA256 signature against the RAW request body.
  * Constant-time comparison. Returns false on any malformed input.
  *
- * NOTE: Kapso docs express the signed content as JSON.stringify(payload); for
- * requests Kapso sends, that equals the raw body bytes we receive, so we sign
- * the raw body (the robust choice — re-serializing could reorder keys).
+ * The bridge signs the exact bytes it sends (bridge/delivery.go), so this must
+ * hash the raw body rather than a re-serialised copy — re-encoding could reorder
+ * keys and every signature would fail.
  */
 export function verifySignature(
   rawBody: string,
@@ -40,126 +46,63 @@ export function verifySignature(
   return timingSafeEqual(a, b);
 }
 
-interface BatchEnvelope {
-  batch?: boolean;
-  data?: unknown[];
-}
-
-/**
- * Normalize a webhook body into a flat list of event objects. Handles both a
- * single event and the batch envelope ({ batch: true, data: [...] }).
- */
-export function normalizeEvents(payload: unknown): Record<string, unknown>[] {
-  if (payload === null || typeof payload !== "object") return [];
-  const envelope = payload as BatchEnvelope;
-  if (envelope.batch === true && Array.isArray(envelope.data)) {
-    return envelope.data.filter(
-      (e): e is Record<string, unknown> => typeof e === "object" && e !== null,
-    );
-  }
-  return [payload as Record<string, unknown>];
-}
-
-export interface InboundMessage {
-  from: string;
-  kind: "text" | "image" | "interactive" | "other";
-  /** WhatsApp message id (wamid...), when present — used for per-event dedupe. */
-  id?: string;
-  /** Text to feed the agent (button title, caption, or body). */
-  agentText: string;
-  media?: { url: string; filename?: string; contentType?: string };
-}
-
 /**
  * Stable per-event dedupe key. Prefers the WhatsApp message id; when absent,
- * falls back to a hash of the event content. This makes retries idempotent even
- * when the request-level x-idempotency-key header is missing or rotates.
+ * falls back to a hash of the event content. This is what makes the bridge's
+ * outbox safe to retry: a redelivered event lands on the same key and the UNIQUE
+ * constraint absorbs it.
  */
 export function stableEventKey(event: Record<string, unknown>, messageId?: string): string {
   if (messageId) return `msg:${messageId}`;
   return `evt:${createHash("sha256").update(JSON.stringify(event)).digest("hex")}`;
 }
 
-function asRecord(v: unknown): Record<string, unknown> | undefined {
-  return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : undefined;
-}
+const rawBodies = new WeakMap<FastifyRequest, string>();
 
 /**
- * Extract an inbound WhatsApp message from a single event. Returns null for
- * events that are not inbound received messages (status updates, contacts...).
+ * Read one of the owner's inbound photos and record it as pending, ready for
+ * attach_pending_photos. Never throws: an unreadable file must not cost the ACK
+ * or the rest of the listing.
+ *
+ * One photo per request, because the bridge delivers one event per POST in
+ * strict order — which is also what preserves photo order, and photo order is
+ * the listing's order: the first photo becomes the storefront's cover.
  */
-export function extractInbound(event: Record<string, unknown>): InboundMessage | null {
-  // The message may sit at event.data.message, event.message, or event itself.
-  const data = asRecord(event["data"]);
-  const message =
-    asRecord(event["message"]) ??
-    asRecord(data?.["message"]) ??
-    (event["type"] && event["from"] ? event : undefined);
-  const msg = asRecord(message);
-  if (!msg) return null;
-
-  const kapso = asRecord(msg["kapso"]);
-  if (kapso && typeof kapso["direction"] === "string" && kapso["direction"] !== "inbound") {
-    return null;
+async function storeInboundMedia(
+  item: InboundMessage,
+  deps: {
+    config: Config;
+    db: DB;
+    channel: WhatsAppChannel;
+    log: Pick<FastifyRequest["log"], "warn">;
+  },
+): Promise<void> {
+  try {
+    const buffer = await deps.channel.downloadMedia(
+      item.media!.ref,
+      AbortSignal.timeout(MEDIA_READ_TIMEOUT_MS),
+    );
+    const saved = await saveMedia(deps.config, buffer, {
+      mimeType: item.media!.contentType,
+      suggestedName: item.media!.filename,
+    });
+    addPendingMedia(deps.db, {
+      phone: item.from,
+      file_path: saved.filePath,
+      public_path: saved.publicPath,
+      // Only what the owner actually wrote about this photo, or nothing.
+      caption: item.agentText.trim() || null,
+    });
+  } catch (err) {
+    // The message still reaches the agent — it just arrives without its image.
+    deps.log.warn({ err, phone: item.from }, "inbound media not stored");
   }
-
-  const from = typeof msg["from"] === "string" ? (msg["from"] as string) : undefined;
-  if (!from) return null;
-
-  const id = typeof msg["id"] === "string" ? (msg["id"] as string) : undefined;
-  const type = typeof msg["type"] === "string" ? (msg["type"] as string) : "other";
-
-  // Media (image and other media types carry kapso.media_data.url).
-  const mediaData = asRecord(kapso?.["media_data"]);
-  const mediaUrl =
-    (typeof mediaData?.["url"] === "string" && (mediaData["url"] as string)) ||
-    (typeof kapso?.["media_url"] === "string" && (kapso["media_url"] as string)) ||
-    undefined;
-
-  if (type === "text") {
-    const text = asRecord(msg["text"]);
-    const body = typeof text?.["body"] === "string" ? (text["body"] as string) : "";
-    return { from, id, kind: "text", agentText: body };
-  }
-
-  if (type === "interactive") {
-    const interactive = asRecord(msg["interactive"]);
-    const buttonReply = asRecord(interactive?.["button_reply"]);
-    const listReply = asRecord(interactive?.["list_reply"]);
-    const reply = buttonReply ?? listReply;
-    const title = typeof reply?.["title"] === "string" ? (reply["title"] as string) : "";
-    const label = typeof reply?.["id"] === "string" ? ` (id ${reply["id"] as string})` : "";
-    return { from, id, kind: "interactive", agentText: `Seleccionó: ${title}${label}` };
-  }
-
-  if (mediaUrl) {
-    const image = asRecord(msg["image"]);
-    const caption =
-      (typeof image?.["caption"] === "string" && (image["caption"] as string)) || "";
-    const filename =
-      typeof mediaData?.["filename"] === "string" ? (mediaData["filename"] as string) : undefined;
-    const contentType =
-      typeof mediaData?.["content_type"] === "string"
-        ? (mediaData["content_type"] as string)
-        : undefined;
-    return {
-      from,
-      id,
-      kind: "image",
-      agentText: caption || PHOTO_PLACEHOLDER,
-      media: { url: mediaUrl, filename, contentType },
-    };
-  }
-
-  return { from, id, kind: "other", agentText: "" };
 }
-
-const rawBodies = new WeakMap<FastifyRequest, string>();
 
 export interface WebhookDeps {
   config: Config;
   db: DB;
-  kapso: KapsoClient;
+  channel: WhatsAppChannel;
   /** Coalesces each phone's burst into a single agent turn, off the ACK path. */
   batcher: InboxBatcher;
   /** Maps a phone number to its role (owner vs customer). */
@@ -167,7 +110,7 @@ export interface WebhookDeps {
 }
 
 export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
-  const { config, db, kapso, batcher, roleFor } = deps;
+  const { config, db, channel, batcher, roleFor } = deps;
 
   // Keep the raw body so we can verify the signature over exact bytes.
   app.addContentTypeParser(
@@ -189,62 +132,69 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
     const signature = request.headers[SIGNATURE_HEADER];
     const signatureValue = Array.isArray(signature) ? signature[0] : signature;
 
-    if (!verifySignature(rawBody, signatureValue, config.kapsoWebhookSecret)) {
+    if (!verifySignature(rawBody, signatureValue, config.webhookSecret)) {
       return reply.code(401).send({ error: "invalid_signature" });
     }
 
-    const events = normalizeEvents(request.body);
+    const event =
+      typeof request.body === "object" && request.body !== null
+        ? (request.body as Record<string, unknown>)
+        : {};
 
-    // Shared budget so the ACK never blocks on unbounded media downloads, even
-    // across a batch. Media tokens expire in ~4 min, so we still download now.
-    const mediaDeadline = AbortSignal.timeout(MEDIA_DOWNLOAD_BUDGET_MS);
-
-    for (const event of events) {
-      const inbound = extractInbound(event);
-      if (!inbound) continue;
-      // No agent-worthy content and no media side effects: skip entirely.
-      if (inbound.agentText.trim().length === 0 && inbound.kind !== "image") continue;
-
-      // Persist BEFORE processing: the UNIQUE dedupe key absorbs Kapso's
-      // 10/40/90s retries, and a crash before the agent runs is replayed on
-      // boot instead of silently losing the message (at-least-once).
-      const row = insertInboxMessage(db, {
-        dedupe_key: stableEventKey(event, inbound.id),
-        phone: inbound.from,
-        agent_text: inbound.agentText,
-      });
-      if (!row) continue; // Retry of an event we already persisted.
-
-      // Persist inbound media ONLY for owners (they ingest listings). Customers'
-      // images are acknowledged in the agent context but never stored/served.
-      // Download is bounded and non-fatal so a slow fetch cannot delay the ACK.
-      if (inbound.media && roleFor(inbound.from) === "owner") {
-        try {
-          const buffer = await kapso.downloadMedia(inbound.media.url, mediaDeadline);
-          const saved = await saveMedia(config, buffer, {
-            mimeType: inbound.media.contentType,
-            suggestedName: inbound.media.filename,
-          });
-          addPendingMedia(db, {
-            phone: inbound.from,
-            file_path: saved.filePath,
-            public_path: saved.publicPath,
-            caption: inbound.agentText,
-          });
-        } catch (err) {
-          // Timeout, network failure, or a rejected host: record and move on.
-          request.log.warn({ err, phone: inbound.from }, "inbound media not stored");
-        }
+    // A file the bridge already wrote and we decide not to keep has to be
+    // released, or it sits on the volume forever — nothing else deletes it.
+    const release = async (ref: string | undefined): Promise<void> => {
+      if (!ref) return;
+      try {
+        await channel.releaseMedia?.(ref);
+      } catch (err) {
+        // Tidying up is never worth the ACK or the message.
+        request.log.warn({ err, ref }, "could not release unused inbound media");
       }
+    };
 
-      // Hand the row to the batcher; it debounces and runs the agent on the
-      // async worker. Only the timer state is touched here, so the ACK stays
-      // fast. The media flag comes from the parsed event — a photo burst needs
-      // a much longer window than chat (see InboxBatcher).
-      batcher.schedule(row.phone, inbound.media ? "media" : "text");
+    const inbound = extractInbound(event);
+    // No agent-worthy content and no media side effects: nothing to do.
+    if (!inbound || (inbound.agentText.trim().length === 0 && inbound.kind !== "image")) {
+      await release(inbound?.media?.ref);
+      return reply.code(200).send({ status: "ok" });
     }
 
-    // ACK fast; the agent runs on the async worker.
+    // Persist BEFORE processing: the UNIQUE dedupe key absorbs the bridge's
+    // outbox retries, and a crash before the agent runs is replayed on boot
+    // instead of silently losing the message (at-least-once).
+    const row = insertInboxMessage(db, {
+      dedupe_key: stableEventKey(event, inbound.id),
+      phone: inbound.from,
+      agent_text: inbound.agentText,
+      // Stored, not inferred later: a captioned photo's text IS the caption,
+      // so nothing downstream could tell it apart from someone typing.
+      kind: inbound.media ? "media" : "text",
+    });
+    if (!row) {
+      // Redelivery of an event we already handled; its media went with the first
+      // pass, so this copy is released rather than left behind.
+      await release(inbound.media?.ref);
+      return reply.code(200).send({ status: "ok" });
+    }
+
+    // Persist inbound media ONLY for owners (they ingest listings). Customers'
+    // images are acknowledged in the agent context but never stored or served —
+    // and "never stored" still means a file to clean up.
+    if (inbound.media) {
+      if (roleFor(inbound.from) === "owner") {
+        await storeInboundMedia(inbound, { config, db, channel, log: request.log });
+      } else {
+        await release(inbound.media.ref);
+      }
+    }
+
+    // Hand the row to the batcher; it debounces and runs the agent on the async
+    // worker. Only timer state is touched here, so the ACK stays fast. The media
+    // flag comes from the parsed event — a photo burst needs a much longer
+    // window than chat (see InboxBatcher).
+    batcher.schedule(row.phone, inbound.media ? "media" : "text");
+
     return reply.code(200).send({ status: "ok" });
   });
 }
