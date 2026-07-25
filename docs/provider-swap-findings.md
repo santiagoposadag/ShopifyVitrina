@@ -21,6 +21,10 @@ Operational detail — env vars, profiles, parity gaps — lives in [provider-sw
 
 Costs are **real billed spend read from each provider's dashboard** for the exact run window — not estimates. The workload was 87 tasks (29 scenarios × 3 passes) per provider, identical set, identical order.
 
+> **The two runs were not symmetric on reasoning.** DeepSeek ran with `{"output_config":{"effort":"high"}}` and thinking active on every turn; Anthropic ran with extended thinking **off** (`maxThinkingTokens: 0`, `extraBody: {}`). Verified from the recorded run config, and the transmission path is pinned by a live test (`actually transmits AGENT_EXTRA_BODY into the request body`).
+>
+> This is not a flaw in the cost result — DeepSeek did strictly *more* work per turn and still cost a third as much. It does mean **most of the latency gap is reasoning Anthropic simply wasn't doing.** Note also that DeepSeek's thinking is on by default with a floor of `high`, so an empty `AGENT_EXTRA_BODY` would have produced much the same run; setting it made the configuration explicit, not different.
+
 **DeepSeek runs our workload for roughly a third of the cost, at no worse quality.** Latency is the one real regression.
 
 ---

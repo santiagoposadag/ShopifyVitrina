@@ -114,6 +114,32 @@ describe.skipIf(!LIVE)("agentic loop parity", () => {
       expect(String(turn["servedModel"])).toContain(config.model);
     });
 
+    // AGENT_EXTRA_BODY is the ONLY lever that reaches a provider ignoring
+    // thinking.budget_tokens, and nothing else proves it survives the trip
+    // through the SDK's subprocess into the request body. Config being SET is
+    // not evidence the field was SENT.
+    //
+    // Asserted by observable effect rather than accept/reject, because
+    // accept/reject is unreliable here: DeepSeek documents temperature as
+    // accepted-but-ignored in thinking mode, so an out-of-range value returns
+    // 200 and looks exactly like the extra body never arriving. A max_tokens
+    // far too small to complete a turn cannot be silently ignored.
+    it("actually transmits AGENT_EXTRA_BODY into the request body", async () => {
+      seedCatalog(db);
+      const starved = { ...config, agentExtraBody: { max_tokens: 5 } };
+
+      await expect(
+        runAgentTurn({ ...deps(), config: starved }, customerCtx(), "Hola, buenas tardes"),
+        "the turn succeeded with max_tokens=5, so the extra body never reached the API — the thinking-effort knob is inert",
+      ).rejects.toThrow();
+
+      // Control: the same turn must succeed without the starving override, so a
+      // failure above is attributable to the extra body and not to the endpoint
+      // being down.
+      const sane = await runAgentTurn(deps(), customerCtx(), "Hola, buenas tardes");
+      expect(sane.length).toBeGreaterThan(0);
+    });
+
     it("reports token counts, so cost is observable at all", async () => {
       seedCatalog(db);
       await runAgentTurn(deps(), customerCtx(), "Hola, ¿qué tienen disponible?");
