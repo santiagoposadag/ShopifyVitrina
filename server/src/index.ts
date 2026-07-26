@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import { runAgentTurn } from "./agent/agent.js";
 import { checkAgentCredential } from "./agent/preflight.js";
+import { transcribe, transcriptionEnabled } from "./agent/transcribe.js";
 import { ConsecutiveFailureAlert } from "./inbox/alerts.js";
 import { InboxBatcher } from "./inbox/batcher.js";
 import { isOwner, loadConfig, loadDotEnv } from "./config.js";
@@ -90,6 +91,15 @@ async function main(): Promise<void> {
   // accepting and PERSISTING inbound messages. The inbox is durable, so messages
   // that arrive during an outage are replayed once the key is fixed — refusing to
   // boot would drop them on the floor instead.
+  // Said once at boot rather than discovered per voice note: without a key,
+  // every voice note gets the "please write it" fallback, and that is a
+  // configuration choice worth seeing in the startup log.
+  if (!transcriptionEnabled(config)) {
+    app.log.warn(
+      "TRANSCRIPTION_API_KEY is not set — inbound voice notes will be answered with a request to write instead",
+    );
+  }
+
   const credentialName = config.agentAuthToken ? "ANTHROPIC_AUTH_TOKEN" : "ANTHROPIC_API_KEY";
   void checkAgentCredential(config).then((result) => {
     if (result.status === "invalid") {
@@ -130,6 +140,13 @@ async function main(): Promise<void> {
     mediaDebounceMs: config.batchMediaDebounceMs,
     mediaMaxWaitMs: config.batchMediaMaxWaitMs,
     roleFor,
+    // Runs on the worker, never in the webhook — see transcribe.ts. With no
+    // TRANSCRIPTION_API_KEY this returns null and a voice note gets a reply
+    // asking for text, rather than the silence it used to get.
+    transcribeAudio: async (filePath: string) => {
+      const result = await transcribe(filePath, config);
+      return result?.text ?? null;
+    },
     onMessage: async (ctx: TurnContext, text: string) => {
       upsertContact(db, ctx.phone, ctx.role);
 

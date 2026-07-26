@@ -69,7 +69,13 @@ export interface Lead {
  */
 export interface InboundMessage {
   from: string;
-  kind: "text" | "image" | "interactive" | "other";
+  /**
+   * "audio" is a voice note or an attached audio file, which the bridge treats
+   * identically. It carries NO text of its own — WhatsApp has no caption field
+   * for audio — so the pipeline has to keep it alive on its media alone until
+   * the worker transcribes it.
+   */
+  kind: "text" | "image" | "audio" | "interactive" | "other";
   /** WhatsApp message id, used for dedupe. */
   id?: string;
   /** Text to feed the agent (button title, caption, or body). */

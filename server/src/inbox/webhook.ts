@@ -1,13 +1,14 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { unlink } from "node:fs/promises";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { InboxBatcher } from "./batcher.js";
 import type { Config } from "../config.js";
 import type { DB } from "../data/db.js";
 import { extractInbound } from "./whatsmeow.js";
 import type { WhatsAppChannel } from "../whatsapp/channel.js";
-import { saveMedia } from "../whatsapp/media.js";
+import { saveAudio, saveMedia } from "../whatsapp/media.js";
 import { addPendingMedia, insertInboxMessage } from "../data/repo.js";
-import type { InboundMessage, TurnContext } from "../types.js";
+import type { InboundMessage, MessageKind, TurnContext } from "../types.js";
 
 export const SIGNATURE_HEADER = "x-webhook-signature";
 
@@ -99,6 +100,65 @@ async function storeInboundMedia(
   }
 }
 
+/**
+ * Read an inbound voice note off the staging volume and keep it until the
+ * worker can transcribe it. Returns the stored path, or null if nothing usable
+ * arrived — never throws, for the same reason storeInboundMedia does not.
+ *
+ * Transcription itself is NOT done here. The bridge's outbox is strictly
+ * sequential, so every message behind this one waits for the handler to return;
+ * a local read off a shared volume is affordable, a call to a speech API is
+ * not. That work belongs to the batcher (see batcher.ts).
+ *
+ * Runs for BOTH roles, unlike photos. A customer's voice note is the customer's
+ * actual question — dropping it is the bug this whole path exists to fix — but
+ * it must never reach pending_media, because attach_pending_photos consumes
+ * every unattached row for a phone with no type filter and would publish it to
+ * the storefront as a product photo.
+ */
+async function storeInboundAudio(
+  item: InboundMessage,
+  deps: {
+    config: Config;
+    channel: WhatsAppChannel;
+    log: Pick<FastifyRequest["log"], "warn">;
+  },
+): Promise<string | null> {
+  try {
+    const buffer = await deps.channel.downloadMedia(
+      item.media!.ref,
+      AbortSignal.timeout(MEDIA_READ_TIMEOUT_MS),
+    );
+    if (buffer.byteLength > deps.config.transcriptionMaxBytes) {
+      deps.log.warn(
+        { phone: item.from, bytes: buffer.byteLength },
+        "inbound audio too large to transcribe; dropping the audio",
+      );
+      return null;
+    }
+    const saved = await saveAudio(deps.config, buffer, { suggestedName: item.media!.filename });
+    return saved.filePath;
+  } catch (err) {
+    // The message still reaches the agent, and the batcher's fallback turns it
+    // into a reply asking for text — which beats the silence this replaced.
+    deps.log.warn({ err, phone: item.from }, "inbound audio not stored");
+    return null;
+  }
+}
+
+/**
+ * Whether this message is worth persisting despite carrying no text.
+ *
+ * Both cases are messages whose CONTENT is not words: an uncaptioned photo, and
+ * a voice note whose transcript does not exist yet. Everything else with an
+ * empty body is an event kind we do not handle, and settling those quietly is
+ * deliberate. This is a predicate rather than a chain of `kind !== ...` because
+ * that chain is exactly what silently swallowed the first voice note.
+ */
+function hasContentWithoutText(item: InboundMessage): boolean {
+  return item.kind === "image" || item.kind === "audio";
+}
+
 export interface WebhookDeps {
   config: Config;
   db: DB;
@@ -155,10 +215,25 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
 
     const inbound = extractInbound(event);
     // No agent-worthy content and no media side effects: nothing to do.
-    if (!inbound || (inbound.agentText.trim().length === 0 && inbound.kind !== "image")) {
+    if (!inbound || (inbound.agentText.trim().length === 0 && !hasContentWithoutText(inbound))) {
       await release(inbound?.media?.ref);
       return reply.code(200).send({ status: "ok" });
     }
+
+    // Audio is stored BEFORE the insert, because the row has to carry the path
+    // the worker will transcribe from. That ordering can orphan a file when the
+    // insert turns out to be a redelivery, so the dedupe branch below unlinks it.
+    const audioPath =
+      inbound.kind === "audio"
+        ? await storeInboundAudio(inbound, { config, channel, log: request.log })
+        : null;
+
+    // A voice note is persisted as 'text', not 'media'. Its transcript is a line
+    // the person spoke, not a caption under a photo count — and the media
+    // debounce window exists for photo bursts arriving in waves, which would
+    // make a single voice note wait 45s for an answer.
+    const persistedKind: MessageKind =
+      inbound.media && inbound.kind !== "audio" ? "media" : "text";
 
     // Persist BEFORE processing: the UNIQUE dedupe key absorbs the bridge's
     // outbox retries, and a crash before the agent runs is replayed on boot
@@ -169,19 +244,26 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
       agent_text: inbound.agentText,
       // Stored, not inferred later: a captioned photo's text IS the caption,
       // so nothing downstream could tell it apart from someone typing.
-      kind: inbound.media ? "media" : "text",
+      kind: persistedKind,
+      audio_path: audioPath,
     });
     if (!row) {
       // Redelivery of an event we already handled; its media went with the first
       // pass, so this copy is released rather than left behind.
       await release(inbound.media?.ref);
+      if (audioPath) {
+        // The first pass already stored this note and will transcribe it. This
+        // copy would otherwise sit in the audio directory forever, unreferenced.
+        await unlink(audioPath).catch(() => undefined);
+      }
       return reply.code(200).send({ status: "ok" });
     }
 
-    // Persist inbound media ONLY for owners (they ingest listings). Customers'
+    // Persist inbound PHOTOS only for owners (they ingest listings). Customers'
     // images are acknowledged in the agent context but never stored or served —
-    // and "never stored" still means a file to clean up.
-    if (inbound.media) {
+    // and "never stored" still means a file to clean up. Audio took its own path
+    // above, for both roles, and deliberately never reaches pending_media.
+    if (inbound.media && inbound.kind !== "audio") {
       if (roleFor(inbound.from) === "owner") {
         await storeInboundMedia(inbound, { config, db, channel, log: request.log });
       } else {
@@ -193,7 +275,7 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
     // worker. Only timer state is touched here, so the ACK stays fast. The media
     // flag comes from the parsed event — a photo burst needs a much longer
     // window than chat (see InboxBatcher).
-    batcher.schedule(row.phone, inbound.media ? "media" : "text");
+    batcher.schedule(row.phone, persistedKind);
 
     return reply.code(200).send({ status: "ok" });
   });

@@ -1,6 +1,7 @@
 import type { FastifyBaseLogger } from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  AUDIO_FALLBACK,
   buildBatchText,
   InboxBatcher,
   MAX_BATCH_ATTEMPTS,
@@ -598,5 +599,140 @@ describe("InboxBatcher", () => {
     expect(h.batcher.pendingPhones).toBe(0);
     expect(getInboxRow(h.db, id)?.status).toBe("pending"); // replayed on next boot
     h.db.close();
+  });
+});
+
+/**
+ * Voice notes become words on the WORKER, not in the webhook: the bridge's
+ * outbox is strictly sequential, so a speech API call in the handler stalls
+ * every message queued behind it.
+ */
+describe("voice notes", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * Close the burst and let it finish. One extra tick beyond the window,
+   * because transcription adds awaited work inside the queued flush that a
+   * text-only batch does not have.
+   */
+  async function settle(): Promise<void> {
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    await vi.advanceTimersByTimeAsync(0);
+  }
+
+  /** Persist a voice note the way the webhook does: no text, an audio path. */
+  function receiveVoice(h: Harness, phone: string, audioPath: string): number {
+    const row = insertInboxMessage(h.db, {
+      dedupe_key: `msg:${phone}:${Math.random()}`,
+      phone,
+      agent_text: "",
+      // 'text', not 'media' — a transcript is a spoken line, not a photo caption.
+      kind: "text",
+      audio_path: audioPath,
+    });
+    if (!row) throw new Error("insert failed");
+    h.batcher.schedule(phone, "text");
+    return row.id;
+  }
+
+  it("asks the agent the transcript, as if it had been typed", async () => {
+    const h = harness({
+      transcribeAudio: async () => "busco apartamento en Laureles",
+    });
+    receiveVoice(h, "573001", "/tmp/note.ogg");
+
+    await settle();
+
+    expect(h.turns).toHaveLength(1);
+    expect(h.turns[0]!.text).toBe("busco apartamento en Laureles");
+  });
+
+  // The crux of the original bug: an empty batch is settled `done` WITHOUT
+  // running the agent, so an untranscribable voice note would reproduce the
+  // silence this whole feature exists to end.
+  it("still answers when transcription fails, instead of going silent", async () => {
+    const h = harness({ transcribeAudio: async () => null });
+    receiveVoice(h, "573001", "/tmp/note.ogg");
+
+    await settle();
+
+    expect(h.turns).toHaveLength(1);
+    expect(h.turns[0]!.text).toBe(AUDIO_FALLBACK);
+  });
+
+  it("answers even when the transcriber throws", async () => {
+    const h = harness({
+      transcribeAudio: async () => {
+        throw new Error("provider down");
+      },
+    });
+    receiveVoice(h, "573001", "/tmp/note.ogg");
+
+    await settle();
+
+    expect(h.turns).toHaveLength(1);
+    expect(h.turns[0]!.text).toBe(AUDIO_FALLBACK);
+  });
+
+  it("answers when no transcription provider is configured at all", async () => {
+    const h = harness(); // no transcribeAudio dep
+    receiveVoice(h, "573001", "/tmp/note.ogg");
+
+    await settle();
+
+    expect(h.turns[0]!.text).toBe(AUDIO_FALLBACK);
+  });
+
+  // Batches retry up to MAX_BATCH_ATTEMPTS. Without the write-back, every
+  // attempt would re-upload and re-bill the same seconds of speech.
+  it("does NOT re-transcribe when a failed batch is retried", async () => {
+    let calls = 0;
+    let failTurn = true;
+    const h = harness({
+      transcribeAudio: async () => {
+        calls += 1;
+        return "hola";
+      },
+      onMessage: async (ctx, text) => {
+        h.turns.push({ phone: ctx.phone, role: ctx.role, text });
+        if (failTurn) {
+          failTurn = false;
+          throw new Error("agent blew up");
+        }
+      },
+    });
+    receiveVoice(h, "573001", "/tmp/note.ogg");
+
+    await settle();
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS + DEBOUNCE_MS);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(h.turns).toHaveLength(2);
+    expect(h.turns[1]!.text).toBe("hola");
+    expect(calls, "the retry paid to transcribe the same audio again").toBe(1);
+  });
+
+  it("persists the transcript so a replay after a crash reads words, not silence", async () => {
+    const h = harness({ transcribeAudio: async () => "el código es 1912" });
+    const id = receiveVoice(h, "573001", "/tmp/note.ogg");
+
+    await settle();
+
+    const row = h.db.prepare(`SELECT agent_text, audio_path FROM inbox WHERE id = ?`).get(id);
+    expect(row).toEqual({ agent_text: "el código es 1912", audio_path: null });
+  });
+
+  it("reads a transcript as its own line when a burst also carries photos", () => {
+    // A media row renders as a photo COUNT with its text treated as a caption
+    // grouped underneath. A transcript is neither, which is why audio rows are
+    // persisted as 'text'.
+    expect(buildBatchText([pic(), txt("busco algo en Laureles"), pic()])).toBe(
+      "(El usuario envió una foto)\nbusco algo en Laureles\n(El usuario envió una foto)",
+    );
   });
 });

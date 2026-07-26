@@ -357,6 +357,8 @@ export interface InboxRow {
   agent_text: string;
   /** What the event was, straight from the webhook — never re-derived from the text. */
   kind: MessageKind;
+  /** Set while a voice note still needs transcribing; null once agent_text holds it. */
+  audio_path: string | null;
   status: InboxStatus;
   attempts: number;
   received_at: string;
@@ -372,16 +374,37 @@ export interface InboxRow {
  */
 export function insertInboxMessage(
   db: DB,
-  input: { dedupe_key: string; phone: string; agent_text: string; kind?: MessageKind },
+  input: {
+    dedupe_key: string;
+    phone: string;
+    agent_text: string;
+    kind?: MessageKind;
+    audio_path?: string | null;
+  },
 ): InboxRow | null {
   const info = db
     .prepare(
-      `INSERT OR IGNORE INTO inbox (dedupe_key, phone, agent_text, kind)
-       VALUES (@dedupe_key, @phone, @agent_text, @kind)`,
+      `INSERT OR IGNORE INTO inbox (dedupe_key, phone, agent_text, kind, audio_path)
+       VALUES (@dedupe_key, @phone, @agent_text, @kind, @audio_path)`,
     )
-    .run({ kind: "text", ...input });
+    .run({ kind: "text", audio_path: null, ...input });
   if (info.changes === 0) return null;
   return getInboxRow(db, Number(info.lastInsertRowid));
+}
+
+/**
+ * Record a voice note's transcript and retire its audio.
+ *
+ * Both fields move together, in one statement, because they are the same fact:
+ * clearing audio_path is what marks the audio as already paid for. A batch that
+ * fails downstream is retried, and without this every retry would re-upload and
+ * re-bill the same seconds of speech.
+ */
+export function setInboxTranscript(db: DB, id: number, transcript: string): void {
+  db.prepare(`UPDATE inbox SET agent_text = @transcript, audio_path = NULL WHERE id = @id`).run({
+    id,
+    transcript,
+  });
 }
 
 export function getInboxRow(db: DB, id: number): InboxRow | null {

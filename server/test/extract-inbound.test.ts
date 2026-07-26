@@ -87,4 +87,38 @@ describe("extractInbound", () => {
     expect(inbound?.kind).toBe("other");
     expect(inbound?.id).toBe("3EB0ABC");
   });
+
+  describe("voice notes", () => {
+    it("maps audio to a media ref and carries no text of its own", () => {
+      const inbound = extractInbound({
+        ...base,
+        type: "audio",
+        text: "",
+        media: {
+          path: "/data/inbound/abc.bin",
+          filename: "audio.ogg",
+          contentType: "audio/ogg; codecs=opus",
+        },
+      });
+
+      expect(inbound?.kind).toBe("audio");
+      expect(inbound?.media?.ref).toBe("/data/inbound/abc.bin");
+      // The staged file is always .bin; this name is the only place the format
+      // survives, and the transcriber reads the format from it.
+      expect(inbound?.media?.filename).toBe("audio.ogg");
+      expect(inbound?.media?.contentType).toBe("audio/ogg; codecs=opus");
+      // WhatsApp has no caption field for audio. The transcript replaces this
+      // later, on the worker.
+      expect(inbound?.agentText).toBe("");
+    });
+
+    it("degrades to 'other' when the audio file never arrived", () => {
+      // Nothing is left to answer without the file, and surfacing a media block
+      // with no path would send an empty ref to downloadMedia.
+      const inbound = extractInbound({ ...base, type: "audio", text: "", media: {} });
+
+      expect(inbound?.kind).toBe("other");
+      expect(inbound?.media).toBeUndefined();
+    });
+  });
 });

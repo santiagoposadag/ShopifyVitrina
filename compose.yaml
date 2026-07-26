@@ -54,6 +54,16 @@ services:
       # DeepSeek's reasoning effort. Validated at boot, so a malformed value
       # fails the container instead of silently doing nothing.
       AGENT_EXTRA_BODY: ${AGENT_EXTRA_BODY:-}
+      # Speech to text for inbound voice notes. Neither Claude nor DeepSeek
+      # accepts audio, so without a key here a voice note is answered with a
+      # request to write instead — never silence. OpenAI-shaped endpoint, so
+      # Groq/OpenAI/anything compatible is a URL change.
+      TRANSCRIPTION_API_KEY: ${TRANSCRIPTION_API_KEY:-}
+      TRANSCRIPTION_BASE_URL: ${TRANSCRIPTION_BASE_URL:-}
+      TRANSCRIPTION_MODEL: ${TRANSCRIPTION_MODEL:-}
+      # Inside the shared volume but OUTSIDE /data/media, which is served
+      # publicly at /media. A voice note is private speech.
+      AUDIO_DIR: /data/audio
       # Cost/abuse protection and session lifetime. Empty values fall back to
       # the defaults in server/src/config.ts (20/hour, 500/day, 7 days).
       RATE_LIMIT_PER_PHONE_PER_HOUR: ${RATE_LIMIT_PER_PHONE_PER_HOUR:-}

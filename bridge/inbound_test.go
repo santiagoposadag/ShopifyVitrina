@@ -164,3 +164,31 @@ func TestDigitsOnlyMatchesTheServersNormalisation(t *testing.T) {
 		}
 	}
 }
+
+func TestAudioFilenameCarriesAFormatTheTranscriberCanRead(t *testing.T) {
+	// The staged file is always <random>.bin, so this name is the ONLY place the
+	// format survives the trip. Speech-to-text APIs take the file as a multipart
+	// upload and reject or misread one whose name says nothing about its format,
+	// so a wrong answer here is a voice note that silently fails to transcribe.
+	cases := map[string]string{
+		// What WhatsApp actually sends for a voice note, parameters and all.
+		"audio/ogg; codecs=opus": "audio.ogg",
+		"audio/ogg":              "audio.ogg",
+		"AUDIO/OGG":              "audio.ogg",
+		"audio/mpeg":             "audio.mp3",
+		"audio/mp4":              "audio.m4a",
+		"audio/x-m4a":            "audio.m4a",
+		"audio/wav":              "audio.wav",
+		"audio/webm":             "audio.webm",
+		"audio/flac":             "audio.flac",
+		// Unknown and empty fall back to Ogg rather than to no extension:
+		// anything unrecognised here is far likelier to be a voice note than not.
+		"application/octet-stream": "audio.ogg",
+		"":                         "audio.ogg",
+	}
+	for in, want := range cases {
+		if got := audioFilename(in); got != want {
+			t.Errorf("audioFilename(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
