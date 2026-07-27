@@ -57,8 +57,18 @@ GitHub repo**. No server, no SaaS.
 | Secret | gopass path |
 |--------|-------------|
 | `ANTHROPIC_API_KEY` | `vitrina/anthropic_api_key` |
+| `ANTHROPIC_AUTH_TOKEN` | `vitrina/deepseek_api_key` (loaded by `--profile deepseek`) |
 | `BRIDGE_WEBHOOK_SECRET` | `vitrina/bridge_webhook_secret` |
 | `BRIDGE_API_TOKEN` | `vitrina/bridge_api_token` |
+| `TRANSCRIPTION_API_KEY` | `vitrina/transcription_api_key`, falling back to `vitrina/groq_api_key` |
+
+> The provider credentials are mutually exclusive: `with-secrets.sh --profile`
+> exports one and unsets the other, so the SDK never sees two credentials for one
+> endpoint. See [provider-swap.md](./provider-swap.md).
+>
+> `TRANSCRIPTION_API_KEY` is the only **optional** entry — a missing one does not
+> fail the run, it just means voice notes are answered with a request to write.
+> See [voice-notes.md](./voice-notes.md).
 
 > The `vitrina/kapso_*` entries are obsolete — Kapso was dropped in favour of the
 > whatsmeow bridge. Leave them in the vault or `gopass rm` them; nothing reads

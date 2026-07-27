@@ -71,6 +71,16 @@ To stay on Anthropic instead, leave all five unset (the defaults are Anthropic +
 
 `NEXT_PUBLIC_*` are inlined by Next.js at **build** time. In Coolify they must be set as build variables, and changing them later requires a **rebuild of the web image**, not a restart.
 
+### Voice notes
+
+| Variable | Notes |
+| --- | --- |
+| `TRANSCRIPTION_API_KEY` | Groq (or any OpenAI-shaped `/audio/transcriptions` endpoint). **Optional** — unset, voice notes are answered with a request to write rather than silence. |
+| `TRANSCRIPTION_BASE_URL` | Defaults to `https://api.groq.com/openai/v1` |
+| `TRANSCRIPTION_MODEL` | Defaults to `whisper-large-v3-turbo` |
+
+`AUDIO_DIR` is set by compose to `/data/audio` — inside the existing `vitrina-data` volume, but **outside** the publicly served `/data/media`. Do not set it yourself. See [voice-notes.md](./voice-notes.md).
+
 ### Optional — all have working defaults
 
 `RATE_LIMIT_PER_PHONE_PER_HOUR` (20) · `RATE_LIMIT_GLOBAL_PER_DAY` (500) · `SESSION_MAX_AGE_DAYS` (7) · `CUSTOMER_AGENT_ENABLED` (true) · `BATCH_DEBOUNCE_MS` (8000) · `BATCH_MAX_WAIT_MS` (45000) · `BATCH_MEDIA_DEBOUNCE_MS` (45000) · `BATCH_MEDIA_MAX_WAIT_MS` (120000)
