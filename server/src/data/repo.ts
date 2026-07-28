@@ -40,42 +40,242 @@ export interface SearchFilters {
   max_price?: number;
   bedrooms?: number;
   neighborhood?: string;
+  /** Relevance floor, 0..1. Defaults to DEFAULT_MIN_SCORE. */
+  min_score?: number;
 }
 
-/** Search ACTIVE products only, applying simple filters. */
-export function searchCatalog(db: DB, filters: SearchFilters): Product[] {
+/** A product the search kept, with how well its text answered the request. */
+export interface SearchHit {
+  product: Product;
+  score: number;
+}
+
+/**
+ * How much of what was asked for a listing must account for to come back at all.
+ *
+ * A floor rather than a cutoff the caller tunes per question: the agent decides
+ * which of the survivors to show, but it does not get to widen its own search
+ * until something appears. Empty means empty — we have nothing like that.
+ */
+export const DEFAULT_MIN_SCORE = 0.6;
+
+/** Above this, the text answered the request rather than merely resembling it. */
+export const CONFIDENT_MATCH_SCORE = 0.8;
+
+const MAX_RESULTS = 10;
+
+/** Below this length a word is too short for an edit-distance guess to mean anything. */
+const FUZZY_MIN_LENGTH = 4;
+const FUZZY_MIN_RATIO = 0.8;
+const FUZZY_SCORE = 0.8;
+
+/**
+ * Spanish function words. They carry no information about a property, and left
+ * in they would drag every score down by the length of the sentence: "casa en
+ * llano grande" would cap at 3/4 even with a perfect match.
+ */
+const STOPWORDS = new Set([
+  "a", "al", "algun", "alguna", "algunas", "alguno", "algunos", "con", "cual", "cuales", "de",
+  "del", "el", "en", "es", "esta", "hay", "la", "las", "lo", "los", "me", "mi", "o", "para", "por",
+  "que", "se", "si", "sin", "su", "sus", "tenemos", "tiene", "tienen", "un", "una", "unas", "unos",
+  "y",
+
+  // Not grammar — these name the catalog itself. Every listing is a propiedad
+  // and every question is someone buscando one, so the words cannot tell two
+  // listings apart, and counting them as misses punishes the natural way of
+  // asking: "¿Tenemos alguna propiedad en Llano Grande?" would cap at 2/3 and
+  // trip the approximate-match warning over an exact answer.
+  "algo", "busca", "buscamos", "buscando", "busco", "disponible", "disponibles", "inmueble",
+  "inmuebles", "necesito", "propiedad", "propiedades", "quiero",
+]);
+
+/** Lowercase, unaccented, punctuation-free. Applied to BOTH sides of every comparison. */
+function normalize(value: string): string {
+  return value
+    .normalize("NFD")
+    // Strip the combining marks NFD just split off. Doing it BEFORE the
+    // punctuation pass matters: left in, an accent would become a space and
+    // "belen" would arrive as two words.
+    .replace(/\p{Mn}/gu, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function tokenize(value: string): string[] {
+  if (!value) return [];
+  return normalize(value)
+    .split(" ")
+    .filter((token) => token.length > 0 && !STOPWORDS.has(token));
+}
+
+/**
+ * The structured attributes, said the way a person would say them.
+ *
+ * Nobody asks for "un apartamento" — they ask for "un apartamento de 3 alcobas
+ * en Laureles". Bedrooms is a number in a column, so without this the words
+ * "3 alcobas" are two guaranteed misses that drag the score of the listing that
+ * actually answers the question below the floor. Both Colombian words for a
+ * bedroom are emitted because both get typed; this is verbalizing one field,
+ * not a synonym table.
+ *
+ * Booleans are emitted only when true: a listing without an elevator must not
+ * answer to "ascensor".
+ */
+function attributeText(a: ProductAttributes): string {
+  const parts: string[] = [];
+  if (a.bedrooms != null) parts.push(`${a.bedrooms} alcobas habitaciones`);
+  if (a.bathrooms != null) parts.push(`${a.bathrooms} banos`);
+  if (a.area_m2 != null) parts.push(`${a.area_m2} m2 metros`);
+  if (a.lot_m2 != null) parts.push(`${a.lot_m2} lote`);
+  if (a.levels != null) parts.push(`${a.levels} niveles`);
+  if (a.floor != null) parts.push(`piso ${a.floor}`);
+  if (a.estrato != null) parts.push(`estrato ${a.estrato}`);
+  if (a.elevator) parts.push("ascensor");
+  return parts.join(" ");
+}
+
+/**
+ * Every word of a product's text, PLUS every adjacent pair glued together.
+ *
+ * The pairs are what make word boundaries stop mattering in either direction:
+ * a search for "llanogrande" finds a listing that says "Llano Grande", and a
+ * search for "llano grande" finds one that says "Llanogrande" because each
+ * token is contained in that single word. Gluing the whole haystack instead
+ * would invent matches across unrelated words ("piso rojo" would answer to
+ * "oro"), so the joins stay pairwise.
+ */
+function wordsAndPairs(raw: string): string[] {
+  const words = normalize(raw).split(" ").filter(Boolean);
+  const pairs = words.slice(0, -1).map((word, i) => word + words[i + 1]);
+  return [...words, ...pairs];
+}
+
+function haystackFor(p: Product): string[] {
+  return wordsAndPairs(
+    [
+      p.title,
+      p.description ?? "",
+      p.code,
+      p.attributes.neighborhood ?? "",
+      p.attributes.city ?? "",
+      (p.attributes.features ?? []).join(" "),
+      attributeText(p.attributes),
+    ].join(" "),
+  );
+}
+
+/** The location fields alone — the tie-break haystack, see searchCatalog. */
+function locationHaystackFor(p: Product): string[] {
+  return wordsAndPairs(`${p.attributes.neighborhood ?? ""} ${p.attributes.city ?? ""}`);
+}
+
+/**
+ * Standard Levenshtein, two rows. Only ever runs on single words.
+ *
+ * Every `?? 0` below is unreachable — both rows are built to length b.length+1
+ * and every index is bounded by its loop — but noUncheckedIndexedAccess cannot
+ * see that, and a fallback reads better here than an assertion.
+ */
+function editDistance(a: string, b: string): number {
+  let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
+
+  for (let i = 1; i <= a.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j++) {
+      const substitute = (previous[j - 1] ?? 0) + (a[i - 1] === b[j - 1] ? 0 : 1);
+      const insert = (current[j - 1] ?? 0) + 1;
+      const remove = (previous[j] ?? 0) + 1;
+      current.push(Math.min(substitute, insert, remove));
+    }
+    previous = current;
+  }
+  return previous[b.length] ?? 0;
+}
+
+/** 1 for a contained word, FUZZY_SCORE for a probable typo, 0 for a miss. */
+function scoreToken(token: string, haystack: string[]): number {
+  // A number is a value, not a word fragment: "3 alcobas" must not be answered
+  // by an area of 230 m². Exact word only, and never fuzzy — a mistyped number
+  // is a different number, not a misspelling.
+  if (/^\d+$/.test(token)) return haystack.includes(token) ? 1 : 0;
+
+  if (haystack.some((word) => word.includes(token))) return 1;
+  if (token.length < FUZZY_MIN_LENGTH) return 0;
+
+  for (const word of haystack) {
+    // A word that differs in length by more than a couple of characters is a
+    // different word, not a misspelling — and skipping it keeps the glued
+    // pairs from fuzzy-matching short tokens.
+    if (Math.abs(word.length - token.length) > 2) continue;
+    const ratio = 1 - editDistance(token, word) / Math.max(token.length, word.length);
+    if (ratio >= FUZZY_MIN_RATIO) return FUZZY_SCORE;
+  }
+  return 0;
+}
+
+/**
+ * Search ACTIVE products, ranked by how much of the request each one answers.
+ *
+ * Two kinds of filter, deliberately not treated alike:
+ *
+ * - price and bedrooms EXCLUDE. They are constraints someone stated, not
+ *   preferences to weigh: a listing at five times the budget is not a partial
+ *   match, it is the wrong property, and surfacing it "because it scored well
+ *   on text" wastes the customer's time.
+ * - `query` and `neighborhood` SCORE. Both are prose, both arrive however the
+ *   person happened to say it, and neither should ever be the reason a real
+ *   listing goes unmentioned. They share one token bag against one haystack:
+ *   in real estate a sector named in the description ("cerca de Laureles") is
+ *   genuine signal, and the agent is the one judging relevance anyway.
+ */
+export function searchCatalog(db: DB, filters: SearchFilters): SearchHit[] {
   const rows = db
     .prepare(`SELECT * FROM products WHERE status = 'active' ORDER BY updated_at DESC`)
     .all() as ProductRow[];
 
-  const q = filters.query?.toLowerCase().trim();
-  const neighborhood = filters.neighborhood?.toLowerCase().trim();
+  const tokens = [...tokenize(filters.query ?? ""), ...tokenize(filters.neighborhood ?? "")];
+  const minScore = filters.min_score ?? DEFAULT_MIN_SCORE;
 
-  return rows.map(rowToProduct).filter((p) => {
-    if (filters.min_price !== undefined && (p.price ?? 0) < filters.min_price) return false;
-    if (filters.max_price !== undefined && (p.price ?? Number.MAX_SAFE_INTEGER) > filters.max_price)
-      return false;
-    if (filters.bedrooms !== undefined && (p.attributes.bedrooms ?? -1) < filters.bedrooms)
-      return false;
-    if (neighborhood) {
-      const hay = `${p.attributes.neighborhood ?? ""} ${p.attributes.city ?? ""}`.toLowerCase();
-      if (!hay.includes(neighborhood)) return false;
+  const hits: (SearchHit & { locationScore: number })[] = [];
+  for (const row of rows) {
+    const product = rowToProduct(row);
+
+    if (filters.min_price !== undefined && (product.price ?? 0) < filters.min_price) continue;
+    if (
+      filters.max_price !== undefined &&
+      (product.price ?? Number.MAX_SAFE_INTEGER) > filters.max_price
+    )
+      continue;
+    if (filters.bedrooms !== undefined && (product.attributes.bedrooms ?? -1) < filters.bedrooms)
+      continue;
+
+    // No text asked for means every survivor answers the request equally.
+    if (tokens.length === 0) {
+      hits.push({ product, score: 1, locationScore: 0 });
+      continue;
     }
-    if (q) {
-      const hay = [
-        p.title,
-        p.description ?? "",
-        p.code,
-        p.attributes.neighborhood ?? "",
-        p.attributes.city ?? "",
-        (p.attributes.features ?? []).join(" "),
-      ]
-        .join(" ")
-        .toLowerCase();
-      if (!hay.includes(q)) return false;
-    }
-    return true;
-  });
+
+    const scoreAgainst = (haystack: string[]): number =>
+      tokens.reduce((sum, token) => sum + scoreToken(token, haystack), 0) / tokens.length;
+
+    const score = scoreAgainst(haystackFor(product));
+    if (score < minScore) continue;
+    hits.push({ product, score, locationScore: scoreAgainst(locationHaystackFor(product)) });
+  }
+
+  // The tie-break exists because a description that cross-references a sector
+  // ("a 7 minutos de Jardines de Llanogrande") scores exactly as high as the
+  // listing that IS in it, and both deserve to come back. Which one leads is
+  // then decided by where the words were found: the structured field beats a
+  // passing mention. Without it, the answer to "¿tienen algo en Llanogrande?"
+  // would open with the neighbouring house whenever that one was edited more
+  // recently — sort is stable, so equal ranks keep the SQL order and the only
+  // signal left is updated_at.
+  return hits
+    .sort((a, b) => b.score - a.score || b.locationScore - a.locationScore)
+    .slice(0, MAX_RESULTS)
+    .map(({ product, score }) => ({ product, score }));
 }
 
 export function getProductByCode(db: DB, code: string): Product | undefined {

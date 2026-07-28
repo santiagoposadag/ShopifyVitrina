@@ -174,17 +174,15 @@ describe.skipIf(!LIVE)("agentic loop parity", () => {
       const reply = sent.join("\n");
       console.log(`[live] reply: ${reply}`);
       expect(sent.length).toBeGreaterThan(0);
-      // KNOWN RED ON EVERY PROVIDER, including Anthropic — do NOT read a failure
-      // here as a provider verdict. search_catalog's description advertises
-      // "free-text search", but repo.searchCatalog substring-matches the whole
-      // `query` string, so a natural-language phrase like "apartamento 3 alcobas
-      // Laureles" matches nothing while `neighborhood`+`bedrooms` matches fine.
-      // Whether a model happens to fill structured filters instead of a prose
-      // query decides this, which makes it a coin toss rather than a parity
-      // signal. See docs/provider-swap.md.
+      // This used to be a known red on every provider: repo.searchCatalog
+      // substring-matched the whole `query`, so the prose phrasing found
+      // nothing while `neighborhood`+`bedrooms` found the listing, and the test
+      // measured which shape the model happened to pick rather than the
+      // provider. Scoring closed that gap — both shapes now score this listing
+      // 1.0 (see catalog.test.ts) — so a failure here IS a real signal again.
       expect(
         reply,
-        "no listing was surfaced. Root cause is usually search_catalog's substring-matched `query`, NOT the provider — compare against the Anthropic baseline before blaming the swap.",
+        "no listing was surfaced. search_catalog answers both the prose and the structured shape of this question, so suspect the provider or the prompt, not the search.",
       ).toContain("1912");
     });
 

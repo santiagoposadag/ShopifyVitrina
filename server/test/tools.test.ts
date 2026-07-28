@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { Config } from "../src/config.js";
 import { openDb } from "../src/data/db.js";
-import { buildToolServer, isPublishTransition, MCP_SERVER_NAME } from "../src/agent/tools.js";
-import type { Role } from "../src/types.js";
+import {
+  buildToolServer,
+  isPublishTransition,
+  MCP_SERVER_NAME,
+  renderSearchHits,
+} from "../src/agent/tools.js";
+import type { SearchHit } from "../src/data/repo.js";
+import type { Product, Role } from "../src/types.js";
 
 const CUSTOMER_TOOLS = ["search_catalog", "get_product", "save_lead"];
 const OWNER_ONLY_TOOLS = ["upsert_product", "attach_pending_photos", "list_products", "list_leads"];
@@ -42,6 +48,53 @@ describe("buildToolServer privilege boundary", () => {
     for (const role of ["customer", "owner"] as const) {
       expect(toolNamesFor(role)).not.toContain("send_product_photos");
     }
+  });
+});
+
+// search_catalog now answers with approximate matches, which is only safe if
+// the agent can tell a hit from a near-miss. These pin the two things that make
+// that possible: the score reaches the model, and a weak result set arrives
+// labelled as weak.
+describe("renderSearchHits", () => {
+  const config = { storefrontBaseUrl: "http://x" } as Config;
+
+  function hit(code: string, score: number): SearchHit {
+    return {
+      product: {
+        id: 1,
+        code,
+        title: `Casa ${code}`,
+        description: null,
+        price: 100,
+        currency: "COP",
+        status: "active",
+        attributes: {},
+        created_at: "",
+        updated_at: "",
+      } as Product,
+      score,
+    };
+  }
+
+  it("tells the agent to capture a lead when nothing matched", () => {
+    expect(renderSearchHits(config, [])).toContain("lead");
+  });
+
+  it("puts the match percentage on every line", () => {
+    const out = renderSearchHits(config, [hit("916", 1), hit("1912", 0.75)]);
+    expect(out).toContain("match=100%");
+    expect(out).toContain("match=75%");
+    expect(out).toContain("link=http://x/propiedad/916");
+  });
+
+  it("warns when even the best result is only approximate", () => {
+    const out = renderSearchHits(config, [hit("916", 0.6)]);
+    expect(out).toContain("APPROXIMATE");
+  });
+
+  it("stays quiet when the top result is a confident match", () => {
+    const out = renderSearchHits(config, [hit("916", 1), hit("1912", 0.6)]);
+    expect(out).not.toContain("APPROXIMATE");
   });
 });
 
