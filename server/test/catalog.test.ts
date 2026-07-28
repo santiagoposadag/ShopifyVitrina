@@ -6,6 +6,7 @@ import {
   getProductByCode,
   insertLead,
   listLeads,
+  listProducts,
   searchCatalog,
   type SearchHit,
   upsertProduct,
@@ -56,6 +57,19 @@ function seed(db: DB): void {
   upsertProduct(
     db,
     { code: "999", title: "Borrador", price: 100_000_000, status: "draft", attributes: { bedrooms: 2 } },
+    null,
+  );
+  // Unpublished, and in the same sector as 0195. Invisible to searchCatalog by
+  // design — and the reason list_products needed the sector filter, since the
+  // owner asking "¿tenemos algo en Llano Grande?" means this one too.
+  upsertProduct(
+    db,
+    {
+      code: "0200",
+      title: "Lote en Llanogrande",
+      status: "draft",
+      attributes: { neighborhood: "Llanogrande" },
+    },
     null,
   );
 }
@@ -251,6 +265,52 @@ describe("searchCatalog ranking between equally-scored listings", () => {
     // them — the sector living in the structured field is.
     expect(results[0]?.score).toBe(1);
     expect(results[1]?.score).toBe(1);
+  });
+});
+
+// The owner asked "¿tenemos alguna propiedad en Llano Grande?" and the agent
+// answered "no" after three list_products calls by status, because that was the
+// only tool spanning statuses and it had no sector filter. The improvisation was
+// the symptom; the missing capability was the bug.
+describe("listProducts", () => {
+  let db: DB;
+  beforeEach(() => {
+    db = openDb(":memory:");
+    seed(db);
+  });
+
+  it("returns every product in every status when nothing is asked", () => {
+    expect(codes(listProducts(db)).sort()).toEqual(["0195", "0200", "1912", "916", "999"]);
+  });
+
+  it("filters by status", () => {
+    expect(codes(listProducts(db, { status: "draft" })).sort()).toEqual(["0200", "999"]);
+  });
+
+  it("finds an unpublished listing by sector — the answer search_catalog cannot give", () => {
+    expect(codes(listProducts(db, { neighborhood: "Llano Grande" })).sort()).toEqual([
+      "0195",
+      "0200",
+    ]);
+    // The boundary that makes the above safe: the draft stays invisible to the
+    // customer-facing search, whose data is reviewed by definition.
+    expect(codes(searchCatalog(db, { neighborhood: "Llano Grande" }))).toEqual(["0195"]);
+  });
+
+  it("combines a status with a sector", () => {
+    expect(codes(listProducts(db, { status: "draft", neighborhood: "Llano Grande" }))).toEqual([
+      "0200",
+    ]);
+  });
+
+  // A truncated report is a lie the owner cannot see: "¿qué tengo publicado?"
+  // answered with 10 of 30 reads as a complete inventory.
+  it("does not cap a report the way a customer search is capped", () => {
+    for (let i = 0; i < 15; i++) {
+      upsertProduct(db, { code: `cap-${i}`, title: "Casa", status: "active" }, null);
+    }
+    expect(listProducts(db).length).toBe(20);
+    expect(searchCatalog(db, {})).toHaveLength(10);
   });
 });
 

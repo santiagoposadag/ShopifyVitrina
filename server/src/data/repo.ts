@@ -42,6 +42,13 @@ export interface SearchFilters {
   neighborhood?: string;
   /** Relevance floor, 0..1. Defaults to DEFAULT_MIN_SCORE. */
   min_score?: number;
+  /** Cap on results. Uncapped when absent — only the customer search sets one. */
+  limit?: number;
+}
+
+/** SearchFilters plus the status axis, which only the owner's report has. */
+export interface ListFilters extends SearchFilters {
+  status?: ProductStatus;
 }
 
 /** A product the search kept, with how well its text answered the request. */
@@ -62,7 +69,13 @@ export const DEFAULT_MIN_SCORE = 0.6;
 /** Above this, the text answered the request rather than merely resembling it. */
 export const CONFIDENT_MATCH_SCORE = 0.8;
 
-const MAX_RESULTS = 10;
+/**
+ * Cap on what a CUSTOMER search returns, so a large catalog cannot flood the
+ * turn. Deliberately not applied to the owner's report: an inventory answered
+ * with 10 of 30 rows reads as the whole inventory, and nothing on screen says
+ * otherwise.
+ */
+const MAX_SEARCH_RESULTS = 10;
 
 /** Below this length a word is too short for an edit-distance guess to mean anything. */
 const FUZZY_MIN_LENGTH = 4;
@@ -215,7 +228,7 @@ function scoreToken(token: string, haystack: string[]): number {
 }
 
 /**
- * Search ACTIVE products, ranked by how much of the request each one answers.
+ * Rank an already-fetched set by how much of the request each product answers.
  *
  * Two kinds of filter, deliberately not treated alike:
  *
@@ -228,19 +241,17 @@ function scoreToken(token: string, haystack: string[]): number {
  *   listing goes unmentioned. They share one token bag against one haystack:
  *   in real estate a sector named in the description ("cerca de Laureles") is
  *   genuine signal, and the agent is the one judging relevance anyway.
+ *
+ * Kept separate from the queries so the customer search and the owner report
+ * rank identically — the ONLY difference between them is which rows they fetch
+ * and how many they keep.
  */
-export function searchCatalog(db: DB, filters: SearchFilters): SearchHit[] {
-  const rows = db
-    .prepare(`SELECT * FROM products WHERE status = 'active' ORDER BY updated_at DESC`)
-    .all() as ProductRow[];
-
+export function rankProducts(products: Product[], filters: SearchFilters): SearchHit[] {
   const tokens = [...tokenize(filters.query ?? ""), ...tokenize(filters.neighborhood ?? "")];
   const minScore = filters.min_score ?? DEFAULT_MIN_SCORE;
 
   const hits: (SearchHit & { locationScore: number })[] = [];
-  for (const row of rows) {
-    const product = rowToProduct(row);
-
+  for (const product of products) {
     if (filters.min_price !== undefined && (product.price ?? 0) < filters.min_price) continue;
     if (
       filters.max_price !== undefined &&
@@ -274,8 +285,20 @@ export function searchCatalog(db: DB, filters: SearchFilters): SearchHit[] {
   // signal left is updated_at.
   return hits
     .sort((a, b) => b.score - a.score || b.locationScore - a.locationScore)
-    .slice(0, MAX_RESULTS)
+    .slice(0, filters.limit ?? Number.POSITIVE_INFINITY)
     .map(({ product, score }) => ({ product, score }));
+}
+
+/** Search ACTIVE products only — the customer-facing catalog. */
+export function searchCatalog(db: DB, filters: SearchFilters): SearchHit[] {
+  const rows = db
+    .prepare(`SELECT * FROM products WHERE status = 'active' ORDER BY updated_at DESC`)
+    .all() as ProductRow[];
+
+  return rankProducts(rows.map(rowToProduct), {
+    ...filters,
+    limit: filters.limit ?? MAX_SEARCH_RESULTS,
+  });
 }
 
 export function getProductByCode(db: DB, code: string): Product | undefined {
@@ -285,13 +308,35 @@ export function getProductByCode(db: DB, code: string): Product | undefined {
   return row ? rowToProduct(row) : undefined;
 }
 
-export function listProducts(db: DB, status?: ProductStatus): Product[] {
+/**
+ * The owner's inventory report: every status, and the same text ranking the
+ * customer search uses.
+ *
+ * The text filters are here because without them the owner's most natural
+ * question had no tool at all. "¿Tenemos algo en Llano Grande?" spans statuses —
+ * a draft in that sector is still something they have — and searchCatalog can
+ * never answer it, since it only sees active listings. Asked that question the
+ * agent reached for the one tool that crossed statuses, called it three times by
+ * status with no sector filter, and reported absence from three answers that had
+ * never looked.
+ *
+ * Safe to show drafts here ONLY because this tool is owner-only (pinned in
+ * test/tools.test.ts). A draft's facts are unreviewed and must never reach a
+ * customer, which is why the equivalent shortcut — giving searchCatalog a status
+ * parameter — was rejected: it would move that boundary from the tool SET, where
+ * it is structural, to an argument the model fills.
+ */
+export function listProducts(db: DB, filters: ListFilters = {}): SearchHit[] {
   const rows = (
-    status
-      ? db.prepare(`SELECT * FROM products WHERE status = ? ORDER BY updated_at DESC`).all(status)
+    filters.status
+      ? db
+          .prepare(`SELECT * FROM products WHERE status = ? ORDER BY updated_at DESC`)
+          .all(filters.status)
       : db.prepare(`SELECT * FROM products ORDER BY updated_at DESC`).all()
   ) as ProductRow[];
-  return rows.map(rowToProduct);
+
+  // No limit: see MAX_SEARCH_RESULTS.
+  return rankProducts(rows.map(rowToProduct), filters);
 }
 
 export function getProductPhotos(db: DB, productId: number): ProductPhoto[] {
