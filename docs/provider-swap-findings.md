@@ -134,6 +134,8 @@ The SDK under-reports **cache-write** tokens: `modelUsage` surfaced 101,752, whi
 
 A customer asking naturally can be told "no tenemos nada" about a property that exists, whenever the model fills the prose `query` instead of structured filters. **This reproduces on Anthropic**, is pre-existing, and was deliberately left unfixed here — fixing it changes production search behaviour and belongs in its own change.
 
+> **Resolved since.** It did bite in production first: an owner asked for "Llano Grande" and was told there was nothing, over a listing stored as "Llanogrande". `repo.searchCatalog` now scores relevance per word instead of matching the whole string, and both shapes of the question above return `1912` at 100%. See `server/test/catalog.test.ts`.
+
 ---
 
 ## Recommendation
