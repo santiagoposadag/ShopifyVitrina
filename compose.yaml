@@ -61,6 +61,10 @@ services:
       TRANSCRIPTION_API_KEY: ${TRANSCRIPTION_API_KEY:-}
       TRANSCRIPTION_BASE_URL: ${TRANSCRIPTION_BASE_URL:-}
       TRANSCRIPTION_MODEL: ${TRANSCRIPTION_MODEL:-}
+      # Forwarded because docs/voice-notes.md documents it as the per-message
+      # cost bound. Left out of this list it is not a default, it is a knob that
+      # silently does nothing in every containerised deploy.
+      TRANSCRIPTION_MAX_BYTES: ${TRANSCRIPTION_MAX_BYTES:-}
       # Inside the shared volume but OUTSIDE /data/media, which is served
       # publicly at /media. A voice note is private speech.
       AUDIO_DIR: /data/audio

@@ -1,10 +1,20 @@
-# Deploying this branch to Coolify — the delta from `main`
+# Deploying to Coolify
 
-What is additional relative to what `main` already has deployed.
-
-> **Read this first.** `main` contains **no `compose.yaml`, no Dockerfiles, and no `bridge/` directory.** Whatever is running from `main` was not deployed through this stack. So this is not "add a few variables to the provider swap" — this branch introduces the whole containerised deployment, replaces the WhatsApp transport, and adds a new service that must be paired by hand with a phone in reach.
+> **Sections 1 and 4 have already happened.** They described the one-time move off Kapso onto the containerised stack, and `main` now carries `compose.yaml`, the three Dockerfiles and `bridge/`. They are kept as the record of how the deployment got its shape — read them to understand why the bridge exists and why its volume is the one that matters, not as steps to perform. **Sections 2, 3 and 5 stay live** and are what a deploy is checked against.
 >
-> The provider swap (Anthropic → DeepSeek) is the small part. The WhatsApp transport change is the risky part.
+> For an existing deployment, the only thing a new merge asks of you is §2: whether it introduces a variable Coolify does not have yet.
+
+## Voice notes: what a deploy needs
+
+The transcription variables in §2 are **optional**. With none of them set the deploy boots fine and a voice note is answered with a request to write instead — the feature is inert, nothing breaks.
+
+Three things that are handled and need no action:
+
+- **Schema.** `openDb` runs an idempotent `ALTER TABLE inbox ADD COLUMN audio_path` at boot (`server/src/data/db.ts`), so a live database migrates itself on the first start.
+- **Storage.** `AUDIO_DIR=/data/audio` lives inside the existing `vitrina-data` volume. No new volume.
+- **Exposure.** The storefront's `/media/[file]` route resolves `basename()` inside `MEDIA_DIR` only, so nothing under `/data/audio` is reachable over HTTP.
+
+One thing that does need attention: **voice notes changed `bridge/inbound.go`.** The bridge had no `AudioMessage` case, which is where a voice note was first dropped. Its image must be **rebuilt**, not restarted — a cached bridge image with a rebuilt server produces a deploy where transcription is configured, the logs are clean, and audio still never arrives.
 
 ---
 
@@ -78,8 +88,11 @@ To stay on Anthropic instead, leave all five unset (the defaults are Anthropic +
 | `TRANSCRIPTION_API_KEY` | Groq (or any OpenAI-shaped `/audio/transcriptions` endpoint). **Optional** — unset, voice notes are answered with a request to write rather than silence. |
 | `TRANSCRIPTION_BASE_URL` | Defaults to `https://api.groq.com/openai/v1` |
 | `TRANSCRIPTION_MODEL` | Defaults to `whisper-large-v3-turbo` |
+| `TRANSCRIPTION_MAX_BYTES` | Defaults to `26214400` (25 MB). Larger audio is skipped rather than billed. Bounds cost per message; it is **not** a rate limiter — transcription runs before the per-phone limiter. |
 
 `AUDIO_DIR` is set by compose to `/data/audio` — inside the existing `vitrina-data` volume, but **outside** the publicly served `/data/media`. Do not set it yourself. See [voice-notes.md](./voice-notes.md).
+
+Catalog search needs **no variables at all**: the relevance scoring, its floor and the result caps are constants in `server/src/data/repo.ts`, deliberately not configuration. A relevance threshold that can be tuned per deploy is a threshold nobody can reason about from the code.
 
 ### Optional — all have working defaults
 
