@@ -11,25 +11,29 @@ export default function HomePage() {
 
   return (
     <div>
-      <section className="bg-gradient-to-b from-white to-slate-50">
-        <div className="mx-auto flex max-w-6xl flex-col items-start gap-6 px-4 py-20">
-          <span className="rounded-full bg-slate-900 px-3 py-1 text-xs font-medium text-white">
-            {BRAND_NAME}
-          </span>
-          <h1 className="max-w-2xl text-4xl font-bold tracking-tight text-slate-900 sm:text-5xl">
+      <section className="relative bg-[url('/hero.jpeg')] bg-cover bg-center">
+        <div className="absolute inset-0 bg-[rgba(7,65,29,0.45)] mix-blend-multiply" />
+        <div className="relative mx-auto flex min-h-[60vh] max-w-6xl flex-col items-center justify-center gap-6 px-4 py-20 text-center text-white">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src="/logo.png"
+            alt={BRAND_NAME}
+            className="w-48 rounded-card border-2 border-accent bg-brand p-2"
+          />
+          <h1 className="max-w-2xl font-heading text-4xl font-bold tracking-tight sm:text-5xl">
             Encontrá tu próxima propiedad y hablá con nosotros por WhatsApp.
           </h1>
-          <p className="max-w-xl text-lg text-slate-600">
+          <p className="max-w-xl text-lg text-white/90">
             Explorá nuestro catálogo actualizado. Cuando algo te guste, escribinos directo por
             WhatsApp con el código de la propiedad y te atendemos al instante.
           </p>
-          <div className="flex flex-wrap items-center gap-3">
+          <div className="flex flex-wrap items-center justify-center gap-3">
             <WhatsAppButton message={`Hola, quiero información sobre las propiedades de ${BRAND_NAME}.`}>
               Escribir por WhatsApp
             </WhatsAppButton>
             <Link
               href="/catalogo"
-              className="inline-flex items-center justify-center rounded-full border border-slate-300 px-6 py-3 font-semibold text-slate-800 transition hover:bg-slate-100"
+              className="inline-flex items-center justify-center rounded-full bg-accent px-6 py-3 font-semibold text-white transition hover:bg-white hover:text-brand"
             >
               Ver catálogo
             </Link>
@@ -39,8 +43,8 @@ export default function HomePage() {
 
       <section className="mx-auto max-w-6xl px-4 py-16">
         <div className="mb-8 flex items-end justify-between">
-          <h2 className="text-2xl font-bold text-slate-900">Propiedades destacadas</h2>
-          <Link href="/catalogo" className="text-sm font-medium text-slate-600 hover:text-slate-900">
+          <h2 className="font-heading text-2xl font-bold text-brand">Propiedades destacadas</h2>
+          <Link href="/catalogo" className="text-sm font-medium text-slate-600 hover:text-brand">
             Ver todas →
           </Link>
         </div>

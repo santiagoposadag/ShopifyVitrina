@@ -7,6 +7,31 @@ interface AttrRow {
   value: string;
 }
 
+interface StatCard {
+  label: string;
+  value: string;
+  bg: string;
+}
+
+/**
+ * Highlight cards for the key figures, shown above the description. Same
+ * `!= null` rule as attributeRows: a stat the owner never stated renders
+ * nothing. Backgrounds alternate brand-green and gold tints.
+ */
+function statCards(product: Product): StatCard[] {
+  const a = product.attributes;
+  const stats: StatCard[] = [];
+  if (a.bedrooms != null)
+    stats.push({ label: "Habitaciones", value: String(a.bedrooms), bg: "bg-[rgba(7,65,29,0.07)]" });
+  if (a.bathrooms != null)
+    stats.push({ label: "Baños", value: String(a.bathrooms), bg: "bg-[rgba(181,157,96,0.10)]" });
+  if (a.area_m2 != null)
+    stats.push({ label: "Área", value: `${a.area_m2} m²`, bg: "bg-[rgba(7,65,29,0.05)]" });
+  if (a.estrato != null)
+    stats.push({ label: "Estrato", value: String(a.estrato), bg: "bg-[rgba(181,157,96,0.07)]" });
+  return stats;
+}
+
 /**
  * The Características table. Every field uses a `!= null` guard so an attribute
  * the owner never stated stays absent instead of rendering as a blank or a zero
@@ -43,6 +68,7 @@ function attributeRows(product: Product): AttrRow[] {
  */
 export function PropertyDetail({ product }: { product: Product }) {
   const rows = attributeRows(product);
+  const stats = statCards(product);
   const location = locationSummary(product);
   const attrs = attributeSummary(product);
   const features = product.attributes.features ?? [];
@@ -52,7 +78,7 @@ export function PropertyDetail({ product }: { product: Product }) {
     <>
       <div className="mb-6">
         <span className="text-sm font-medium text-slate-500">Código {product.code}</span>
-        <h1 className="mt-1 text-3xl font-bold text-slate-900">{product.title}</h1>
+        <h1 className="mt-1 font-heading text-3xl font-bold text-brand">{product.title}</h1>
         {location && <p className="mt-1 text-slate-600">{location}</p>}
         {attrs && <p className="text-slate-600">{attrs}</p>}
       </div>
@@ -75,9 +101,20 @@ export function PropertyDetail({ product }: { product: Product }) {
 
       <div className="grid grid-cols-1 gap-8 md:grid-cols-3">
         <div className="md:col-span-2">
+          {stats.length > 0 && (
+            <section className="mb-8 grid grid-cols-2 gap-4 sm:grid-cols-4">
+              {stats.map((s) => (
+                <div key={s.label} className={`rounded-lg p-4 text-center ${s.bg}`}>
+                  <p className="text-xl font-semibold text-brand">{s.value}</p>
+                  <p className="text-xs text-slate-600">{s.label}</p>
+                </div>
+              ))}
+            </section>
+          )}
+
           {product.description && (
             <section className="mb-8">
-              <h2 className="mb-2 text-lg font-semibold text-slate-900">Descripción</h2>
+              <h2 className="mb-2 font-heading text-lg font-semibold text-brand">Descripción</h2>
               <p className="whitespace-pre-line leading-relaxed text-slate-700">
                 {product.description}
               </p>
@@ -86,7 +123,7 @@ export function PropertyDetail({ product }: { product: Product }) {
 
           {rows.length > 0 && (
             <section className="mb-8">
-              <h2 className="mb-3 text-lg font-semibold text-slate-900">Características</h2>
+              <h2 className="mb-3 font-heading text-lg font-semibold text-brand">Características</h2>
               <dl className="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
                 {rows.map((r) => (
                   <div key={r.label} className="flex justify-between border-b border-slate-100 py-2">
@@ -100,12 +137,12 @@ export function PropertyDetail({ product }: { product: Product }) {
 
           {features.length > 0 && (
             <section>
-              <h2 className="mb-3 text-lg font-semibold text-slate-900">Comodidades</h2>
+              <h2 className="mb-3 font-heading text-lg font-semibold text-brand">Comodidades</h2>
               <ul className="flex flex-wrap gap-2">
                 {features.map((f) => (
                   <li
                     key={f}
-                    className="rounded-full bg-slate-100 px-3 py-1 text-sm text-slate-700"
+                    className="rounded-full bg-accent/10 px-3 py-1 text-sm text-brand"
                   >
                     {f}
                   </li>
@@ -116,9 +153,9 @@ export function PropertyDetail({ product }: { product: Product }) {
         </div>
 
         <aside className="md:col-span-1">
-          <div className="sticky top-20 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+          <div className="sticky top-20 rounded-card bg-white p-6 shadow-card">
             <p className="text-sm text-slate-500">Precio</p>
-            <p className="mb-1 text-3xl font-bold text-slate-900">{formatCOP(product.price)}</p>
+            <p className="mb-1 text-3xl font-bold text-accent">{formatCOP(product.price)}</p>
             {product.attributes.negotiable && (
               <p className="mb-4 text-sm text-slate-500">Precio negociable</p>
             )}
