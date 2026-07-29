@@ -67,6 +67,9 @@ COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=prod-deps /app/web/node_modules ./web/node_modules
 # `next start` lazily writes under .next/cache, so it must be owned by `node`.
 COPY --from=build --chown=node:node /app/web/.next ./web/.next
+# Static assets are served from public/ on disk at runtime, never bundled
+# into .next — without this copy every /logo.png-style URL 404s in the image.
+COPY web/public web/public
 COPY package.json ./
 COPY web/package.json web/package.json
 # Plain .mjs, NOT .ts: `next start` cannot load a TypeScript config without
