@@ -9,7 +9,7 @@ const poppins = Poppins({ subsets: ["latin"], weight: ["600", "700"], variable: 
 
 export const metadata: Metadata = {
   title: `${BRAND_NAME} — Propiedades`,
-  description: `Catálogo de propiedades de ${BRAND_NAME}. Encontrá tu próximo hogar y escribinos por WhatsApp.`,
+  description: `Catálogo de propiedades de ${BRAND_NAME}. Encuentra tu próximo hogar y escríbenos por WhatsApp.`,
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

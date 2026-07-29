@@ -21,10 +21,10 @@ export default function HomePage() {
             className="w-48 rounded-card border-2 border-accent bg-brand p-2"
           />
           <h1 className="max-w-2xl font-heading text-4xl font-bold tracking-tight sm:text-5xl">
-            Encontrá tu próxima propiedad y hablá con nosotros por WhatsApp.
+            Encuentra tu próxima propiedad y habla con nosotros por WhatsApp.
           </h1>
           <p className="max-w-xl text-lg text-white/90">
-            Explorá nuestro catálogo actualizado. Cuando algo te guste, escribinos directo por
+            Explora nuestro catálogo actualizado. Cuando algo te guste, escríbenos directo por
             WhatsApp con el código de la propiedad y te atendemos al instante.
           </p>
           <div className="flex flex-wrap items-center justify-center gap-3">
@@ -50,7 +50,7 @@ export default function HomePage() {
         </div>
         {featured.length === 0 ? (
           <p className="rounded-lg border border-dashed border-slate-300 p-10 text-center text-slate-500">
-            Aún no hay propiedades publicadas. Volvé pronto.
+            Aún no hay propiedades publicadas. Vuelve pronto.
           </p>
         ) : (
           <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
