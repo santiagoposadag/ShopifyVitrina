@@ -290,6 +290,8 @@ So a customer asking normally can be told "no tenemos nada" about a property tha
 
 It matters here for one reason: it makes some customer-path outcomes a coin toss, which is noise in a parity comparison. Judge DeepSeek on **regressions against the Anthropic baseline**, not on absolute pass rate. The `--diff` output flags regressions explicitly for this reason.
 
+> **Resolved since.** `repo.searchCatalog` now scores relevance word by word, so all three rows above find `1912` and the coin toss is gone — a live customer-path failure is a real signal again, not a search artefact.
+
 ---
 
 ## Cutover bar

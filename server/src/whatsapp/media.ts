@@ -46,6 +46,32 @@ export async function saveMedia(
 }
 
 /**
+ * Persist a voice note until the worker can transcribe it.
+ *
+ * Deliberately NOT saveMedia, and deliberately not MEDIA_DIR. That directory is
+ * served publicly by registerMediaRoutes below, and a customer's voice note is
+ * private speech — publishing it at a guessable URL because it happened to
+ * share a code path with product photos would be a real leak. This directory is
+ * never routed.
+ *
+ * The name keeps its extension because the transcription API reads the format
+ * from it; the bridge stages every file as <random>.bin and puts the real one
+ * in `filename`, which is what arrives here as suggestedName.
+ */
+export async function saveAudio(
+  config: Pick<Config, "audioDir">,
+  buffer: Buffer,
+  opts: { suggestedName?: string },
+): Promise<{ filePath: string; fileName: string }> {
+  mkdirSync(config.audioDir, { recursive: true });
+  const ext = (opts.suggestedName && extname(opts.suggestedName)) || ".ogg";
+  const fileName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`;
+  const filePath = join(config.audioDir, fileName);
+  await writeFile(filePath, buffer);
+  return { filePath, fileName };
+}
+
+/**
  * Serve MEDIA_DIR under GET /media/*. Photos are public so WhatsApp (and the
  * storefront during local dev) can fetch them by URL.
  */

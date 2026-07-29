@@ -89,6 +89,21 @@ case "$PROFILE" in
     ;;
 esac
 
+# Speech to text for voice notes. Optional on purpose: unset, the assistant
+# still answers everyone who types, and a voice note gets a reply asking for
+# text rather than silence — so this is loaded only when an entry exists,
+# rather than failing the run like the secrets above.
+#
+# The provider-neutral path wins, because TRANSCRIPTION_BASE_URL can point
+# anywhere; vitrina/groq_api_key is accepted as the name this started life
+# under, so an existing store keeps working.
+for _stt_path in vitrina/transcription_api_key vitrina/groq_api_key; do
+  if _val="$(gopass show -o "$_stt_path" 2>/dev/null)"; then
+    export TRANSCRIPTION_API_KEY="$_val"
+    break
+  fi
+done
+
 # Both sides of the bridge read these, and they must agree: the sidecar signs
 # inbound events with the first and accepts /send calls with the second.
 load_secret BRIDGE_WEBHOOK_SECRET vitrina/bridge_webhook_secret

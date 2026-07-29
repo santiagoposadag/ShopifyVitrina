@@ -58,6 +58,79 @@ function describeProduct(p: Product): string {
 }
 
 /**
+ * Render search results for the model, scores included.
+ *
+ * The scores are the whole point of showing them: the search now answers with
+ * approximate matches, so SOMETHING coming back no longer means the request was
+ * met. Without the number the agent cannot tell "this is the house you asked
+ * about" from "this is the only thing we have in that price range", and the
+ * failure mode is confidently offering a customer a property in the wrong
+ * sector.
+ *
+ * The caveat rides in the tool result rather than only in the system prompt
+ * because a result travels next to the data on every call — including turns
+ * where the prompt is far back in a resumed transcript.
+ */
+export function renderSearchHits(config: Config, hits: repo.SearchHit[]): string {
+  if (hits.length === 0) {
+    return "No matching active products. Offer to save the inquiry as a lead.";
+  }
+
+  const lines = hits.map(
+    (hit) =>
+      `match=${Math.round(hit.score * 100)}% | ${describeProduct(hit.product)}` +
+      linkLineFor(config, hit.product),
+  );
+
+  const bestScore = hits[0]?.score ?? 1;
+  if (bestScore < repo.CONFIDENT_MATCH_SCORE) {
+    lines.unshift(
+      "APPROXIMATE MATCHES ONLY — nothing in the catalog closely matches what was asked. Do NOT present these as if they met the request. Say plainly that there is nothing exact, offer them as alternatives if they are worth mentioning, and offer to save the inquiry as a lead.",
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Render the owner's inventory report.
+ *
+ * The empty case is the reason this exists. It used to read "No products found."
+ * no matter what had been asked, so an answer meaning "no DRAFTS" was
+ * indistinguishable from "no products anywhere" — and the agent, having called
+ * this three times over three statuses without ever filtering by sector, added
+ * the three sentences up into "no tenemos ninguna propiedad en Llano Grande".
+ * An empty answer now carries the shape of the question that produced it.
+ *
+ * The match percentage appears only when text was actually asked for: against no
+ * query at all every row scores 100%, which is noise on an inventory listing.
+ */
+export function renderProductList(
+  hits: repo.SearchHit[],
+  filters: { status?: string; query?: string; neighborhood?: string },
+): string {
+  const asked = [filters.query, filters.neighborhood].filter(Boolean).join(" ");
+  const constraints = [
+    filters.status ? `status=${filters.status}` : "",
+    asked ? `matching "${asked}"` : "",
+  ].filter(Boolean);
+
+  if (hits.length === 0) {
+    if (constraints.length === 0) return "No products at all: the catalog is empty.";
+    return (
+      `No products with ${constraints.join(" ")}. This answer is scoped to that filter ` +
+      `and says nothing about products outside it — it does not mean the catalog has none.`
+    );
+  }
+
+  return hits
+    .map(
+      (hit) =>
+        (asked ? `match=${Math.round(hit.score * 100)}% | ` : "") + describeProduct(hit.product),
+    )
+    .join("\n");
+}
+
+/**
  * Build the in-process MCP server exposing the tools for this turn. Customer
  * tools are always present; owner tools are added only for the owner role. The
  * acting phone number is taken from context, never from the model.
@@ -67,7 +140,7 @@ export function buildToolServer(deps: ToolDeps) {
 
   const searchCatalog = tool(
     "search_catalog",
-    "Search the ACTIVE product catalog. Returns matching products with their facts, each with a 'link' to its page on the storefront. Use this before answering any question about availability, price, or features. Never answer product facts from memory.",
+    "Search the ACTIVE product catalog. Returns products ranked by relevance, each with its facts, a 'match' percentage and a 'link' to its page on the storefront. Text is matched loosely — spelling, accents and word breaks do not have to agree — so a result is a CANDIDATE, not proof the request was met: read the match percentage and judge whether it actually answers what was asked. 100% means every word asked for was found; anything under 80% is related, not equivalent. The percentage is for your judgement only, never mention it. An empty result means the catalog genuinely has nothing like it. Use this before answering any question about availability, price, or features. Never answer product facts from memory.",
     {
       query: z.string().optional().describe("Free-text search over title, description, neighborhood, features"),
       min_price: z.number().optional().describe("Minimum price (COP)"),
@@ -75,13 +148,9 @@ export function buildToolServer(deps: ToolDeps) {
       bedrooms: z.number().optional().describe("Minimum number of bedrooms"),
       neighborhood: z.string().optional().describe("Neighborhood or city to match"),
     },
-    async (args) => {
-      const results = repo.searchCatalog(db, args);
-      if (results.length === 0) {
-        return text("No matching active products. Offer to save the inquiry as a lead.");
-      }
-      return text(results.map((p) => describeProduct(p) + linkLineFor(config, p)).join("\n"));
-    },
+    // min_score is deliberately NOT a parameter: the relevance floor is policy,
+    // not something to relax until the search finally returns something.
+    async (args) => text(renderSearchHits(config, repo.searchCatalog(db, args))),
   );
 
   const getProduct = tool(
@@ -189,13 +258,13 @@ export function buildToolServer(deps: ToolDeps) {
 
   const listProductsTool = tool(
     "list_products",
-    "List products, optionally filtered by status (draft, active, sold, inactive).",
-    { status: z.enum(["draft", "active", "sold", "inactive"]).optional() },
-    async ({ status }) => {
-      const products = repo.listProducts(db, status);
-      if (products.length === 0) return text("No products found.");
-      return text(products.map(describeProduct).join("\n"));
+    "The owner's inventory report, across ALL statuses including unpublished drafts. Filter by status, by text, or both; with no filter it returns the entire catalog. Use this — not search_catalog — whenever the owner asks what they have somewhere, because search_catalog only ever sees ACTIVE listings and a draft in that sector is still something they own. Never enumerate statuses to establish absence: an empty result is scoped to the filter you passed and says nothing about anything else. Text is matched loosely and each row carries a 'match' percentage for your judgement; never mention it.",
+    {
+      status: z.enum(["draft", "active", "sold", "inactive"]).optional(),
+      query: z.string().optional().describe("Free-text search over title, description, features"),
+      neighborhood: z.string().optional().describe("Neighborhood or city to match"),
     },
+    async (args) => text(renderProductList(repo.listProducts(db, args), args)),
   );
 
   const listLeadsTool = tool(

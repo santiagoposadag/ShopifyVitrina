@@ -1,3 +1,4 @@
+import { unlink } from "node:fs/promises";
 import type { FastifyBaseLogger } from "fastify";
 import type { DB } from "../data/db.js";
 import type { PerPhoneQueue } from "./queue.js";
@@ -7,6 +8,8 @@ import {
   markInboxBatchDone,
   markInboxBatchFailed,
   markInboxBatchPending,
+  setInboxTranscript,
+  type InboxRow,
 } from "../data/repo.js";
 import type { MessageKind, TurnContext } from "../types.js";
 
@@ -84,6 +87,18 @@ export function buildBatchText(rows: BatchRow[]): string {
   return lines.join("\n");
 }
 
+/**
+ * What the agent reads when a voice note could not be turned into words —
+ * because no provider is configured, the file was lost, or the API refused.
+ *
+ * A line rather than nothing, and this is the crux of the bug this feature
+ * fixes: an empty batch is settled `done` WITHOUT running the agent, so an
+ * untranscribable voice note would reproduce the original silence exactly. The
+ * person gets an answer either way; only its usefulness varies.
+ */
+export const AUDIO_FALLBACK =
+  "(El usuario envió una nota de voz que no se pudo transcribir. Pídele amablemente que escriba su mensaje.)";
+
 export type { MessageKind };
 
 export interface InboxBatcherDeps {
@@ -102,6 +117,16 @@ export interface InboxBatcherDeps {
   /** Async worker invoked once per coalesced burst. */
   onMessage: (ctx: TurnContext, text: string) => Promise<void>;
   roleFor: (phone: string) => TurnContext["role"];
+  /**
+   * Turn a stored voice note into words. Optional: with no transcription
+   * provider configured, audio rows fall back to a reply asking for text.
+   *
+   * Lives here rather than in the webhook because the bridge's outbox is
+   * strictly sequential — a speech API call in the handler stalls every message
+   * queued behind it. Returning null means "could not", and the caller must
+   * still produce SOMETHING for the agent to answer.
+   */
+  transcribeAudio?: (filePath: string) => Promise<string | null>;
   /**
    * Invoked after a batch attempt fails, on EVERY attempt. `final` is true when
    * the batch just settled as 'failed' (retry budget exhausted) — user-facing
@@ -235,6 +260,56 @@ export class InboxBatcher {
   }
 
   /**
+   * Replace every claimed voice note with its transcript, in place.
+   *
+   * The transcript is written back to the row as it is produced, which is what
+   * makes a retry cheap: a batch that fails downstream is claimed again, and
+   * without the write-back every attempt would re-upload and re-bill the same
+   * seconds of speech. Clearing audio_path in the same statement is the marker
+   * that this audio has already been paid for.
+   *
+   * Sequential rather than concurrent. A burst of voice notes is rare, the
+   * per-phone queue already serialises turns, and parallelism here could hit
+   * provider rate limits during exactly the bursts that need to succeed.
+   */
+  private async resolveAudio(rows: InboxRow[]): Promise<void> {
+    const { db, log, transcribeAudio } = this.deps;
+
+    for (const row of rows) {
+      if (!row.audio_path) continue;
+
+      const path = row.audio_path;
+      let transcript: string | null = null;
+      try {
+        transcript = transcribeAudio ? await transcribeAudio(path) : null;
+      } catch (err) {
+        // A failed transcription must never fail the batch: the message still
+        // deserves an answer, and the fallback below is that answer.
+        log.error({ err, phone: row.phone, inboxId: row.id }, "transcription failed");
+      }
+
+      const text = transcript?.trim() || AUDIO_FALLBACK;
+      setInboxTranscript(db, row.id, text);
+      // Mutated in place because buildBatchText reads these same row objects.
+      row.agent_text = text;
+      row.audio_path = null;
+
+      if (transcript) {
+        log.info(
+          { phone: row.phone, inboxId: row.id, chars: text.length },
+          "voice note transcribed",
+        );
+      }
+
+      // Unlinked whether or not the words were recovered. Clearing audio_path
+      // above already made this file unreachable — nothing will ever read it
+      // again — so keeping it on failure would leak one file per failed voice
+      // note, forever. Someone's speech is also not something to hoard.
+      await unlink(path).catch(() => undefined);
+    }
+  }
+
+  /**
    * Close the burst and hand it to the phone's queue. Clearing the timer state
    * BEFORE enqueuing is what lets messages arriving during the agent turn open
    * the next burst instead of being swallowed by this one.
@@ -304,6 +379,14 @@ export class InboxBatcher {
     // every boot forever.
     if (attempts > MAX_BATCH_ATTEMPTS) {
       markInboxBatchFailed(db, ids);
+      // Abandoning the batch abandons its audio: nothing will ever claim these
+      // rows again, so an un-transcribed voice note here would sit on disk
+      // forever. Not transcribed first — a poison batch should not be billed.
+      await Promise.all(
+        rows
+          .filter((row) => row.audio_path)
+          .map((row) => unlink(row.audio_path!).catch(() => undefined)),
+      );
       log.error({ phone, inboxIds: ids, attempts }, "inbox batch exceeded attempt cap; giving up");
       await this.notifyFailure(ctx, {
         final: true,
@@ -312,6 +395,10 @@ export class InboxBatcher {
       });
       return;
     }
+
+    // Voice notes become words HERE, on the worker, not in the webhook: this is
+    // a network call, and the bridge's outbox is strictly sequential.
+    await this.resolveAudio(rows);
 
     const text = buildBatchText(rows);
     // Nothing for the agent to answer (e.g. only unsupported event kinds):

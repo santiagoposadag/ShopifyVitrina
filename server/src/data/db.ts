@@ -86,6 +86,16 @@ export function createSchema(db: DB): void {
       -- from agent_text: a photo's caption is stored as its text.
       kind TEXT NOT NULL DEFAULT 'text'
         CHECK (kind IN ('text','media')),
+      -- A voice note awaiting transcription, stored OUTSIDE the media directory
+      -- (see whatsapp/media.ts saveAudio). Set at insert time and cleared once
+      -- the worker writes the transcript into agent_text, so a retried batch
+      -- never pays to transcribe the same audio twice.
+      --
+      -- Audio rows are deliberately kind='text', not 'media': buildBatchText
+      -- renders a media row as a photo COUNT and treats its text as a caption
+      -- grouped underneath, which is the wrong shape for a transcript — and the
+      -- media debounce window would make one voice note wait 45s for a reply.
+      audio_path TEXT,
       status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending','processing','done','failed')),
       attempts INTEGER NOT NULL DEFAULT 0,
@@ -129,6 +139,10 @@ function migrate(db: DB): void {
   // the caption is stored as agent_text, so the photo signal had to become data.
   // Existing rows default to 'text', which is exactly how they read today.
   addColumn(db, "inbox", "kind", "TEXT NOT NULL DEFAULT 'text' CHECK (kind IN ('text','media'))");
+  // Voice notes. Nullable with no CHECK on purpose: SQLite cannot widen an
+  // existing CHECK with ALTER TABLE, so audio rides on kind='text' plus this
+  // column rather than forcing a table rebuild on the running pilot.
+  addColumn(db, "inbox", "audio_path", "TEXT");
 }
 
 /** Add a column unless the table already has it. Table/column names are literals. */

@@ -66,6 +66,32 @@ export function extractInbound(event: Record<string, unknown>): InboundMessage |
     }
   }
 
+  if (type === "audio") {
+    const media = asRecord(event["media"]);
+    const ref = asString(media?.["path"]);
+    // Same fall-through as the image branch above, and it matters more here: an
+    // audio message whose file never arrived has NOTHING left — no caption, no
+    // text — so letting it degrade to "other" is what stops an empty ref
+    // reaching downloadMedia.
+    if (ref) {
+      return {
+        from,
+        id,
+        kind: "audio",
+        // Audio has no caption field; the transcript replaces this later, on
+        // the worker. It is empty here on purpose.
+        agentText: "",
+        media: {
+          ref,
+          // The bridge stages every file as <random>.bin and puts the real
+          // format in `filename`, which is what the transcriber reads.
+          filename: asString(media?.["filename"]) || undefined,
+          contentType: asString(media?.["contentType"]) || undefined,
+        },
+      };
+    }
+  }
+
   if (type === "text") return { from, id, kind: "text", agentText: text };
 
   return { from, id, kind: "other", agentText: text };

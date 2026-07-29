@@ -47,6 +47,26 @@ export interface Config {
   ownerPhoneNumbers: Set<string>;
   dbPath: string;
   mediaDir: string;
+  /**
+   * Where inbound voice notes wait to be transcribed. SEPARATE from mediaDir,
+   * which is served publicly at /media — private speech must not land somewhere
+   * a guessable URL reaches.
+   */
+  audioDir: string;
+  /**
+   * Speech-to-text. Anthropic-compatible thinking in the same spirit as the
+   * agent provider: an OpenAI-shaped /audio/transcriptions endpoint, chosen by
+   * URL, so Groq or OpenAI or anything compatible is an env change.
+   *
+   * With no key, transcription is OFF and a voice note gets a reply asking for
+   * text instead. Deliberately not required: an unset key must not stop the
+   * server from answering everyone who types.
+   */
+  transcriptionBaseUrl: string;
+  transcriptionApiKey: string;
+  transcriptionModel: string;
+  /** Skip anything larger, rather than paying to transcribe a podcast. */
+  transcriptionMaxBytes: number;
   publicBaseUrl: string;
   port: number;
   /** Model for the agent turn itself. */
@@ -211,6 +231,14 @@ export function loadConfig(): Config {
     ownerPhoneNumbers,
     dbPath: resolveDataPath(optional("DB_PATH", "./data/vitrina.db")),
     mediaDir: resolveDataPath(optional("MEDIA_DIR", "./data/media")),
+    audioDir: resolveDataPath(optional("AUDIO_DIR", "./data/audio")),
+    transcriptionBaseUrl: optional(
+      "TRANSCRIPTION_BASE_URL",
+      "https://api.groq.com/openai/v1",
+    ).replace(/\/+$/, ""),
+    transcriptionApiKey: optional("TRANSCRIPTION_API_KEY", ""),
+    transcriptionModel: optional("TRANSCRIPTION_MODEL", "whisper-large-v3-turbo"),
+    transcriptionMaxBytes: optionalInt("TRANSCRIPTION_MAX_BYTES", 25 * 1024 * 1024),
     publicBaseUrl: optional("PUBLIC_BASE_URL", "http://localhost:3001").replace(/\/+$/, ""),
     port: Number.parseInt(optional("PORT", "3001"), 10),
     model,
