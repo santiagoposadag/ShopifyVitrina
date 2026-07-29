@@ -18,12 +18,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className="min-h-screen flex flex-col">
         <header className="sticky top-0 z-10 bg-brand shadow-md">
           <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
-            <Link href="/" className="flex items-center gap-3">
+            <Link href="/" className="flex items-center">
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img src="/logo.png" alt={BRAND_NAME} className="h-10 w-auto" />
-              <span className="font-heading text-lg font-bold tracking-tight text-white">
-                {BRAND_NAME}
-              </span>
+              <span className="sr-only">{BRAND_NAME}</span>
             </Link>
             <nav className="flex items-center gap-6 text-sm font-medium text-white/80">
               <Link href="/" className="transition hover:text-accent">
@@ -51,6 +49,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <p className="text-sm text-white/80">
               © {new Date().getFullYear()} {BRAND_NAME}. Todos los derechos reservados.
             </p>
+            <p className="text-xs text-white/50">Impulsado por Vitrina</p>
           </div>
         </footer>
       </body>

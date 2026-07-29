@@ -1,4 +1,4 @@
-export const BRAND_NAME = process.env.NEXT_PUBLIC_BRAND_NAME?.trim() || "Vitrina";
+export const BRAND_NAME = process.env.NEXT_PUBLIC_BRAND_NAME?.trim() || "Alberto Posada Bienes Raíces";
 
 /**
  * WhatsApp number for wa.me deep links, sanitized to bare digits (wa.me rejects
