@@ -1,5 +1,6 @@
 import type { Product } from "@/lib/db";
 import { attributeSummary, formatCOP, locationSummary } from "@/lib/format";
+import { PhotoGallery } from "./PhotoGallery";
 import { WhatsAppButton } from "./WhatsAppButton";
 
 interface AttrRow {
@@ -84,19 +85,7 @@ export function PropertyDetail({ product }: { product: Product }) {
       </div>
 
       {product.photos.length > 0 && (
-        <div className="mb-8 grid grid-cols-2 gap-3 md:grid-cols-4">
-          {product.photos.map((src, i) => (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              key={src}
-              src={src}
-              alt={`${product.title} — foto ${i + 1}`}
-              className={`w-full rounded-xl object-cover ${
-                i === 0 ? "col-span-2 row-span-2 aspect-square md:col-span-2" : "aspect-square"
-              }`}
-            />
-          ))}
-        </div>
+        <PhotoGallery photos={product.photos} title={product.title} />
       )}
 
       <div className="grid grid-cols-1 gap-8 md:grid-cols-3">
