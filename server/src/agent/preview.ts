@@ -1,9 +1,37 @@
 import type { Config } from "../config.js";
 import type { Product } from "../types.js";
+import { anonToken } from "./anon-token.js";
 
 /** The storefront's preview URL for a product, in any status. */
 export function previewUrl(config: Config, product: Product): string {
   return `${config.storefrontBaseUrl}/preview/${encodeURIComponent(product.code)}`;
+}
+
+/**
+ * The ANONYMOUS, de-branded storefront URL for an ACTIVE product — a link the
+ * owner can hand a colleague to reshare with their own clients. It carries no
+ * company branding and no WhatsApp button, and the opaque token does not reveal
+ * the code. Empty when the product is not active (nothing public to share) or
+ * when ANON_SHARE_SECRET is unset (feature disabled).
+ */
+export function anonUrl(config: Config, product: Product): string {
+  if (product.status !== "active") return "";
+  const token = anonToken(product.code, config.anonShareSecret);
+  if (!token) return "";
+  return `${config.storefrontBaseUrl}/ver/${token}`;
+}
+
+/**
+ * The line appended to upsert_product's result once a product is active, so the
+ * owner is handed the anonymous share link at publish time without having to ask.
+ * Empty for a non-active product (nothing public to share yet) or when sharing is
+ * unconfigured. OWNER-only output — deliberately NOT part of linkLineFor, which
+ * rides on customer-facing results.
+ */
+export function anonLineFor(config: Config, product: Product): string {
+  const url = anonUrl(config, product);
+  if (!url) return "";
+  return `\nAnonymous share link for the OWNER to send a colleague (de-branded, no WhatsApp button, safe to reshare with the colleague's own clients): ${url}`;
 }
 
 /** The public storefront URL for a product. Only active products render there. */

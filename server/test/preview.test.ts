@@ -1,9 +1,21 @@
 import { describe, expect, it } from "vitest";
 import type { Config } from "../src/config.js";
-import { linkLineFor, previewLineFor, previewUrl, propertyUrl } from "../src/agent/preview.js";
+import {
+  anonLineFor,
+  anonUrl,
+  linkLineFor,
+  previewLineFor,
+  previewUrl,
+  propertyUrl,
+} from "../src/agent/preview.js";
+import { anonToken } from "../src/agent/anon-token.js";
 import type { Product } from "../src/types.js";
 
 const CONFIG = { storefrontBaseUrl: "https://vitrina.example.com" } as Config;
+const ANON_CONFIG = {
+  storefrontBaseUrl: "https://vitrina.example.com",
+  anonShareSecret: "s3cr3t-shared",
+} as Config;
 
 const DRAFT = { code: "0195", status: "draft" } as Product;
 
@@ -79,5 +91,42 @@ describe("property link", () => {
       const offered = [linkLineFor(CONFIG, product), previewLineFor(CONFIG, product)];
       expect(offered.filter((line) => line !== "")).toHaveLength(1);
     }
+  });
+});
+
+// The anonymous, de-branded link the owner hands a colleague to reshare. It
+// carries the SAME token the web storefront recomputes to resolve /ver/<token>,
+// so the path here and the resolver there must stay in lockstep (anon-token.test).
+describe("anonymous share link", () => {
+  const ACTIVE = { ...DRAFT, status: "active" } as Product;
+
+  it("builds a /ver/<token> URL whose token matches the shared derivation", () => {
+    const url = anonUrl(ANON_CONFIG, ACTIVE);
+    expect(url).toBe(`https://vitrina.example.com/ver/${anonToken("0195", "s3cr3t-shared")}`);
+  });
+
+  it("does NOT reveal the code in the URL", () => {
+    // The whole point of the anonymous link: nothing on the page or in the URL
+    // maps it back to our catalog.
+    expect(anonUrl(ANON_CONFIG, ACTIVE)).not.toContain("0195");
+  });
+
+  it("offers a link only for an active product", () => {
+    for (const status of ["draft", "sold", "inactive"] as const) {
+      expect(anonUrl(ANON_CONFIG, { ...DRAFT, status })).toBe("");
+      expect(anonLineFor(ANON_CONFIG, { ...DRAFT, status })).toBe("");
+    }
+  });
+
+  it("is disabled when the secret is unset", () => {
+    // No ANON_SHARE_SECRET means no feature: emit nothing rather than a dead link.
+    expect(anonUrl(CONFIG, ACTIVE)).toBe("");
+    expect(anonLineFor(CONFIG, ACTIVE)).toBe("");
+  });
+
+  it("labels the owner-facing line so it is never sent to a customer", () => {
+    const line = anonLineFor(ANON_CONFIG, ACTIVE);
+    expect(line).toContain("OWNER");
+    expect(line).toContain("/ver/");
   });
 });

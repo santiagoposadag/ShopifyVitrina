@@ -12,7 +12,13 @@ import type { SearchHit } from "../src/data/repo.js";
 import type { Product, Role } from "../src/types.js";
 
 const CUSTOMER_TOOLS = ["search_catalog", "get_product", "save_lead"];
-const OWNER_ONLY_TOOLS = ["upsert_product", "attach_pending_photos", "list_products", "list_leads"];
+const OWNER_ONLY_TOOLS = [
+  "upsert_product",
+  "attach_pending_photos",
+  "get_anonymous_link",
+  "list_products",
+  "list_leads",
+];
 
 function toolNamesFor(role: Role): string[] {
   const db = openDb(":memory:");

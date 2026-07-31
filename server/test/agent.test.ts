@@ -48,6 +48,7 @@ const CONFIG: Config = {
   batchMediaDebounceMs: 45000,
   batchMediaMaxWaitMs: 120000,
   storefrontBaseUrl: "http://localhost:3000",
+  anonShareSecret: "",
   customerAgentEnabled: true,
 };
 

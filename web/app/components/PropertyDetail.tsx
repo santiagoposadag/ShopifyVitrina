@@ -62,12 +62,23 @@ function attributeRows(product: Product): AttrRow[] {
 }
 
 /**
- * The full property page body, shared by the public /propiedad/[code] page and
- * the owner's private /preview/[code] page so the owner reviews EXACTLY what a
- * customer would see. The two routes differ only in how they read the product
- * (status filter vs preview token) and in the banner above.
+ * The full property page body, shared by the public /propiedad/[code] page, the
+ * owner's private /preview/[code] page, and the anonymous /ver/[token] page.
+ *
+ * `anonymous` renders the de-branded variant for a link a colleague can reshare
+ * with their own clients: it drops the "Consultar por WhatsApp" CTA (and its
+ * helper line) so the page carries no route back to us. The company header/footer
+ * are handled a level up — the /ver route sits outside the (storefront) layout —
+ * so this component only owns the WhatsApp button. Everything else is identical,
+ * on purpose: the owner reshares EXACTLY the property a customer would see.
  */
-export function PropertyDetail({ product }: { product: Product }) {
+export function PropertyDetail({
+  product,
+  anonymous = false,
+}: {
+  product: Product;
+  anonymous?: boolean;
+}) {
   const rows = attributeRows(product);
   const stats = statCards(product);
   const location = locationSummary(product);
@@ -148,12 +159,16 @@ export function PropertyDetail({ product }: { product: Product }) {
             {product.attributes.negotiable && (
               <p className="mb-4 text-sm text-slate-500">Precio negociable</p>
             )}
-            <WhatsAppButton message={message} className="mt-4 w-full">
-              Consultar por WhatsApp
-            </WhatsAppButton>
-            <p className="mt-3 text-center text-xs text-slate-400">
-              Te atenderemos con el código {product.code} ya cargado.
-            </p>
+            {!anonymous && (
+              <>
+                <WhatsAppButton message={message} className="mt-4 w-full">
+                  Consultar por WhatsApp
+                </WhatsAppButton>
+                <p className="mt-3 text-center text-xs text-slate-400">
+                  Te atenderemos con el código {product.code} ya cargado.
+                </p>
+              </>
+            )}
           </div>
         </aside>
       </div>

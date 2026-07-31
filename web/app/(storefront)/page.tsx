@@ -1,8 +1,8 @@
 import Link from "next/link";
 import { BRAND_NAME } from "@/lib/brand";
 import { getActiveProducts } from "@/lib/db";
-import { ProductCard } from "./components/ProductCard";
-import { WhatsAppButton } from "./components/WhatsAppButton";
+import { ProductCard } from "@/app/components/ProductCard";
+import { WhatsAppButton } from "@/app/components/WhatsAppButton";
 
 export const dynamic = "force-dynamic";
 

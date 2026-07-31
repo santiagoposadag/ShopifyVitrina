@@ -1,5 +1,5 @@
 import { getActiveProducts } from "@/lib/db";
-import { ProductCard } from "../components/ProductCard";
+import { ProductCard } from "@/app/components/ProductCard";
 
 export const dynamic = "force-dynamic";
 

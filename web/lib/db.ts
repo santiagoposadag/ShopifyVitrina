@@ -4,6 +4,7 @@ import { basename } from "node:path";
 // Shared with the server (both read the same SQLite rows) — type-only,
 // erased at compile time (see shared/index.d.ts).
 import type { ProductAttributes } from "@vitrina/shared";
+import { anonToken, hasAnonShare } from "./anon";
 import { dbPath } from "./paths";
 
 export type { ProductAttributes };
@@ -95,6 +96,20 @@ export function getProductByCode(code: string): Product | null {
   } finally {
     db.close();
   }
+}
+
+/**
+ * Resolve an anonymous /ver/<token> link to its product. The token is a
+ * deterministic HMAC of the code (see lib/anon.ts), so there is nothing to look
+ * up by: we recompute it over the ACTIVE catalog and match. Only published
+ * listings are shareable, and the pilot catalog is small enough that a scan is
+ * cheaper than the stored column (and the write path) a lookup would need — the
+ * web workspace stays read-only. Null when sharing is unconfigured or no active
+ * product matches.
+ */
+export function getProductByShareToken(token: string): Product | null {
+  if (!token || !hasAnonShare()) return null;
+  return getActiveProducts().find((p) => anonToken(p.code) === token) ?? null;
 }
 
 /**

@@ -2,7 +2,7 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { Config } from "../config.js";
 import type { DB } from "../data/db.js";
-import { linkLineFor, previewLineFor } from "./preview.js";
+import { anonLineFor, anonUrl, linkLineFor, previewLineFor } from "./preview.js";
 import * as repo from "../data/repo.js";
 import type { Product, ProductAttributeUpdates, ProductStatus, TurnContext } from "../types.js";
 
@@ -235,7 +235,8 @@ export function buildToolServer(deps: ToolDeps) {
       if (isPublishTransition(previousStatus, product.status)) ctx.sessionAfterTurn = "reset";
       return text(
         `${created ? "Created" : "Updated"} product: ${describeProduct(product)}` +
-          previewLineFor(config, product),
+          previewLineFor(config, product) +
+          anonLineFor(config, product),
       );
     },
   );
@@ -267,6 +268,28 @@ export function buildToolServer(deps: ToolDeps) {
     async (args) => text(renderProductList(repo.listProducts(db, args), args)),
   );
 
+  const getAnonymousLink = tool(
+    "get_anonymous_link",
+    "Get the ANONYMOUS, de-branded share link for a PUBLISHED (active) product, by code. This link shows the property page WITHOUT the company's branding and WITHOUT the WhatsApp button, so the owner can hand it to a colleague who will reshare it with their own clients — nothing on the page routes those clients back to us. Use it whenever the owner asks for a link to share with another agent/colleague, an 'anonymous', 'de-branded' or 'sin marca' link, or a link without our WhatsApp/contact. Only active products have one.",
+    { code: z.string().describe("The product code") },
+    async ({ code }) => {
+      const product = repo.getProductByCode(db, code);
+      if (!product) return text(`No product found with code ${code}.`);
+      if (product.status !== "active") {
+        return text(
+          `Product ${code} is not published (status=${product.status}); only active products have a shareable link. Publish it first with upsert_product.`,
+        );
+      }
+      const url = anonUrl(config, product);
+      if (!url) {
+        return text(
+          "Anonymous sharing is not configured on this deployment (ANON_SHARE_SECRET is unset). Tell the owner to ask the administrator to enable it.",
+        );
+      }
+      return text(`Anonymous share link for ${code}: ${url}`);
+    },
+  );
+
   const listLeadsTool = tool(
     "list_leads",
     "List captured leads (inquiries and visit requests), optionally limited to the last N days.",
@@ -289,6 +312,7 @@ export function buildToolServer(deps: ToolDeps) {
     ...customerTools,
     upsertProduct,
     attachPendingPhotos,
+    getAnonymousLink,
     listProductsTool,
     listLeadsTool,
   ];

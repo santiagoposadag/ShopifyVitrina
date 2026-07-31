@@ -25,6 +25,14 @@ x-data-env: &data-env
   DB_PATH: /data/vitrina.db
   MEDIA_DIR: /data/media
 
+# Shared by the server (mints anonymous /ver/<token> share links) and the web
+# storefront (resolves them). Both must see the SAME value or a minted link won't
+# open, so it is interpolated once here and merged into both services below.
+# Runtime env for web, NOT a build arg: it stays server-side and never reaches the
+# browser, so changing it needs a restart, not a rebuild. Empty disables sharing.
+x-anon-env: &anon-env
+  ANON_SHARE_SECRET: ${ANON_SHARE_SECRET:-}
+
 services:
   server:
     image: vitrina-server
@@ -32,7 +40,7 @@ services:
       context: .
       dockerfile: server/Dockerfile
     environment:
-      <<: [*secrets-env, *data-env]
+      <<: [*secrets-env, *data-env, *anon-env]
       # The bridge is reachable on the compose network only — never published,
       # never given a domain.
       BRIDGE_URL: http://bridge:3002
@@ -124,7 +132,7 @@ services:
         NEXT_PUBLIC_BRAND_NAME: ${NEXT_PUBLIC_BRAND_NAME:-Vitrina}
         NEXT_PUBLIC_WHATSAPP_NUMBER: ${NEXT_PUBLIC_WHATSAPP_NUMBER:-}
     environment:
-      <<: *data-env
+      <<: [*data-env, *anon-env]
     ports:
       # Host port is configurable so the storefront can coexist with other
       # local apps that claim 3000 (set WEB_PORT in the shell or compose .env).

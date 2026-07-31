@@ -111,6 +111,13 @@ export interface Config {
   /** Public URL of the STOREFRONT (the web app) — not this server. */
   storefrontBaseUrl: string;
   /**
+   * Secret that mints anonymous share tokens (the id in a /ver/<token> link).
+   * MUST match the web storefront's ANON_SHARE_SECRET or a minted link won't
+   * resolve. Empty disables the feature — the agent's get_anonymous_link tool
+   * then reports it as unconfigured rather than emitting a dead link.
+   */
+  anonShareSecret: string;
+  /**
    * Kill switch for the customer path. When false, non-owner messages get a
    * static "assistant unavailable" reply and never reach the agent (no Claude
    * call). Owners are unaffected.
@@ -255,6 +262,7 @@ export function loadConfig(): Config {
     batchMediaDebounceMs: optionalInt("BATCH_MEDIA_DEBOUNCE_MS", 45000),
     batchMediaMaxWaitMs: optionalInt("BATCH_MEDIA_MAX_WAIT_MS", 120000),
     storefrontBaseUrl: optional("STOREFRONT_BASE_URL", "http://localhost:3000").replace(/\/+$/, ""),
+    anonShareSecret: optional("ANON_SHARE_SECRET", ""),
     customerAgentEnabled: optionalBool("CUSTOMER_AGENT_ENABLED", true),
   };
 }
