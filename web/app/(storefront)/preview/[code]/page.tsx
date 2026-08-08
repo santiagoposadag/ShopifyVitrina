@@ -5,6 +5,7 @@ import { CopyLinkBox } from "@/app/components/CopyLinkBox";
 import { PropertyDetail } from "@/app/components/PropertyDetail";
 import { anonToken, hasAnonShare } from "@/lib/anon";
 import { getProductForPreview } from "@/lib/db";
+import { ANON_BASE_URL } from "@/lib/hosts";
 
 export const dynamic = "force-dynamic";
 
@@ -42,17 +43,22 @@ export default async function PreviewPage({ params }: { params: Promise<{ code: 
   const isPublished = product.status === "active";
 
   // The anonymous link only exists once the property is active (it resolves over
-  // the active catalog). Build it as an absolute URL from the request host so the
-  // owner can paste it straight into a chat with a colleague; the token is
-  // computed server-side (the secret never reaches the browser).
+  // the active catalog). Built from the configured ANONYMOUS host and NOT from
+  // the request host: this page is served on the BRANDED domain, so deriving the
+  // host from the request would hand the owner a "de-branded" link whose domain
+  // names the company. The token is computed server-side (the secret never
+  // reaches the browser).
+  // Unconfigured, it falls back to the request host — that is a dev machine with
+  // no domains set, where the request host is the only host there is.
   let anonShareUrl: string | null = null;
   if (isPublished && hasAnonShare()) {
-    const h = await headers();
-    const host = h.get("host");
-    if (host) {
-      const proto = h.get("x-forwarded-proto") ?? "http";
-      anonShareUrl = `${proto}://${host}/ver/${anonToken(product.code)}`;
+    let base = ANON_BASE_URL;
+    if (!base) {
+      const h = await headers();
+      const host = h.get("host");
+      base = host ? `${h.get("x-forwarded-proto") ?? "http"}://${host}` : "";
     }
+    if (base) anonShareUrl = `${base}/ver/${anonToken(product.code)}`;
   }
 
   return (

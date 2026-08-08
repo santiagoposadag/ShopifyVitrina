@@ -13,12 +13,15 @@ export function previewUrl(config: Config, product: Product): string {
  * company branding and no WhatsApp button, and the opaque token does not reveal
  * the code. Empty when the product is not active (nothing public to share) or
  * when ANON_SHARE_SECRET is unset (feature disabled).
+ *
+ * Built on anonBaseUrl, NOT storefrontBaseUrl: the domain is the one piece of
+ * branding a de-branded page cannot hide from the person reading the URL.
  */
 export function anonUrl(config: Config, product: Product): string {
   if (product.status !== "active") return "";
   const token = anonToken(product.code, config.anonShareSecret);
   if (!token) return "";
-  return `${config.storefrontBaseUrl}/ver/${token}`;
+  return `${config.anonBaseUrl}/ver/${token}`;
 }
 
 /**

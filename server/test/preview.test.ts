@@ -11,11 +11,15 @@ import {
 import { anonToken } from "../src/agent/anon-token.js";
 import type { Product } from "../src/types.js";
 
-const CONFIG = { storefrontBaseUrl: "https://vitrina.example.com" } as Config;
-const ANON_CONFIG = {
+// One domain: anonBaseUrl mirrors loadConfig's fallback to the branded host.
+const CONFIG = {
   storefrontBaseUrl: "https://vitrina.example.com",
-  anonShareSecret: "s3cr3t-shared",
+  anonBaseUrl: "https://vitrina.example.com",
 } as Config;
+const ANON_CONFIG = { ...CONFIG, anonShareSecret: "s3cr3t-shared" } as Config;
+// Two domains: the real deployment, where the anonymous link lives on a host
+// whose NAME does not identify the company either.
+const SPLIT_CONFIG = { ...ANON_CONFIG, anonBaseUrl: "https://anonimo.example.net" } as Config;
 
 const DRAFT = { code: "0195", status: "draft" } as Product;
 
@@ -128,5 +132,23 @@ describe("anonymous share link", () => {
     const line = anonLineFor(ANON_CONFIG, ACTIVE);
     expect(line).toContain("OWNER");
     expect(line).toContain("/ver/");
+  });
+
+  // The reason ANON_BASE_URL exists. The page hides the logo, the footer and the
+  // WhatsApp button — and then the address bar says the company's domain, which
+  // the colleague's client reads before any of that renders.
+  it("uses the ANONYMOUS host while the branded links stay on the branded one", () => {
+    const url = anonUrl(SPLIT_CONFIG, ACTIVE);
+    expect(url).toBe(`https://anonimo.example.net/ver/${anonToken("0195", "s3cr3t-shared")}`);
+    expect(anonLineFor(SPLIT_CONFIG, ACTIVE)).toContain("https://anonimo.example.net/ver/");
+
+    expect(propertyUrl(SPLIT_CONFIG, ACTIVE)).toBe("https://vitrina.example.com/propiedad/0195");
+    expect(previewUrl(SPLIT_CONFIG, DRAFT)).toBe("https://vitrina.example.com/preview/0195");
+  });
+
+  it("keeps the branded host out of the anonymous link entirely", () => {
+    // Not just the path: no substring of the branded base may survive into the
+    // link, since the whole URL is what the colleague's client sees.
+    expect(anonUrl(SPLIT_CONFIG, ACTIVE)).not.toContain("vitrina.example.com");
   });
 });

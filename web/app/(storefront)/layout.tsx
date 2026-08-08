@@ -1,6 +1,9 @@
 import type { Metadata } from "next";
+import { headers } from "next/headers";
 import Link from "next/link";
+import { notFound } from "next/navigation";
 import { BRAND_NAME } from "@/lib/brand";
+import { isAnonHost } from "@/lib/hosts";
 
 /**
  * The branded metadata (company name in the tab, WhatsApp-flavored description)
@@ -18,8 +21,19 @@ export const metadata: Metadata = {
  * It lives in this route group rather than the root layout precisely so the
  * anonymous /ver/[token] page, which is NOT in the group, renders with no
  * company branding at all. Route groups do not affect the URL.
+ *
+ * It is also the host boundary, for the same reason: every branded route is
+ * inside this group and the anonymous one is outside it, so ONE check here
+ * makes the branding unreachable on the anonymous host by construction rather
+ * than by remembering to guard each page. A 404 and not a redirect — redirecting
+ * "/" to the branded domain would announce the company to exactly the person the
+ * anonymous link exists to hide it from. Links already sent to customers are
+ * grandfathered at the edge instead (a Cloudflare redirect rule for
+ * /propiedad/* and /catalogo), where path-specific policy belongs.
  */
-export default function StorefrontLayout({ children }: { children: React.ReactNode }) {
+export default async function StorefrontLayout({ children }: { children: React.ReactNode }) {
+  if (isAnonHost((await headers()).get("host"))) notFound();
+
   return (
     <>
       <header className="sticky top-0 z-10 bg-brand shadow-md">

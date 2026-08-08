@@ -136,7 +136,8 @@ Every variable is documented in `env.sample`. Key ones:
 | `OWNER_PHONE_NUMBERS` | Comma-separated allowlist (E.164 digits, no `+`) that gets the owner toolset. |
 | `DB_PATH`, `MEDIA_DIR` | Shared by server and web. Relative paths resolve to the **repo root**, so both apps agree regardless of the workspace they run from. |
 | `PUBLIC_BASE_URL` | Public URL of the server (a tunnel) — used to build photo URLs WhatsApp can fetch. |
-| `STOREFRONT_BASE_URL` | Public URL of the **storefront** (a different host from `PUBLIC_BASE_URL`) — used to build the owner's private draft-preview links (default `http://localhost:3000`). |
+| `STOREFRONT_BASE_URL` | Public URL of the **branded storefront** (a different host from `PUBLIC_BASE_URL`) — the owner's draft-preview links and the `/propiedad/<code>` links customers receive (default `http://localhost:3000`). |
+| `ANON_BASE_URL` | Public URL of the **anonymous host**, where `/ver/<token>` links live — a second domain on the same container, so a resharing colleague's client never reads the company's name in the address bar. Empty falls back to `STOREFRONT_BASE_URL` and the host split goes inert (single-domain / local). |
 | `RATE_LIMIT_PER_PHONE_PER_HOUR`, `RATE_LIMIT_GLOBAL_PER_DAY` | Cost protection for customer agent turns (defaults 20/hour per phone, 500/day global; owners exempt). |
 | `CUSTOMER_AGENT_ENABLED` | Kill switch for the customer path (default `true`). `false` auto-replies that the assistant is unavailable — non-owner messages never reach the agent or spend a Claude call. |
 | `SESSION_MAX_AGE_DAYS` | Conversations idle longer than this start a fresh agent session (default 7). |

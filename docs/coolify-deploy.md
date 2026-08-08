@@ -75,7 +75,8 @@ To stay on Anthropic instead, leave all five unset (the defaults are Anthropic +
 | Variable | Notes |
 | --- | --- |
 | `PUBLIC_BASE_URL` | Public URL of the **server**. Baked into photo URLs WhatsApp fetches. |
-| `STOREFRONT_BASE_URL` | Public URL of the **web** app — a different host. Used for owner preview links. |
+| `STOREFRONT_BASE_URL` | Public URL of the **branded** web domain — a different host from the server. Owner preview links and the `/propiedad/<code>` links customers receive. |
+| `ANON_BASE_URL` | Public URL of the **anonymous** web domain (`/ver/<token>` links). Optional; empty falls back to `STOREFRONT_BASE_URL`. See "Two domains, one web container" below. |
 | `NEXT_PUBLIC_BRAND_NAME` | **Build arg.** |
 | `NEXT_PUBLIC_WHATSAPP_NUMBER` | **Build arg.** E.164 digits, no `+`. |
 
@@ -125,6 +126,33 @@ All three must be **persistent**, not ephemeral:
 Use named volumes, not host bind mounts. The images create these directories owned by a non-root user and a named volume inherits that ownership; a bind mount lands root-owned on most hosts and the process cannot write to it.
 
 The bridge runs as **uid 1000**, matching the server image's `node` user, because both mount `vitrina-data`. The bridge writes decrypted photos there and the server unlinks them after reading. Unlinking needs write permission on the *directory* — mismatched uids mean the server reads every photo fine and silently leaks all of them.
+
+### Two domains, one web container
+
+The `web` service answers on **two** domains, both routed to the same container by Host header:
+
+| Domain | Serves | Set as |
+| --- | --- | --- |
+| the branded one | `/`, `/catalogo`, `/propiedad/<code>`, `/preview/<code>` | `STOREFRONT_BASE_URL` |
+| the anonymous one | `/ver/<token>` and its photos, nothing else | `ANON_BASE_URL` |
+
+Add both under the `web` service's domains in Coolify. Both variables are **runtime** env, not build args — changing a domain is a restart, not a rebuild (unlike `NEXT_PUBLIC_*`).
+
+The split is not cosmetic. The anonymous page already hides the logo, the footer and the WhatsApp button; the domain is the last thing it cannot hide, since the colleague's client reads the address bar before the page renders. So the web app **404s every branded route on the anonymous host** — a client who truncates `…/ver/<token>` down to `/` gets nothing, not the company's catalog.
+
+That 404 is deliberate and must not be softened into a redirect: redirecting to the branded domain would announce the company to exactly the person the anonymous link exists to hide it from. Links already sent to customers are grandfathered **at the edge** instead — a Cloudflare redirect rule on the anonymous host:
+
+```
+(http.host eq "<anon-host>" and
+ (starts_with(http.request.uri.path, "/propiedad/") or http.request.uri.path eq "/catalogo"))
+→ 301: concat("https://<branded-host>", http.request.uri.path)
+```
+
+Path-specific policy belongs at the edge; the app keeps one rule it cannot get wrong.
+
+The new domain also needs its **own** TLS: a Cloudflare Origin Certificate is issued per hostname list, so the one covering the old domain does not cover this one. Either issue a second origin cert and install it, or create the DNS record **grey-clouded (DNS only)** first so Coolify's Let's Encrypt challenge resolves, then switch it to proxied.
+
+Leaving `ANON_BASE_URL` empty collapses everything back to one domain and turns every host check inert — the correct state for a local or single-domain deployment.
 
 ---
 

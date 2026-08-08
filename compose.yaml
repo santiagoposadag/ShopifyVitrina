@@ -33,6 +33,19 @@ x-data-env: &data-env
 x-anon-env: &anon-env
   ANON_SHARE_SECRET: ${ANON_SHARE_SECRET:-}
 
+# The two public storefront hosts, shared by the server (which MINTS every link)
+# and the web app (which decides what each host is allowed to serve). They must
+# agree: the server minting an anonymous link for a host the web app treats as
+# branded produces a link that 404s.
+#
+# ANON_BASE_URL empty means "one domain" — both fall back to STOREFRONT_BASE_URL
+# and the host split is inert, which is the local and single-domain setup.
+# Runtime env for web, NOT build args: a domain change is a restart, not a
+# rebuild (unlike the NEXT_PUBLIC_* pair below).
+x-urls-env: &urls-env
+  STOREFRONT_BASE_URL: ${STOREFRONT_BASE_URL:-http://localhost:3000}
+  ANON_BASE_URL: ${ANON_BASE_URL:-}
+
 services:
   server:
     image: vitrina-server
@@ -40,15 +53,15 @@ services:
       context: .
       dockerfile: server/Dockerfile
     environment:
-      <<: [*secrets-env, *data-env, *anon-env]
+      <<: [*secrets-env, *data-env, *anon-env, *urls-env]
       # The bridge is reachable on the compose network only — never published,
       # never given a domain.
       BRIDGE_URL: http://bridge:3002
       BRIDGE_STAGING_DIR: /data/inbound
+      # This server's own URL, which is neither storefront host: it is what
+      # WhatsApp fetches product photos from. The storefront hosts arrive via
+      # *urls-env above.
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
-      # The STOREFRONT's URL, not this server's — the two are different hosts.
-      # Used to build the owner's private draft-preview links.
-      STOREFRONT_BASE_URL: ${STOREFRONT_BASE_URL:-http://localhost:3000}
       PORT: "3001"
       # Provider routing. Empty values fall back to the defaults in
       # server/src/config.ts (Anthropic's endpoint, claude-haiku-4-5). Set them
@@ -132,7 +145,7 @@ services:
         NEXT_PUBLIC_BRAND_NAME: ${NEXT_PUBLIC_BRAND_NAME:-Vitrina}
         NEXT_PUBLIC_WHATSAPP_NUMBER: ${NEXT_PUBLIC_WHATSAPP_NUMBER:-}
     environment:
-      <<: [*data-env, *anon-env]
+      <<: [*data-env, *anon-env, *urls-env]
     ports:
       # Host port is configurable so the storefront can coexist with other
       # local apps that claim 3000 (set WEB_PORT in the shell or compose .env).

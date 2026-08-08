@@ -111,6 +111,14 @@ export interface Config {
   /** Public URL of the STOREFRONT (the web app) — not this server. */
   storefrontBaseUrl: string;
   /**
+   * Public URL of the host that serves ANONYMOUS /ver/<token> links. A separate
+   * domain from storefrontBaseUrl on purpose: a colleague resharing a listing
+   * must not hand their client a URL that names the company, and the host name
+   * itself is part of what the de-branded page hides. Defaults to
+   * storefrontBaseUrl, which is the single-domain deployment.
+   */
+  anonBaseUrl: string;
+  /**
    * Secret that mints anonymous share tokens (the id in a /ver/<token> link).
    * MUST match the web storefront's ANON_SHARE_SECRET or a minted link won't
    * resolve. Empty disables the feature — the agent's get_anonymous_link tool
@@ -227,6 +235,14 @@ export function loadConfig(): Config {
 
   const model = optional("MODEL", "claude-haiku-4-5");
 
+  // The anonymous host defaults to the branded one, so a deployment that has not
+  // split its domains keeps working exactly as before and dev needs one variable.
+  const storefrontBaseUrl = optional("STOREFRONT_BASE_URL", "http://localhost:3000").replace(
+    /\/+$/,
+    "",
+  );
+  const anonBaseUrl = optional("ANON_BASE_URL", "").replace(/\/+$/, "") || storefrontBaseUrl;
+
   return {
     anthropicApiKey,
     agentAuthToken,
@@ -261,7 +277,8 @@ export function loadConfig(): Config {
     batchMaxWaitMs: optionalInt("BATCH_MAX_WAIT_MS", 45000),
     batchMediaDebounceMs: optionalInt("BATCH_MEDIA_DEBOUNCE_MS", 45000),
     batchMediaMaxWaitMs: optionalInt("BATCH_MEDIA_MAX_WAIT_MS", 120000),
-    storefrontBaseUrl: optional("STOREFRONT_BASE_URL", "http://localhost:3000").replace(/\/+$/, ""),
+    storefrontBaseUrl,
+    anonBaseUrl,
     anonShareSecret: optional("ANON_SHARE_SECRET", ""),
     customerAgentEnabled: optionalBool("CUSTOMER_AGENT_ENABLED", true),
   };

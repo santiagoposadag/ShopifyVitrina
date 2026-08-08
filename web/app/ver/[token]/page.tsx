@@ -1,7 +1,9 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
+import { headers } from "next/headers";
+import { notFound, redirect } from "next/navigation";
 import { PropertyDetail } from "@/app/components/PropertyDetail";
 import { getProductByShareToken } from "@/lib/db";
+import { ANON_BASE_URL, isBrandedHost } from "@/lib/hosts";
 
 export const dynamic = "force-dynamic";
 
@@ -23,6 +25,10 @@ export const metadata: Metadata = {
  *
  * Only active products resolve (see getProductByShareToken); a stale, unknown,
  * or unconfigured token 404s.
+ *
+ * Reached on the BRANDED host it redirects to the anonymous one, so the link a
+ * colleague copies out of their address bar to reshare names no company. Minted
+ * links already point there; this only catches a hand-edited URL.
  */
 export default async function AnonymousPropertyPage({
   params,
@@ -30,6 +36,11 @@ export default async function AnonymousPropertyPage({
   params: Promise<{ token: string }>;
 }) {
   const { token } = await params;
+
+  if (isBrandedHost((await headers()).get("host"))) {
+    redirect(`${ANON_BASE_URL}/ver/${encodeURIComponent(token)}`);
+  }
+
   const product = getProductByShareToken(decodeURIComponent(token));
   if (!product) notFound();
 

@@ -148,6 +148,75 @@ describe("loadConfig agent credential and model tiers", () => {
   });
 });
 
+// Two storefront hosts: the branded one customers see and the anonymous one a
+// colleague's client sees. They are separate config values because the domain is
+// the one piece of branding a de-branded PAGE cannot hide.
+describe("loadConfig storefront hosts", () => {
+  const OWNED = [
+    "STOREFRONT_BASE_URL",
+    "ANON_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "BRIDGE_WEBHOOK_SECRET",
+    "BRIDGE_URL",
+    "BRIDGE_API_TOKEN",
+    "BRIDGE_STAGING_DIR",
+  ] as const;
+  const saved = new Map<string, string | undefined>();
+
+  beforeEach(() => {
+    for (const name of OWNED) {
+      saved.set(name, process.env[name]);
+      delete process.env[name];
+    }
+    process.env["ANTHROPIC_API_KEY"] = "k";
+    process.env["BRIDGE_WEBHOOK_SECRET"] = "whsec";
+    process.env["BRIDGE_URL"] = "http://bridge:3002";
+    process.env["BRIDGE_API_TOKEN"] = "tok";
+    process.env["BRIDGE_STAGING_DIR"] = "/tmp/inbound";
+  });
+
+  afterEach(() => {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
+  // A deployment on one domain must keep working untouched — and every dev
+  // machine is such a deployment. The web app mirrors this exact fallback, so
+  // the two cannot disagree about which host an anonymous link lives on.
+  it("defaults the anonymous host to the branded one", () => {
+    process.env["STOREFRONT_BASE_URL"] = "https://marca.example.com";
+    const config = loadConfig();
+    expect(config.storefrontBaseUrl).toBe("https://marca.example.com");
+    expect(config.anonBaseUrl).toBe("https://marca.example.com");
+  });
+
+  it("keeps the two hosts apart once the anonymous one is set", () => {
+    process.env["STOREFRONT_BASE_URL"] = "https://marca.example.com";
+    process.env["ANON_BASE_URL"] = "https://anonimo.example.net";
+    const config = loadConfig();
+    expect(config.storefrontBaseUrl).toBe("https://marca.example.com");
+    expect(config.anonBaseUrl).toBe("https://anonimo.example.net");
+  });
+
+  it("strips a trailing slash from both, so a link never carries a double slash", () => {
+    process.env["STOREFRONT_BASE_URL"] = "https://marca.example.com/";
+    process.env["ANON_BASE_URL"] = "https://anonimo.example.net/";
+    const config = loadConfig();
+    expect(config.storefrontBaseUrl).toBe("https://marca.example.com");
+    expect(config.anonBaseUrl).toBe("https://anonimo.example.net");
+  });
+
+  // An empty value is how Coolify presents a variable that was added and left
+  // blank — it must read as "unset", not as an empty host.
+  it("treats an empty ANON_BASE_URL as unset", () => {
+    process.env["STOREFRONT_BASE_URL"] = "https://marca.example.com";
+    process.env["ANON_BASE_URL"] = "   ";
+    expect(loadConfig().anonBaseUrl).toBe("https://marca.example.com");
+  });
+});
+
 // Vitest runs from server/ — the same cwd as `npm run dev:server`, which is
 // exactly what broke this: a relative ".env" resolved to server/.env, missed,
 // and was swallowed by the catch below it, so every variable silently fell back
