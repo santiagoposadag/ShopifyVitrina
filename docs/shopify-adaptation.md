@@ -1,6 +1,13 @@
 # Adapting Vitrina to a Shopify inventory
 
-**Status: exploration. Nothing below is built.** This is the map of what a
+> **Status update.** This was written as an exploration, before any code.
+> **Milestone 1 is now built** — phases 0–6 of §10, minus the checkout (§5D),
+> which was deferred with the rest of the customer-buys path. Where the
+> implementation departed from the plan below, the departure is noted inline.
+> `README.md` and `CLAUDE.md` describe what actually exists; this file is kept
+> as the reasoning behind it, and §9 and §11 are still the open questions.
+
+**Originally: exploration, nothing built.** This is the map of what a
 Shopify-backed Vitrina would cost and what it would break, written before any
 code, so the expensive surprises are on paper rather than in a branch.
 
@@ -150,6 +157,14 @@ agent finding the right record. Three candidates:
 Whatever is chosen, it must be a **single** anchor: today `getProductByCode` is
 one indexed lookup, and every tool depends on it being unambiguous.
 
+> **As built:** all three, in a fixed order — gid, then SKU, then handle
+> (`catalog.ts` `resolveProduct`). The requirement turned out to be
+> unambiguity, not singularity: each form is unique on its own, the order is
+> deterministic, and nothing falls through to a text search, so a reference
+> either resolves to exactly one product or returns null. SKU is tried before
+> handle because it names a single *variant*, which is what a stock or price
+> question is actually about.
+
 ### 4.2 Money
 
 `products.price` is an `INTEGER` of whole COP. Shopify returns money as a
@@ -240,9 +255,16 @@ What changes is the destination. Instead of `insertPhoto` into SQLite:
 2. multipart POST of the staged file bytes to that URL
 3. `productCreateMedia(productId, media: [{ originalSource: resourceUrl }])`
 
-Product creation itself is `productSet` — one mutation that creates or updates
-a product *with* its options and variants, which is exactly the shape of "the
-owner just described a product with three sizes".
+Product creation itself looked like `productSet` — one mutation that creates or
+updates a product *with* its options and variants, which is exactly the shape of
+"the owner just described a product with three sizes".
+
+> **As built: not `productSet`.** It is declarative over the whole product —
+> variants absent from the input are *deleted*. That is right for a sync job and
+> exactly wrong behind a chat agent, where a model re-sending a payload it half
+> remembers would silently drop every variant it forgot to mention. Creation is
+> `productCreate` + `productVariantsBulkCreate`; updates are `productUpdate` +
+> `productVariantsBulkUpdate`, which merge.
 
 > **The zero-bytes invariant is gone.** Today a 37-photo owner burst moves zero
 > image bytes between services: the bridge decrypts into a shared volume and

@@ -3,36 +3,55 @@ import type { Config } from "../src/config.js";
 import { openDb } from "../src/data/db.js";
 import {
   buildToolServer,
+  describeProduct,
   isPublishTransition,
   MCP_SERVER_NAME,
   renderProductList,
   renderSearchHits,
 } from "../src/agent/tools.js";
-import type { SearchHit } from "../src/data/repo.js";
-import type { Product, Role } from "../src/types.js";
+import { CatalogCache } from "../src/shopify/cache.js";
+import { ShopifyClient } from "../src/shopify/client.js";
+import type { SearchHit } from "../src/shopify/rank.js";
+import type { ShopifyProduct } from "../src/shopify/types.js";
+import type { Role } from "../src/types.js";
 
 const CUSTOMER_TOOLS = ["search_catalog", "get_product", "save_lead"];
 const OWNER_ONLY_TOOLS = [
-  "upsert_product",
-  "attach_pending_photos",
-  "get_anonymous_link",
   "list_products",
+  "create_product",
+  "update_product",
+  "delete_product",
+  "get_inventory",
+  "adjust_inventory",
+  "attach_pending_photos",
+  "list_locations",
   "list_leads",
 ];
 
+const TEST_CONFIG = {
+  shopifyStoreDomain: "tienda.myshopify.com",
+  shopifyAdminToken: "shpat_x",
+  shopifyApiVersion: "2026-01",
+  shopifyLocationId: "",
+} as Config;
+
 function toolNamesFor(role: Role): string[] {
   const db = openDb(":memory:");
+  const shopify = new ShopifyClient(TEST_CONFIG);
   const { toolNames } = buildToolServer({
     db,
-    config: {} as Config,
-    ctx: { phone: "573000000000", role },
+    config: TEST_CONFIG,
+    shopify,
+    cache: new CatalogCache(shopify, 0),
+    ctx: { phone: "573000000000", role, turnKey: "msg:1" },
   });
   db.close();
   return toolNames.map((n) => n.replace(`mcp__${MCP_SERVER_NAME}__`, ""));
 }
 
-// This is the privilege boundary of the whole system: customers must never be
-// offered the inventory/lead tools. Lock the tool sets in explicitly.
+// This is the privilege boundary of the whole system. It matters more here than
+// it did over a read-only storefront: an owner tool reaching a customer is a
+// stranger repricing a live store, or deleting a product out of it.
 describe("buildToolServer privilege boundary", () => {
   it("gives customers exactly the customer tools — no owner tool leaks", () => {
     const names = toolNamesFor("customer");
@@ -47,7 +66,16 @@ describe("buildToolServer privilege boundary", () => {
     expect(names.sort()).toEqual([...CUSTOMER_TOOLS, ...OWNER_ONLY_TOOLS].sort());
   });
 
-  // Photos reach a customer as a storefront link, never as images in the chat.
+  // Nothing may write to the catalog from the customer path, whatever it is
+  // called. Pinned by prefix rather than by name so a future create_variant or
+  // set_price cannot slip in unnoticed.
+  it("gives customers no tool that can write to the store", () => {
+    const names = toolNamesFor("customer");
+    for (const name of names) {
+      expect(name).not.toMatch(/^(create|update|delete|adjust|set|attach|publish)_/);
+    }
+  });
+
   // The tool server has no WhatsApp client at all, so this is structural — but
   // pin it anyway: a tool that could push media back would be a silent
   // regression of a product decision, in either role.
@@ -58,111 +86,162 @@ describe("buildToolServer privilege boundary", () => {
   });
 });
 
-// search_catalog now answers with approximate matches, which is only safe if
-// the agent can tell a hit from a near-miss. These pin the two things that make
-// that possible: the score reaches the model, and a weak result set arrives
-// labelled as weak.
-function hit(code: string, score: number): SearchHit {
+function product(overrides: Partial<ShopifyProduct> = {}): ShopifyProduct {
   return {
-    product: {
-      id: 1,
-      code,
-      title: `Casa ${code}`,
-      description: null,
-      price: 100,
-      currency: "COP",
-      status: "active",
-      attributes: {},
-      created_at: "",
-      updated_at: "",
-    } as Product,
-    score,
+    id: "gid://shopify/Product/1",
+    handle: "camiseta-negra",
+    title: "Camiseta negra",
+    description: "",
+    status: "ACTIVE",
+    productType: "Camiseta",
+    vendor: "",
+    tags: [],
+    totalInventory: 5,
+    onlineStoreUrl: "https://tienda.example.com/products/camiseta-negra",
+    mediaCount: 2,
+    updatedAt: "2026-08-01T00:00:00Z",
+    variants: [
+      {
+        id: "gid://shopify/ProductVariant/1",
+        sku: "CAM-NEG-M",
+        title: "M",
+        price: "80000.00",
+        compareAtPrice: null,
+        inventoryQuantity: 5,
+        inventoryItemId: "gid://shopify/InventoryItem/1",
+        inventoryTracked: true,
+        selectedOptions: [{ name: "Talla", value: "M" }],
+      },
+    ],
+    ...overrides,
   };
 }
 
-describe("renderSearchHits", () => {
-  const config = { storefrontBaseUrl: "http://x" } as Config;
+function hit(score: number, overrides: Partial<ShopifyProduct> = {}): SearchHit {
+  return { product: product(overrides), score };
+}
 
+// The search answers with approximate matches, which is only safe if the agent
+// can tell a hit from a near-miss. These pin the two things that make that
+// possible: the score reaches the model, and a weak result set arrives labelled
+// as weak.
+describe("renderSearchHits", () => {
   it("tells the agent to capture a lead when nothing matched", () => {
-    expect(renderSearchHits(config, [])).toContain("lead");
+    expect(renderSearchHits([])).toContain("lead");
   });
 
   it("puts the match percentage on every line", () => {
-    const out = renderSearchHits(config, [hit("916", 1), hit("1912", 0.75)]);
+    const out = renderSearchHits([hit(1), hit(0.75, { handle: "otra" })]);
     expect(out).toContain("match=100%");
     expect(out).toContain("match=75%");
-    expect(out).toContain("link=http://x/propiedad/916");
   });
 
   it("warns when even the best result is only approximate", () => {
-    const out = renderSearchHits(config, [hit("916", 0.6)]);
-    expect(out).toContain("APPROXIMATE");
+    expect(renderSearchHits([hit(0.6)])).toContain("APPROXIMATE");
   });
 
   it("stays quiet when the top result is a confident match", () => {
-    const out = renderSearchHits(config, [hit("916", 1), hit("1912", 0.6)]);
-    expect(out).not.toContain("APPROXIMATE");
+    expect(renderSearchHits([hit(1), hit(0.6)])).not.toContain("APPROXIMATE");
+  });
+
+  // A sold-out product still comes back — it answers the question, and hiding
+  // it makes the agent say "no tenemos" about something the customer can see on
+  // the shelf. But it must never be offered as available, and the flag has to
+  // ride on the result line, not only in the prompt.
+  it("marks a sold-out product on its own line", () => {
+    const soldOut = hit(1, {
+      totalInventory: 0,
+      variants: [
+        {
+          ...product().variants[0]!,
+          inventoryQuantity: 0,
+        },
+      ],
+    });
+    expect(renderSearchHits([soldOut])).toContain("SOLD OUT");
+    expect(renderSearchHits([hit(1)])).not.toContain("SOLD OUT");
   });
 });
 
-// "No products found." for status=draft means there are no DRAFTS. The agent
-// read the literal sentence, three times over different statuses, and concluded
-// the catalog had nothing in a sector it never filtered on. An empty answer has
-// to carry the shape of its own question.
+// An answer meaning "no DRAFTS" must not read as "no products anywhere": the
+// agent that called this three times over three statuses added the three
+// sentences up into a confident, wrong claim about the whole catalog.
 describe("renderProductList", () => {
   it("scopes an empty answer to the filter that produced it", () => {
-    const out = renderProductList([], { status: "draft" });
-    expect(out).toContain("status=draft");
+    const out = renderProductList([], { status: "DRAFT" });
+    expect(out).toContain("status=DRAFT");
     expect(out).toMatch(/nothing about|does not mean/i);
   });
 
   it("names the text that found nothing", () => {
-    expect(renderProductList([], { neighborhood: "Llano Grande" })).toContain("Llano Grande");
+    expect(renderProductList([], { query: "camiseta roja" })).toContain("camiseta roja");
   });
 
   it("reports an empty catalog plainly when nothing was filtered", () => {
-    const out = renderProductList([], {});
-    expect(out).toMatch(/empty|no products at all/i);
+    expect(renderProductList([], {})).toMatch(/empty|no products at all/i);
   });
 
   it("shows a match percentage only when text was actually asked for", () => {
-    expect(renderProductList([hit("916", 0.8)], { neighborhood: "Laureles" })).toContain(
-      "match=80%",
-    );
+    expect(renderProductList([hit(0.8)], { query: "camiseta" })).toContain("match=80%");
     // A percentage against nothing is meaningless noise on an inventory report.
-    expect(renderProductList([hit("916", 1)], { status: "active" })).not.toContain("match=");
+    expect(renderProductList([hit(1)], { status: "ACTIVE" })).not.toContain("match=");
   });
 
-  it("lists the products it did find", () => {
-    const out = renderProductList([hit("916", 1), hit("1912", 1)], {});
-    expect(out).toContain("code=916");
-    expect(out).toContain("code=1912");
+  // A truncated list read as a complete one is how an owner is told they have
+  // 250 products when they have 900.
+  it("says so when the catalog is larger than one fetch", () => {
+    const out = renderProductList([hit(1)], {}, true);
+    expect(out).toMatch(/incomplete|larger than/i);
+  });
+});
+
+describe("describeProduct", () => {
+  it("carries the facts the agent is allowed to quote", () => {
+    const out = describeProduct(product());
+    expect(out).toContain("handle=camiseta-negra");
+    expect(out).toContain("status=ACTIVE");
+    expect(out).toContain("sku=CAM-NEG-M");
+    expect(out).toContain("price=80000.00");
+    expect(out).toContain("stock=5");
+    expect(out).toContain("photos=2");
+  });
+
+  // An untracked variant is not "0 in stock" — Shopify is not counting it, and
+  // reporting a zero would tell the owner something sold out that never was.
+  it("distinguishes untracked stock from zero stock", () => {
+    const untracked = product({
+      totalInventory: null,
+      variants: [
+        { ...product().variants[0]!, inventoryTracked: false, inventoryQuantity: 0 },
+      ],
+    });
+    expect(describeProduct(untracked)).toContain("stock=untracked");
+    expect(describeProduct(untracked)).not.toContain("stock=0");
   });
 });
 
 // The session-reset trigger: only the moment a product BECOMES active ends the
-// unit of work. Editing an already-live listing mid-conversation must not reset.
+// unit of work. Editing an already-live product mid-conversation must not reset.
 describe("isPublishTransition", () => {
   it("fires when a draft is published", () => {
-    expect(isPublishTransition("draft", "active")).toBe(true);
+    expect(isPublishTransition("DRAFT", "ACTIVE")).toBe(true);
   });
 
   it("fires when a product is created directly as active", () => {
-    expect(isPublishTransition(undefined, "active")).toBe(true);
+    expect(isPublishTransition(undefined, "ACTIVE")).toBe(true);
   });
 
-  it("fires when a sold or inactive product is republished", () => {
-    expect(isPublishTransition("sold", "active")).toBe(true);
-    expect(isPublishTransition("inactive", "active")).toBe(true);
+  it("fires when an archived product is republished", () => {
+    expect(isPublishTransition("ARCHIVED", "ACTIVE")).toBe(true);
   });
 
   it("does not fire when editing an already-active product", () => {
-    expect(isPublishTransition("active", "active")).toBe(false);
+    expect(isPublishTransition("ACTIVE", "ACTIVE")).toBe(false);
   });
 
-  it("does not fire on draft work", () => {
-    expect(isPublishTransition("draft", "draft")).toBe(false);
-    expect(isPublishTransition(undefined, "draft")).toBe(false);
-    expect(isPublishTransition("active", "inactive")).toBe(false);
+  it("does not fire on draft work or on archiving", () => {
+    expect(isPublishTransition("DRAFT", "DRAFT")).toBe(false);
+    expect(isPublishTransition(undefined, "DRAFT")).toBe(false);
+    expect(isPublishTransition("ACTIVE", "ARCHIVED")).toBe(false);
   });
 });

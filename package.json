@@ -2,18 +2,14 @@
   "name": "vitrina",
   "version": "0.1.0",
   "private": true,
-  "description": "Vitrina — a WhatsApp-native sales & inventory assistant.",
+  "description": "Vitrina — a WhatsApp-native inventory assistant for Shopify.",
   "workspaces": [
-    "shared",
-    "server",
-    "web"
+    "server"
   ],
   "scripts": {
     "dev:server": "npm run dev -w server",
-    "dev:web": "npm run dev -w web",
-    "seed": "npm run seed -w server",
     "test": "npm run test -w server",
-    "build": "npm run build -w server && npm run build -w web"
+    "build": "npm run build -w server"
   },
   "engines": {
     "node": ">=20"

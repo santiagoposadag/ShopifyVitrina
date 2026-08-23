@@ -367,7 +367,13 @@ export class InboxBatcher {
     if (rows.length === 0) return;
 
     const ids = rows.map((row) => row.id);
-    const ctx: TurnContext = { phone, role: roleFor(phone) };
+    // The FIRST row's dedupe key, not a hash of the whole batch: a retried
+    // batch absorbs newer messages, so anything derived from the full set
+    // changes between attempts — and the point of this key is to be the SAME
+    // on a retry, so Shopify can recognise a replayed stock adjustment. Rows
+    // are ordered by arrival and keep their ids, so the anchor holds.
+    const turnKey = rows[0]!.dedupe_key;
+    const ctx: TurnContext = { phone, role: roleFor(phone), turnKey };
     // max, not min: a retried batch absorbs fresh rows (attempts = 1), and min
     // would let one poison row pin ever-growing batches forever. Consequence:
     // fresh messages that joined a terminally failing batch die with it —

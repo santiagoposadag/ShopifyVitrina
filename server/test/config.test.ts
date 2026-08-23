@@ -97,6 +97,8 @@ describe("loadConfig agent credential and model tiers", () => {
     process.env["BRIDGE_URL"] = "http://bridge:3002";
     process.env["BRIDGE_API_TOKEN"] = "tok";
     process.env["BRIDGE_STAGING_DIR"] = "/tmp/inbound";
+    process.env["SHOPIFY_STORE_DOMAIN"] = "tienda.myshopify.com";
+    process.env["SHOPIFY_ADMIN_TOKEN"] = "shpat_x";
   });
 
   afterEach(() => {
@@ -148,13 +150,17 @@ describe("loadConfig agent credential and model tiers", () => {
   });
 });
 
-// Two storefront hosts: the branded one customers see and the anonymous one a
-// colleague's client sees. They are separate config values because the domain is
-// the one piece of branding a de-branded PAGE cannot hide.
-describe("loadConfig storefront hosts", () => {
+// The store is the catalog. These two are required because there is no local
+// fallback to degrade to: without them every product tool fails on its first
+// call, and the fail-fast boot is what turns that into a startup error instead
+// of an apology to the owner.
+describe("loadConfig Shopify block", () => {
   const OWNED = [
-    "STOREFRONT_BASE_URL",
-    "ANON_BASE_URL",
+    "SHOPIFY_STORE_DOMAIN",
+    "SHOPIFY_ADMIN_TOKEN",
+    "SHOPIFY_API_VERSION",
+    "SHOPIFY_LOCATION_ID",
+    "CATALOG_CACHE_TTL_MS",
     "ANTHROPIC_API_KEY",
     "BRIDGE_WEBHOOK_SECRET",
     "BRIDGE_URL",
@@ -173,6 +179,8 @@ describe("loadConfig storefront hosts", () => {
     process.env["BRIDGE_URL"] = "http://bridge:3002";
     process.env["BRIDGE_API_TOKEN"] = "tok";
     process.env["BRIDGE_STAGING_DIR"] = "/tmp/inbound";
+    process.env["SHOPIFY_STORE_DOMAIN"] = "tienda.myshopify.com";
+    process.env["SHOPIFY_ADMIN_TOKEN"] = "shpat_x";
   });
 
   afterEach(() => {
@@ -182,38 +190,44 @@ describe("loadConfig storefront hosts", () => {
     }
   });
 
-  // A deployment on one domain must keep working untouched — and every dev
-  // machine is such a deployment. The web app mirrors this exact fallback, so
-  // the two cannot disagree about which host an anonymous link lives on.
-  it("defaults the anonymous host to the branded one", () => {
-    process.env["STOREFRONT_BASE_URL"] = "https://marca.example.com";
-    const config = loadConfig();
-    expect(config.storefrontBaseUrl).toBe("https://marca.example.com");
-    expect(config.anonBaseUrl).toBe("https://marca.example.com");
+  it("refuses to boot without the store domain or the token", () => {
+    delete process.env["SHOPIFY_STORE_DOMAIN"];
+    expect(() => loadConfig()).toThrow(/SHOPIFY_STORE_DOMAIN/);
+
+    process.env["SHOPIFY_STORE_DOMAIN"] = "tienda.myshopify.com";
+    delete process.env["SHOPIFY_ADMIN_TOKEN"];
+    expect(() => loadConfig()).toThrow(/SHOPIFY_ADMIN_TOKEN/);
   });
 
-  it("keeps the two hosts apart once the anonymous one is set", () => {
-    process.env["STOREFRONT_BASE_URL"] = "https://marca.example.com";
-    process.env["ANON_BASE_URL"] = "https://anonimo.example.net";
-    const config = loadConfig();
-    expect(config.storefrontBaseUrl).toBe("https://marca.example.com");
-    expect(config.anonBaseUrl).toBe("https://anonimo.example.net");
+  // Everyone copies the domain out of a browser address bar, and the client
+  // builds https://<domain>/admin/... — a scheme left on would produce a URL
+  // with two of them and every catalog call would fail at DNS.
+  it("strips a scheme and a trailing slash from the store domain", () => {
+    process.env["SHOPIFY_STORE_DOMAIN"] = "https://tienda.myshopify.com/";
+    expect(loadConfig().shopifyStoreDomain).toBe("tienda.myshopify.com");
   });
 
-  it("strips a trailing slash from both, so a link never carries a double slash", () => {
-    process.env["STOREFRONT_BASE_URL"] = "https://marca.example.com/";
-    process.env["ANON_BASE_URL"] = "https://anonimo.example.net/";
-    const config = loadConfig();
-    expect(config.storefrontBaseUrl).toBe("https://marca.example.com");
-    expect(config.anonBaseUrl).toBe("https://anonimo.example.net");
+  // Pinned, not "latest": Shopify ships quarterly and deprecates on a rolling
+  // schedule, so a silently-moving API is a silently-changing agent.
+  it("pins an API version by default and lets it be overridden", () => {
+    expect(loadConfig().shopifyApiVersion).toBe("2026-01");
+    process.env["SHOPIFY_API_VERSION"] = "2026-07";
+    expect(loadConfig().shopifyApiVersion).toBe("2026-07");
   });
 
-  // An empty value is how Coolify presents a variable that was added and left
-  // blank — it must read as "unset", not as an empty host.
-  it("treats an empty ANON_BASE_URL as unset", () => {
-    process.env["STOREFRONT_BASE_URL"] = "https://marca.example.com";
-    process.env["ANON_BASE_URL"] = "   ";
-    expect(loadConfig().anonBaseUrl).toBe("https://marca.example.com");
+  // A single-location store never has to be told which location, so this stays
+  // optional; catalog.ts resolveLocation is what refuses to guess when there
+  // is more than one.
+  it("leaves the default location empty when it is not set", () => {
+    expect(loadConfig().shopifyLocationId).toBe("");
+  });
+
+  // Zero is legal and means "never cache" — a store whose owner edits in the
+  // Shopify admin while chatting wants exactly that.
+  it("defaults the catalog cache TTL and accepts zero", () => {
+    expect(loadConfig().catalogCacheTtlMs).toBe(60_000);
+    process.env["CATALOG_CACHE_TTL_MS"] = "0";
+    expect(loadConfig().catalogCacheTtlMs).toBe(0);
   });
 });
 

@@ -108,23 +108,35 @@ export interface Config {
   /** Same, for a burst containing photos: WhatsApp uploads them in slow waves. */
   batchMediaDebounceMs: number;
   batchMediaMaxWaitMs: number;
-  /** Public URL of the STOREFRONT (the web app) — not this server. */
-  storefrontBaseUrl: string;
+  /** The store's myshopify domain, e.g. mitienda.myshopify.com (no scheme). */
+  shopifyStoreDomain: string;
   /**
-   * Public URL of the host that serves ANONYMOUS /ver/<token> links. A separate
-   * domain from storefrontBaseUrl on purpose: a colleague resharing a listing
-   * must not hand their client a URL that names the company, and the host name
-   * itself is part of what the de-branded page hides. Defaults to
-   * storefrontBaseUrl, which is the single-domain deployment.
+   * Admin API access token from a custom app installed in the store admin,
+   * sent as X-Shopify-Access-Token. The blast radius of this one string is the
+   * whole catalog — prices, stock and orders — so it is scoped in Shopify to
+   * exactly the operations the tools use and never leaves this process.
    */
-  anonBaseUrl: string;
+  shopifyAdminToken: string;
   /**
-   * Secret that mints anonymous share tokens (the id in a /ver/<token> link).
-   * MUST match the web storefront's ANON_SHARE_SECRET or a minted link won't
-   * resolve. Empty disables the feature — the agent's get_anonymous_link tool
-   * then reports it as unconfigured rather than emitting a dead link.
+   * Pinned Admin API version. Shopify ships quarterly and deprecates on a
+   * rolling schedule, so this is a deliberate value rather than "latest": a
+   * silently-moving API is a silently-changing agent.
    */
-  anonShareSecret: string;
+  shopifyApiVersion: string;
+  /**
+   * Default inventory location (a gid://shopify/Location/… id). Every stock
+   * operation is per-location; with one location set here the agent never has
+   * to ask. Empty means "resolve the store's locations and ask when there is
+   * more than one" — see shopify/catalog.ts resolveLocation.
+   */
+  shopifyLocationId: string;
+  /**
+   * How long a fetched catalog stays usable for RANKING search results. The
+   * facts that must never be stale — price and stock — are re-read live for the
+   * products actually shown, so this only bounds how quickly a brand-new
+   * product becomes findable by text.
+   */
+  catalogCacheTtlMs: number;
   /**
    * Kill switch for the customer path. When false, non-owner messages get a
    * static "assistant unavailable" reply and never reach the agent (no Claude
@@ -235,13 +247,12 @@ export function loadConfig(): Config {
 
   const model = optional("MODEL", "claude-haiku-4-5");
 
-  // The anonymous host defaults to the branded one, so a deployment that has not
-  // split its domains keeps working exactly as before and dev needs one variable.
-  const storefrontBaseUrl = optional("STOREFRONT_BASE_URL", "http://localhost:3000").replace(
-    /\/+$/,
-    "",
-  );
-  const anonBaseUrl = optional("ANON_BASE_URL", "").replace(/\/+$/, "") || storefrontBaseUrl;
+  // Accept a full URL and keep only the host: the token header goes to
+  // https://<domain>/admin/api/<version>/graphql.json, and a domain that
+  // already carries a scheme would build a URL with two of them.
+  const shopifyStoreDomain = required("SHOPIFY_STORE_DOMAIN")
+    .replace(/^https?:\/\//, "")
+    .replace(/\/+$/, "");
 
   return {
     anthropicApiKey,
@@ -277,9 +288,11 @@ export function loadConfig(): Config {
     batchMaxWaitMs: optionalInt("BATCH_MAX_WAIT_MS", 45000),
     batchMediaDebounceMs: optionalInt("BATCH_MEDIA_DEBOUNCE_MS", 45000),
     batchMediaMaxWaitMs: optionalInt("BATCH_MEDIA_MAX_WAIT_MS", 120000),
-    storefrontBaseUrl,
-    anonBaseUrl,
-    anonShareSecret: optional("ANON_SHARE_SECRET", ""),
+    shopifyStoreDomain,
+    shopifyAdminToken: required("SHOPIFY_ADMIN_TOKEN"),
+    shopifyApiVersion: optional("SHOPIFY_API_VERSION", "2026-01"),
+    shopifyLocationId: optional("SHOPIFY_LOCATION_ID", ""),
+    catalogCacheTtlMs: optionalCountOrZero("CATALOG_CACHE_TTL_MS", 60_000),
     customerAgentEnabled: optionalBool("CUSTOMER_AGENT_ENABLED", true),
   };
 }

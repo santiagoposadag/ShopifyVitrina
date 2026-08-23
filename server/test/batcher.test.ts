@@ -27,6 +27,8 @@ const silentLog = { error: () => undefined, info: () => undefined } as unknown a
 interface Harness {
   db: DB;
   batcher: InboxBatcher;
+  /** Exposed so a test can wait for the flush chain to actually drain. */
+  queue: PerPhoneQueue;
   /** One entry per agent turn: exactly what the agent was asked to answer. */
   turns: { phone: string; role: TurnContext["role"]; text: string }[];
   /** One entry per failed attempt, in order — final marks the terminal one. */
@@ -37,9 +39,10 @@ function harness(overrides: Partial<InboxBatcherDeps> = {}): Harness {
   const db = openDb(":memory:");
   const turns: Harness["turns"] = [];
   const failures: Harness["failures"] = [];
+  const queue = new PerPhoneQueue();
   const batcher = new InboxBatcher({
     db,
-    queue: new PerPhoneQueue(),
+    queue,
     log: silentLog,
     debounceMs: DEBOUNCE_MS,
     maxWaitMs: MAX_WAIT_MS,
@@ -54,8 +57,19 @@ function harness(overrides: Partial<InboxBatcherDeps> = {}): Harness {
     },
     ...overrides,
   });
-  return { db, batcher, turns, failures };
+  return { db, batcher, queue, turns, failures };
 }
+
+/**
+ * A real event-loop turn, captured at module load — BEFORE any test installs
+ * fake timers, so this stays the genuine setImmediate whatever vi.useFakeTimers
+ * replaces later. Needed to wait on actual filesystem I/O inside a flush.
+ */
+const realSetTimeout = setTimeout;
+const realEventLoopTurn = (): Promise<void> =>
+  new Promise((resolve) => {
+    realSetTimeout(resolve, 1);
+  });
 
 /** Persist an inbound message and hand it to the batcher, as the webhook does. */
 function receive(h: Harness, phone: string, text: string, kind: MessageKind = "text"): number {
@@ -616,13 +630,35 @@ describe("voice notes", () => {
   });
 
   /**
-   * Close the burst and let it finish. One extra tick beyond the window,
-   * because transcription adds awaited work inside the queued flush that a
-   * text-only batch does not have.
+   * Close the burst and let it finish.
+   *
+   * The extra turns are not padding. resolveAudio awaits a real
+   * `unlink()` on the voice note's file — genuine libuv I/O, which fake timers
+   * do not control and `advanceTimersByTimeAsync(0)` does not wait for: that
+   * only drains microtasks. Whether the unlink had already settled therefore
+   * depended on what else the runner happened to have in flight, which made
+   * this whole group order-dependent — the same test passed alone and failed
+   * after its neighbours. Yielding real event-loop turns is what actually waits
+   * for it.
    */
-  async function settle(): Promise<void> {
+  async function settle(h: Harness): Promise<void> {
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
-    await vi.advanceTimersByTimeAsync(0);
+    await drain(h);
+  }
+
+  /**
+   * Yield until the phone's flush chain has actually finished.
+   *
+   * Polling the queue rather than guessing a tick count: the chain contains
+   * real I/O, so how long it takes is not a property of the fake clock. The
+   * bound is generous because vitest runs test FILES in parallel workers and a
+   * starved thread can take a while to get its I/O completion back.
+   */
+  async function drain(h: Harness): Promise<void> {
+    for (let i = 0; i < 500 && h.queue.activePhones > 0; i++) {
+      await realEventLoopTurn();
+      await vi.advanceTimersByTimeAsync(0);
+    }
   }
 
   /** Persist a voice note the way the webhook does: no text, an audio path. */
@@ -646,7 +682,7 @@ describe("voice notes", () => {
     });
     receiveVoice(h, "573001", "/tmp/note.ogg");
 
-    await settle();
+    await settle(h);
 
     expect(h.turns).toHaveLength(1);
     expect(h.turns[0]!.text).toBe("busco apartamento en Laureles");
@@ -659,7 +695,7 @@ describe("voice notes", () => {
     const h = harness({ transcribeAudio: async () => null });
     receiveVoice(h, "573001", "/tmp/note.ogg");
 
-    await settle();
+    await settle(h);
 
     expect(h.turns).toHaveLength(1);
     expect(h.turns[0]!.text).toBe(AUDIO_FALLBACK);
@@ -673,7 +709,7 @@ describe("voice notes", () => {
     });
     receiveVoice(h, "573001", "/tmp/note.ogg");
 
-    await settle();
+    await settle(h);
 
     expect(h.turns).toHaveLength(1);
     expect(h.turns[0]!.text).toBe(AUDIO_FALLBACK);
@@ -683,7 +719,7 @@ describe("voice notes", () => {
     const h = harness(); // no transcribeAudio dep
     receiveVoice(h, "573001", "/tmp/note.ogg");
 
-    await settle();
+    await settle(h);
 
     expect(h.turns[0]!.text).toBe(AUDIO_FALLBACK);
   });
@@ -708,9 +744,9 @@ describe("voice notes", () => {
     });
     receiveVoice(h, "573001", "/tmp/note.ogg");
 
-    await settle();
+    await settle(h);
     await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS + DEBOUNCE_MS);
-    await vi.advanceTimersByTimeAsync(0);
+    await drain(h);
 
     expect(h.turns).toHaveLength(2);
     expect(h.turns[1]!.text).toBe("hola");
@@ -721,7 +757,7 @@ describe("voice notes", () => {
     const h = harness({ transcribeAudio: async () => "el código es 1912" });
     const id = receiveVoice(h, "573001", "/tmp/note.ogg");
 
-    await settle();
+    await settle(h);
 
     const row = h.db.prepare(`SELECT agent_text, audio_path FROM inbox WHERE id = ?`).get(id);
     expect(row).toEqual({ agent_text: "el código es 1912", audio_path: null });

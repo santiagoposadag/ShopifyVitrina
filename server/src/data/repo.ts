@@ -1,489 +1,12 @@
 import { unlinkSync } from "node:fs";
 import type { DB } from "./db.js";
-import type {
-  Lead,
-  LeadType,
-  MessageKind,
-  Product,
-  ProductAttributes,
-  ProductAttributeUpdates,
-  ProductPhoto,
-  ProductStatus,
-} from "../types.js";
+import type { Lead, LeadType, MessageKind } from "../types.js";
 
-interface ProductRow {
-  id: number;
-  code: string;
-  title: string;
-  description: string | null;
-  price: number | null;
-  currency: string;
-  status: ProductStatus;
-  attributes: string;
-  created_at: string;
-  updated_at: string;
-}
-
-function rowToProduct(row: ProductRow): Product {
-  let attributes: ProductAttributes = {};
-  try {
-    attributes = JSON.parse(row.attributes) as ProductAttributes;
-  } catch {
-    attributes = {};
-  }
-  return { ...row, attributes };
-}
-
-export interface SearchFilters {
-  query?: string;
-  min_price?: number;
-  max_price?: number;
-  bedrooms?: number;
-  neighborhood?: string;
-  /** Relevance floor, 0..1. Defaults to DEFAULT_MIN_SCORE. */
-  min_score?: number;
-  /** Cap on results. Uncapped when absent — only the customer search sets one. */
-  limit?: number;
-}
-
-/** SearchFilters plus the status axis, which only the owner's report has. */
-export interface ListFilters extends SearchFilters {
-  status?: ProductStatus;
-}
-
-/** A product the search kept, with how well its text answered the request. */
-export interface SearchHit {
-  product: Product;
-  score: number;
-}
-
-/**
- * How much of what was asked for a listing must account for to come back at all.
- *
- * A floor rather than a cutoff the caller tunes per question: the agent decides
- * which of the survivors to show, but it does not get to widen its own search
- * until something appears. Empty means empty — we have nothing like that.
- */
-export const DEFAULT_MIN_SCORE = 0.6;
-
-/** Above this, the text answered the request rather than merely resembling it. */
-export const CONFIDENT_MATCH_SCORE = 0.8;
-
-/**
- * Cap on what a CUSTOMER search returns, so a large catalog cannot flood the
- * turn. Deliberately not applied to the owner's report: an inventory answered
- * with 10 of 30 rows reads as the whole inventory, and nothing on screen says
- * otherwise.
- */
-const MAX_SEARCH_RESULTS = 10;
-
-/** Below this length a word is too short for an edit-distance guess to mean anything. */
-const FUZZY_MIN_LENGTH = 4;
-const FUZZY_MIN_RATIO = 0.8;
-const FUZZY_SCORE = 0.8;
-
-/**
- * Spanish function words. They carry no information about a property, and left
- * in they would drag every score down by the length of the sentence: "casa en
- * llano grande" would cap at 3/4 even with a perfect match.
- */
-const STOPWORDS = new Set([
-  "a", "al", "algun", "alguna", "algunas", "alguno", "algunos", "con", "cual", "cuales", "de",
-  "del", "el", "en", "es", "esta", "hay", "la", "las", "lo", "los", "me", "mi", "o", "para", "por",
-  "que", "se", "si", "sin", "su", "sus", "tenemos", "tiene", "tienen", "un", "una", "unas", "unos",
-  "y",
-
-  // Not grammar — these name the catalog itself. Every listing is a propiedad
-  // and every question is someone buscando one, so the words cannot tell two
-  // listings apart, and counting them as misses punishes the natural way of
-  // asking: "¿Tenemos alguna propiedad en Llano Grande?" would cap at 2/3 and
-  // trip the approximate-match warning over an exact answer.
-  "algo", "busca", "buscamos", "buscando", "busco", "disponible", "disponibles", "inmueble",
-  "inmuebles", "necesito", "propiedad", "propiedades", "quiero",
-]);
-
-/** Lowercase, unaccented, punctuation-free. Applied to BOTH sides of every comparison. */
-function normalize(value: string): string {
-  return value
-    .normalize("NFD")
-    // Strip the combining marks NFD just split off. Doing it BEFORE the
-    // punctuation pass matters: left in, an accent would become a space and
-    // "belen" would arrive as two words.
-    .replace(/\p{Mn}/gu, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
-
-function tokenize(value: string): string[] {
-  if (!value) return [];
-  return normalize(value)
-    .split(" ")
-    .filter((token) => token.length > 0 && !STOPWORDS.has(token));
-}
-
-/**
- * The structured attributes, said the way a person would say them.
- *
- * Nobody asks for "un apartamento" — they ask for "un apartamento de 3 alcobas
- * en Laureles". Bedrooms is a number in a column, so without this the words
- * "3 alcobas" are two guaranteed misses that drag the score of the listing that
- * actually answers the question below the floor. Both Colombian words for a
- * bedroom are emitted because both get typed; this is verbalizing one field,
- * not a synonym table.
- *
- * Booleans are emitted only when true: a listing without an elevator must not
- * answer to "ascensor".
- */
-function attributeText(a: ProductAttributes): string {
-  const parts: string[] = [];
-  if (a.bedrooms != null) parts.push(`${a.bedrooms} alcobas habitaciones`);
-  if (a.bathrooms != null) parts.push(`${a.bathrooms} banos`);
-  if (a.area_m2 != null) parts.push(`${a.area_m2} m2 metros`);
-  if (a.lot_m2 != null) parts.push(`${a.lot_m2} lote`);
-  if (a.levels != null) parts.push(`${a.levels} niveles`);
-  if (a.floor != null) parts.push(`piso ${a.floor}`);
-  if (a.estrato != null) parts.push(`estrato ${a.estrato}`);
-  if (a.elevator) parts.push("ascensor");
-  return parts.join(" ");
-}
-
-/**
- * Every word of a product's text, PLUS every adjacent pair glued together.
- *
- * The pairs are what make word boundaries stop mattering in either direction:
- * a search for "llanogrande" finds a listing that says "Llano Grande", and a
- * search for "llano grande" finds one that says "Llanogrande" because each
- * token is contained in that single word. Gluing the whole haystack instead
- * would invent matches across unrelated words ("piso rojo" would answer to
- * "oro"), so the joins stay pairwise.
- */
-function wordsAndPairs(raw: string): string[] {
-  const words = normalize(raw).split(" ").filter(Boolean);
-  const pairs = words.slice(0, -1).map((word, i) => word + words[i + 1]);
-  return [...words, ...pairs];
-}
-
-function haystackFor(p: Product): string[] {
-  return wordsAndPairs(
-    [
-      p.title,
-      p.description ?? "",
-      p.code,
-      p.attributes.neighborhood ?? "",
-      p.attributes.city ?? "",
-      (p.attributes.features ?? []).join(" "),
-      attributeText(p.attributes),
-    ].join(" "),
-  );
-}
-
-/** The location fields alone — the tie-break haystack, see searchCatalog. */
-function locationHaystackFor(p: Product): string[] {
-  return wordsAndPairs(`${p.attributes.neighborhood ?? ""} ${p.attributes.city ?? ""}`);
-}
-
-/**
- * Standard Levenshtein, two rows. Only ever runs on single words.
- *
- * Every `?? 0` below is unreachable — both rows are built to length b.length+1
- * and every index is bounded by its loop — but noUncheckedIndexedAccess cannot
- * see that, and a fallback reads better here than an assertion.
- */
-function editDistance(a: string, b: string): number {
-  let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
-
-  for (let i = 1; i <= a.length; i++) {
-    const current = [i];
-    for (let j = 1; j <= b.length; j++) {
-      const substitute = (previous[j - 1] ?? 0) + (a[i - 1] === b[j - 1] ? 0 : 1);
-      const insert = (current[j - 1] ?? 0) + 1;
-      const remove = (previous[j] ?? 0) + 1;
-      current.push(Math.min(substitute, insert, remove));
-    }
-    previous = current;
-  }
-  return previous[b.length] ?? 0;
-}
-
-/** 1 for a contained word, FUZZY_SCORE for a probable typo, 0 for a miss. */
-function scoreToken(token: string, haystack: string[]): number {
-  // A number is a value, not a word fragment: "3 alcobas" must not be answered
-  // by an area of 230 m². Exact word only, and never fuzzy — a mistyped number
-  // is a different number, not a misspelling.
-  if (/^\d+$/.test(token)) return haystack.includes(token) ? 1 : 0;
-
-  if (haystack.some((word) => word.includes(token))) return 1;
-  if (token.length < FUZZY_MIN_LENGTH) return 0;
-
-  for (const word of haystack) {
-    // A word that differs in length by more than a couple of characters is a
-    // different word, not a misspelling — and skipping it keeps the glued
-    // pairs from fuzzy-matching short tokens.
-    if (Math.abs(word.length - token.length) > 2) continue;
-    const ratio = 1 - editDistance(token, word) / Math.max(token.length, word.length);
-    if (ratio >= FUZZY_MIN_RATIO) return FUZZY_SCORE;
-  }
-  return 0;
-}
-
-/**
- * Rank an already-fetched set by how much of the request each product answers.
- *
- * Two kinds of filter, deliberately not treated alike:
- *
- * - price and bedrooms EXCLUDE. They are constraints someone stated, not
- *   preferences to weigh: a listing at five times the budget is not a partial
- *   match, it is the wrong property, and surfacing it "because it scored well
- *   on text" wastes the customer's time.
- * - `query` and `neighborhood` SCORE. Both are prose, both arrive however the
- *   person happened to say it, and neither should ever be the reason a real
- *   listing goes unmentioned. They share one token bag against one haystack:
- *   in real estate a sector named in the description ("cerca de Laureles") is
- *   genuine signal, and the agent is the one judging relevance anyway.
- *
- * Kept separate from the queries so the customer search and the owner report
- * rank identically — the ONLY difference between them is which rows they fetch
- * and how many they keep.
- */
-export function rankProducts(products: Product[], filters: SearchFilters): SearchHit[] {
-  const tokens = [...tokenize(filters.query ?? ""), ...tokenize(filters.neighborhood ?? "")];
-  const minScore = filters.min_score ?? DEFAULT_MIN_SCORE;
-
-  const hits: (SearchHit & { locationScore: number })[] = [];
-  for (const product of products) {
-    if (filters.min_price !== undefined && (product.price ?? 0) < filters.min_price) continue;
-    if (
-      filters.max_price !== undefined &&
-      (product.price ?? Number.MAX_SAFE_INTEGER) > filters.max_price
-    )
-      continue;
-    if (filters.bedrooms !== undefined && (product.attributes.bedrooms ?? -1) < filters.bedrooms)
-      continue;
-
-    // No text asked for means every survivor answers the request equally.
-    if (tokens.length === 0) {
-      hits.push({ product, score: 1, locationScore: 0 });
-      continue;
-    }
-
-    const scoreAgainst = (haystack: string[]): number =>
-      tokens.reduce((sum, token) => sum + scoreToken(token, haystack), 0) / tokens.length;
-
-    const score = scoreAgainst(haystackFor(product));
-    if (score < minScore) continue;
-    hits.push({ product, score, locationScore: scoreAgainst(locationHaystackFor(product)) });
-  }
-
-  // The tie-break exists because a description that cross-references a sector
-  // ("a 7 minutos de Jardines de Llanogrande") scores exactly as high as the
-  // listing that IS in it, and both deserve to come back. Which one leads is
-  // then decided by where the words were found: the structured field beats a
-  // passing mention. Without it, the answer to "¿tienen algo en Llanogrande?"
-  // would open with the neighbouring house whenever that one was edited more
-  // recently — sort is stable, so equal ranks keep the SQL order and the only
-  // signal left is updated_at.
-  return hits
-    .sort((a, b) => b.score - a.score || b.locationScore - a.locationScore)
-    .slice(0, filters.limit ?? Number.POSITIVE_INFINITY)
-    .map(({ product, score }) => ({ product, score }));
-}
-
-/** Search ACTIVE products only — the customer-facing catalog. */
-export function searchCatalog(db: DB, filters: SearchFilters): SearchHit[] {
-  const rows = db
-    .prepare(`SELECT * FROM products WHERE status = 'active' ORDER BY updated_at DESC`)
-    .all() as ProductRow[];
-
-  return rankProducts(rows.map(rowToProduct), {
-    ...filters,
-    limit: filters.limit ?? MAX_SEARCH_RESULTS,
-  });
-}
-
-export function getProductByCode(db: DB, code: string): Product | undefined {
-  const row = db.prepare(`SELECT * FROM products WHERE code = ?`).get(code) as
-    | ProductRow
-    | undefined;
-  return row ? rowToProduct(row) : undefined;
-}
-
-/**
- * The owner's inventory report: every status, and the same text ranking the
- * customer search uses.
- *
- * The text filters are here because without them the owner's most natural
- * question had no tool at all. "¿Tenemos algo en Llano Grande?" spans statuses —
- * a draft in that sector is still something they have — and searchCatalog can
- * never answer it, since it only sees active listings. Asked that question the
- * agent reached for the one tool that crossed statuses, called it three times by
- * status with no sector filter, and reported absence from three answers that had
- * never looked.
- *
- * Safe to show drafts here ONLY because this tool is owner-only (pinned in
- * test/tools.test.ts). A draft's facts are unreviewed and must never reach a
- * customer, which is why the equivalent shortcut — giving searchCatalog a status
- * parameter — was rejected: it would move that boundary from the tool SET, where
- * it is structural, to an argument the model fills.
- */
-export function listProducts(db: DB, filters: ListFilters = {}): SearchHit[] {
-  const rows = (
-    filters.status
-      ? db
-          .prepare(`SELECT * FROM products WHERE status = ? ORDER BY updated_at DESC`)
-          .all(filters.status)
-      : db.prepare(`SELECT * FROM products ORDER BY updated_at DESC`).all()
-  ) as ProductRow[];
-
-  // No limit: see MAX_SEARCH_RESULTS.
-  return rankProducts(rows.map(rowToProduct), filters);
-}
-
-export function getProductPhotos(db: DB, productId: number): ProductPhoto[] {
-  return db
-    .prepare(`SELECT * FROM product_photos WHERE product_id = ? ORDER BY sort ASC, id ASC`)
-    .all(productId) as ProductPhoto[];
-}
-
-export interface UpsertProductInput {
-  code: string;
-  title?: string;
-  description?: string;
-  price?: number;
-  currency?: string;
-  status?: ProductStatus;
-  attributes?: ProductAttributeUpdates;
-}
-
-/**
- * Merge incoming attributes into the stored ones, key by key. An explicit null
- * REMOVES the key rather than storing a null: the owner's only way to un-say a
- * fact (the agent has been known to invent one), and the stored JSON keeps
- * matching ProductAttributes, where absent means absent.
- *
- * Only null clears. Falsy values like 0 (no admin fee) and false (no elevator)
- * are facts the owner stated and are preserved.
- */
-function mergeAttributes(
-  existing: ProductAttributes,
-  incoming: ProductAttributeUpdates | undefined,
-): ProductAttributes {
-  const merged: ProductAttributes = { ...existing };
-  for (const [key, value] of Object.entries(incoming ?? {})) {
-    if (value === null) delete merged[key];
-    else merged[key] = value;
-  }
-  return merged;
-}
-
-export interface UpsertResult {
-  product: Product;
-  created: boolean;
-}
-
-/**
- * Create a draft product or update an existing one by code. Only provided
- * fields are changed. Records an audit row in product_changes.
- */
-export function upsertProduct(
-  db: DB,
-  input: UpsertProductInput,
-  changedByPhone: string | null,
-): UpsertResult {
-  const existing = getProductByCode(db, input.code);
-
-  if (!existing) {
-    const info = db
-      .prepare(
-        `INSERT INTO products (code, title, description, price, currency, status, attributes)
-         VALUES (@code, @title, @description, @price, @currency, @status, @attributes)`,
-      )
-      .run({
-        code: input.code,
-        title: input.title ?? `Producto ${input.code}`,
-        description: input.description ?? null,
-        price: input.price ?? null,
-        currency: input.currency ?? "COP",
-        status: input.status ?? "draft",
-        attributes: JSON.stringify(mergeAttributes({}, input.attributes)),
-      });
-    const product = getProductById(db, Number(info.lastInsertRowid));
-    recordChange(db, product.id, changedByPhone, `Created product ${input.code}`);
-    return { product, created: true };
-  }
-
-  const merged = mergeAttributes(existing.attributes, input.attributes);
-  const changes: string[] = [];
-  if (input.title !== undefined && input.title !== existing.title) changes.push("title");
-  if (input.description !== undefined && input.description !== existing.description)
-    changes.push("description");
-  if (input.price !== undefined && input.price !== existing.price) changes.push("price");
-  if (input.status !== undefined && input.status !== existing.status) changes.push("status");
-  if (input.attributes !== undefined) changes.push("attributes");
-
-  db.prepare(
-    `UPDATE products SET
-       title = @title,
-       description = @description,
-       price = @price,
-       currency = @currency,
-       status = @status,
-       attributes = @attributes,
-       updated_at = datetime('now')
-     WHERE id = @id`,
-  ).run({
-    id: existing.id,
-    title: input.title ?? existing.title,
-    description: input.description ?? existing.description,
-    price: input.price ?? existing.price,
-    currency: input.currency ?? existing.currency,
-    status: input.status ?? existing.status,
-    attributes: JSON.stringify(merged),
-  });
-
-  const product = getProductById(db, existing.id);
-  recordChange(
-    db,
-    product.id,
-    changedByPhone,
-    changes.length > 0 ? `Updated ${changes.join(", ")}` : "No-op update",
-  );
-  return { product, created: false };
-}
-
-export function getProductById(db: DB, id: number): Product {
-  const row = db.prepare(`SELECT * FROM products WHERE id = ?`).get(id) as ProductRow | undefined;
-  if (!row) throw new Error(`Product ${id} not found`);
-  return rowToProduct(row);
-}
-
-export function recordChange(
-  db: DB,
-  productId: number,
-  changedByPhone: string | null,
-  summary: string,
-): void {
-  db.prepare(
-    `INSERT INTO product_changes (product_id, changed_by_phone, change_summary)
-     VALUES (?, ?, ?)`,
-  ).run(productId, changedByPhone, summary);
-}
-
-export function insertPhoto(
-  db: DB,
-  photo: { product_id: number; file_path: string; public_path: string; caption?: string | null; sort?: number },
-): void {
-  db.prepare(
-    `INSERT INTO product_photos (product_id, file_path, public_path, caption, sort)
-     VALUES (@product_id, @file_path, @public_path, @caption, @sort)`,
-  ).run({
-    product_id: photo.product_id,
-    file_path: photo.file_path,
-    public_path: photo.public_path,
-    caption: photo.caption ?? null,
-    sort: photo.sort ?? 0,
-  });
-}
+// The catalog is NOT here. Products, variants, prices, stock and photos live in
+// Shopify (see ../shopify/), which is the source of truth for every one of
+// them. This module owns only what Shopify has no place for: leads, contacts,
+// agent sessions, the durable inbox, and inbound photos on their way to a
+// product.
 
 export interface LeadInput {
   phone: string;
@@ -754,6 +277,7 @@ export function deleteStaleInboxRows(
   return done.changes + failed.changes;
 }
 
+
 // --- Pending media ----------------------------------------------------------
 
 export function addPendingMedia(
@@ -771,7 +295,7 @@ export function addPendingMedia(
   });
 }
 
-interface PendingMediaRow {
+export interface PendingMedia {
   id: number;
   phone: string;
   file_path: string;
@@ -780,7 +304,7 @@ interface PendingMediaRow {
 }
 
 /**
- * Delete unattached pending media older than the given age, removing both the
+ * Delete un-uploaded pending media older than the given age, removing both the
  * DB rows and the files on disk. Keeps stored inbound media from growing without
  * bound. Returns the number of rows deleted.
  */
@@ -788,7 +312,7 @@ export function deleteStalePendingMedia(db: DB, olderThanHours: number): number 
   const rows = db
     .prepare(
       `SELECT id, file_path FROM pending_media
-       WHERE attached_product_id IS NULL AND received_at < datetime('now', ?)`,
+       WHERE attached_to IS NULL AND received_at < datetime('now', ?)`,
     )
     .all(`-${olderThanHours} hours`) as { id: number; file_path: string }[];
   if (rows.length === 0) return 0;
@@ -809,41 +333,39 @@ export function deleteStalePendingMedia(db: DB, olderThanHours: number): number 
 }
 
 /**
- * Attach this phone's unattached inbound media to a product. Moves rows from
- * pending_media into product_photos and marks them attached. Returns count.
+ * This phone's photos that have not been uploaded to a product yet, oldest
+ * first.
+ *
+ * Arrival order IS listing order: the bridge's outbox delivers a WhatsApp photo
+ * burst strictly sequentially, so the order these come back in is the order the
+ * owner sent them, and the first one becomes the product's cover image.
+ *
+ * Deliberately does NOT mark anything: the upload can fail halfway, and a row
+ * claimed before the network call would leave photos that never reached Shopify
+ * looking like they had. markPendingMediaAttached is called after, with only
+ * the ids that actually landed.
  */
-export function attachPendingPhotos(db: DB, phone: string, productId: number): number {
-  const pending = db
+export function listPendingMedia(db: DB, phone: string): PendingMedia[] {
+  return db
     .prepare(
       `SELECT id, phone, file_path, public_path, caption
        FROM pending_media
-       WHERE phone = ? AND attached_product_id IS NULL
+       WHERE phone = ? AND attached_to IS NULL
        ORDER BY received_at ASC, id ASC`,
     )
-    .all(phone) as PendingMediaRow[];
+    .all(phone) as PendingMedia[];
+}
 
-  if (pending.length === 0) return 0;
-
-  const baseSort =
-    (db.prepare(`SELECT COALESCE(MAX(sort), -1) AS m FROM product_photos WHERE product_id = ?`).get(
-      productId,
-    ) as { m: number }).m + 1;
-
+/**
+ * Record that these photos reached a Shopify product, so the housekeeping sweep
+ * stops treating them as unclaimed and their files survive the TTL.
+ */
+export function markPendingMediaAttached(db: DB, ids: number[], productGid: string): void {
+  const mark = db.prepare(
+    `UPDATE pending_media SET attached_to = ?, attached_at = datetime('now') WHERE id = ?`,
+  );
   const tx = db.transaction(() => {
-    pending.forEach((row, index) => {
-      insertPhoto(db, {
-        product_id: productId,
-        file_path: row.file_path,
-        public_path: row.public_path,
-        caption: row.caption,
-        sort: baseSort + index,
-      });
-      db.prepare(`UPDATE pending_media SET attached_product_id = ? WHERE id = ?`).run(
-        productId,
-        row.id,
-      );
-    });
+    for (const id of ids) mark.run(productGid, id);
   });
   tx();
-  return pending.length;
 }

@@ -1,15 +1,21 @@
 # Vitrina
 
-A WhatsApp-native sales & inventory assistant. One WhatsApp number becomes a full
-sales channel: an AI assistant (Claude) answers customer questions from a live
-catalog, sends photos, captures leads, and schedules visits — while the business
-owner manages inventory **through WhatsApp itself**, in natural language. A public
-storefront (landing + catalog) is generated automatically from the same catalog.
+A WhatsApp-native **inventory assistant for a Shopify store**. One WhatsApp
+number becomes the store's admin panel: the owner creates products, changes
+prices, moves stock and uploads photos by chatting in natural language, and
+customers search the same catalog and get answers grounded in live data.
 
-First vertical: real estate. The pilot ships with two seed properties.
+The catalog is **Shopify**. There is no local products table and no storefront
+of our own — the store already is one. SQLite keeps only what Shopify has no
+place for: the durable inbox, agent sessions, captured leads, and inbound photos
+on their way to a product.
 
-> **Language:** the assistant and the storefront speak neutral, professional Spanish.
-> All code, identifiers, and comments are in English.
+> **Language:** the assistant replies in neutral, professional Spanish.
+> All code, identifiers, comments and docs are in English.
+
+> **Milestone 1** is inventory: full CRUD over products, variants, stock and
+> photos. There is no checkout — the customer path answers questions and captures
+> leads. See `docs/shopify-adaptation.md` for what comes after.
 
 ---
 
@@ -18,11 +24,9 @@ First vertical: real estate. The pilot ships with two seed properties.
 Monorepo with npm workspaces:
 
 ```
-package.json          # workspaces: ["server", "web", "shared"]
+package.json          # workspaces: ["server"]
 env.sample            # copy to .env and fill in  (see note below)
 server/               # Fastify + Claude Agent SDK + SQLite  (the brain)
-web/                  # Next.js App Router storefront (reads the same SQLite file)
-shared/               # types-only package (@vitrina/shared) — no runtime code
 bridge/               # Go sidecar: the WhatsApp transport (whatsmeow)
 data/                 # created at runtime: vitrina.db + media/  (git-ignored)
 ```
@@ -44,10 +48,9 @@ Customer / Owner (WhatsApp)
                                                            │         │
                                              ┌─────────────┴─────────┴────────┐
                                              ▼                                 ▼
-                                        SQLite (better-sqlite3)          MEDIA_DIR (photos)
-                                             ▲
-                                             │ read-only
-                                        Next.js storefront (landing + catalog)
+                                    SQLite (better-sqlite3)         Shopify Admin API
+                                    inbox · sessions · leads        products · variants
+                                    pending photos                  inventory · media
 ```
 
 The bridge pairs a real number as a **linked device**. That means no WhatsApp
@@ -57,40 +60,52 @@ phone stays offline too long. See `bridge/` and CLAUDE.md.
 
 ### server/ — the brain
 
-- `src/config.ts` — env loading and role detection (`OWNER_PHONE_NUMBERS` allowlist).
-- `src/data/db.ts` — SQLite (WAL), schema created on boot.
-- `src/data/repo.ts` — all catalog/lead/session queries.
-- `src/whatsapp/channel.ts` — the transport seam: `sendText`, `downloadMedia(ref)`, optional `releaseMedia`. Outbound is text-only on purpose — photos are relayed as a storefront link, never pushed into the chat.
+- `src/config.ts` — env loading, role detection (`OWNER_PHONE_NUMBERS` allowlist), and the Shopify block. Fails fast: a missing store domain or token dies at boot rather than on the owner's first message.
+- `src/data/db.ts` — SQLite (WAL), schema created on boot. No catalog tables.
+- `src/data/repo.ts` — leads, contacts, sessions, the inbox, and pending photos.
+- `src/whatsapp/channel.ts` — the transport seam: `sendText`, `downloadMedia(ref)`, optional `releaseMedia`. Outbound is text-only on purpose — photos go to Shopify, never back into the chat.
 - `src/whatsapp/bridge.ts` — the one implementation: posts replies to the sidecar, reads staged media off the shared volume (`isAllowedMediaPath` confines it), sweeps files orphaned by a crash.
 - `src/inbox/whatsmeow.ts` — parses the bridge's event shape into an `InboundMessage`.
 - `src/inbox/webhook.ts` — `POST /webhook`: HMAC verify (raw body), persisted inbox (dedupe + at-least-once: unfinished messages are replayed on boot), media handoff, fast ACK.
-- `src/inbox/batcher.ts` — coalesces each phone's message burst into ONE agent turn (`BATCH_DEBOUNCE_MS` of silence, `BATCH_MAX_WAIT_MS` ceiling) and settles its inbox rows.
+- `src/inbox/batcher.ts` — coalesces each phone's message burst into ONE agent turn (`BATCH_DEBOUNCE_MS` of silence, `BATCH_MAX_WAIT_MS` ceiling) and settles its inbox rows. Also mints the turn key that makes a stock adjustment safe to retry.
 - `src/inbox/queue.ts` — in-process FIFO with per-phone serialization.
-- `src/agent/agent.ts` — Claude Agent SDK integration: resume per-phone session (idle sessions expire after `SESSION_MAX_AGE_DAYS`; an unresumable session falls back once to a fresh one), run tools, reply in Spanish.
+- `src/agent/agent.ts` — Claude Agent SDK integration: resume per-phone session (idle sessions expire after `SESSION_MAX_AGE_DAYS`; an unresumable session falls back once to a fresh one), run tools, reply in Spanish. `systemPrompt` holds both personas.
 - `src/inbox/rate-limit.ts` — cost protection: per-phone sliding-hour limit + global daily cap for customer turns (owners exempt).
 - `src/inbox/alerts.ts` — notifies the owner's WhatsApp after consecutive agent failures.
 - `src/data/backup.ts` — consistent SQLite snapshot (online backup API) with pruning.
 - `src/data/transcripts.ts` — the Agent SDK's transcripts on disk: delete one session's, or sweep the ones no session row can resume any more. Inert unless `AGENT_TRANSCRIPTS_DIR` is set, which it deliberately does not default (see the file's header).
 - `src/data/purge.ts` / `src/data/purge-sessions.ts` — ops lever: drop every **customer** conversation history so they start fresh; owner sessions are kept. `docker compose --profile purge run --rm purge-sessions`, or `npm run purge:sessions -w server`.
-- `src/agent/tools.ts` — in-process MCP tools. Customer: `search_catalog`, `get_product`, `save_lead`. Owner (allowlist): the above plus `upsert_product`, `attach_pending_photos`, `list_products`, `list_leads`. The tool server has no WhatsApp channel: tools read and write data, they never message the chat.
-- `src/agent/preview.ts` — the storefront URL shapes: `/propiedad/<code>` for customers (active only), `/preview/<code>` for the owner's pre-publish review. Both ride back on tool results, since the agent may only state what a tool returned.
+- `src/agent/tools.ts` — in-process MCP tools, listed below. The tool server has no WhatsApp channel: tools read and write data, they never message the chat.
 - `src/whatsapp/media.ts` — serves `MEDIA_DIR` under `/media/*`; saves inbound media.
-- `src/seed/seed.ts` — parses the two example properties and inserts them as **active** with photos.
 - `src/index.ts` — wires everything; `GET /health`.
 
-### web/ — the storefront
+### server/src/shopify/ — the catalog
 
-Next.js 15 (App Router) + Tailwind v4, reading the **same** SQLite file directly via
-`better-sqlite3` (read-only, dynamic rendering — no static caching of DB reads).
+- `client.ts` — GraphQL over native `fetch` with an injectable implementation, so the whole tool suite is testable against a plain function. Handles the two failure modes that are easy to miss: cost **throttling arrives as a 200 OK** with `THROTTLED` in the errors array, and **`userErrors` is a response field**, so a rejected write also arrives as a 200.
+- `catalog.ts` — the operations: resolve by SKU / handle / gid, list and page, create (`productCreate` + `productVariantsBulkCreate`), update (a merge — `productUpdate` and `productVariantsBulkUpdate`), delete, publish to the Online Store channel, locations, stock reads and writes, and staged photo uploads.
+- `rank.ts` — the Spanish relevance scorer. Shopify's `products(query:)` has no accent folding, no typo tolerance and no comparable score, so it ranks a fetched set instead: this is what puts `match=NN%` on every result line and raises the approximate-match warning.
+- `cache.ts` — a short-lived, read-only catalog snapshot for ranking. Not a mirror: no write-back, no reconciliation. Price and stock are re-read live for the products actually shown.
 
-- `/` — brand hero + featured properties + WhatsApp CTA.
-- `/catalogo` — grid of all active products.
-- `/propiedad/[code]` — photo gallery, attributes, description, and the key CTA:
-  a `wa.me` deep link prefilled with `Hola, me interesa la propiedad con código <code>`.
-- `/preview/[code]` — the owner's view of a property in **any** status, so a draft can
-  be reviewed before publishing. Unlisted and `noindex`; not in the catalog.
-- `/media/[file]` — serves product photos from `MEDIA_DIR` (so the storefront is
-  self-contained and does not depend on the WhatsApp server being reachable).
+### The tools
+
+| Tool | Role | What it does |
+|---|---|---|
+| `search_catalog` | both | Rank what is for sale, with live prices and stock |
+| `get_product` | both | One product by SKU, handle or id (owners also see drafts) |
+| `save_lead` | both | Capture an inquiry, a back-in-stock request, or a follow-up |
+| `list_products` | owner | Inventory report across every status |
+| `create_product` | owner | New product with options, variants, prices, opening stock |
+| `update_product` | owner | Merge fields, change a variant's price/SKU, publish, archive |
+| `delete_product` | owner | Permanent — guarded by a handle confirmation |
+| `get_inventory` | owner | Live stock per variant, per location |
+| `adjust_inventory` | owner | `set_to` (compare-and-set) or `delta` (idempotent per turn) |
+| `attach_pending_photos` | owner | Upload this chat's photos, in arrival order |
+| `list_locations` | owner | The store's inventory locations |
+| `list_leads` | owner | What customers asked for |
+
+Customers get the first three and nothing else. That boundary is structural —
+the owner tools are never built for a customer turn — and pinned in
+`test/tools.test.ts`.
 
 ---
 
@@ -134,35 +149,43 @@ Every variable is documented in `env.sample`. Key ones:
 | `BRIDGE_URL`, `BRIDGE_STAGING_DIR` | Where the sidecar lives, and the shared directory it stages decrypted media in. Set by compose. |
 | `BRIDGE_PAIR_PHONE` | The number to pair, bare E.164 digits. Set it to pair by code instead of QR. |
 | `OWNER_PHONE_NUMBERS` | Comma-separated allowlist (E.164 digits, no `+`) that gets the owner toolset. |
-| `DB_PATH`, `MEDIA_DIR` | Shared by server and web. Relative paths resolve to the **repo root**, so both apps agree regardless of the workspace they run from. |
-| `PUBLIC_BASE_URL` | Public URL of the server (a tunnel) — used to build photo URLs WhatsApp can fetch. |
-| `STOREFRONT_BASE_URL` | Public URL of the **branded storefront** (a different host from `PUBLIC_BASE_URL`) — the owner's draft-preview links and the `/propiedad/<code>` links customers receive (default `http://localhost:3000`). |
-| `ANON_BASE_URL` | Public URL of the **anonymous host**, where `/ver/<token>` links live — a second domain on the same container, so a resharing colleague's client never reads the company's name in the address bar. Empty falls back to `STOREFRONT_BASE_URL` and the host split goes inert (single-domain / local). |
+| `SHOPIFY_STORE_DOMAIN` | **Required.** The store's myshopify domain. A scheme and trailing slash are stripped, so pasting the address bar works. |
+| `SHOPIFY_ADMIN_TOKEN` | **Required.** Admin API token from a custom app in the store admin. Scope it to `read/write_products`, `read/write_inventory`, `read_locations` — its blast radius is the whole catalog of a live store. |
+| `SHOPIFY_API_VERSION` | Pinned Admin API version (default `2026-01`). Deliberate, not `latest`: an unpinned version is an agent that changes behaviour without a deploy. |
+| `SHOPIFY_LOCATION_ID` | Default inventory location. Only needed with more than one — with several and this unset, the agent asks instead of guessing. |
+| `CATALOG_CACHE_TTL_MS` | How long a fetched catalog stays usable for **ranking** (default 60000; `0` never caches). Price and stock are always re-read live for the products shown. |
+| `DB_PATH`, `MEDIA_DIR` | Relative paths resolve to the **repo root**, so every workspace script agrees regardless of where it runs from. |
+| `PUBLIC_BASE_URL` | Public URL of the server (a tunnel). Only used to serve inbound owner photos while they wait to be uploaded. |
 | `RATE_LIMIT_PER_PHONE_PER_HOUR`, `RATE_LIMIT_GLOBAL_PER_DAY` | Cost protection for customer agent turns (defaults 20/hour per phone, 500/day global; owners exempt). |
 | `CUSTOMER_AGENT_ENABLED` | Kill switch for the customer path (default `true`). `false` auto-replies that the assistant is unavailable — non-owner messages never reach the agent or spend a Claude call. |
 | `SESSION_MAX_AGE_DAYS` | Conversations idle longer than this start a fresh agent session (default 7). |
 | `BATCH_DEBOUNCE_MS`, `BATCH_MAX_WAIT_MS` | How long a phone's messages are coalesced into one agent turn: silence that ends a burst (default 8000) and the ceiling from its first message (default 45000). |
 | `BATCH_MEDIA_DEBOUNCE_MS`, `BATCH_MEDIA_MAX_WAIT_MS` | The same two knobs once a burst contains photos (defaults 45000 / 120000) — WhatsApp delivers a photo set in waves tens of seconds apart. |
 
-### 3. Seed the catalog
+### 3. Connect the store
+
+Create a **custom app** in the Shopify admin (Settings → Apps and sales channels
+→ Develop apps), give it the four scopes above, install it, and copy the Admin
+API access token into `SHOPIFY_ADMIN_TOKEN`.
+
+There is nothing to seed: the catalog is whatever the store already holds. A
+quick check that the credentials work:
 
 ```bash
-npm run seed
+curl -s -X POST \
+  "https://$SHOPIFY_STORE_DOMAIN/admin/api/2026-01/graphql.json" \
+  -H "X-Shopify-Access-Token: $SHOPIFY_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{ shop { name } products(first: 3) { nodes { handle title } } }"}'
 ```
 
-Inserts the two example properties as **active** with their photos copied into
-`MEDIA_DIR`:
-
-- Código **916** — house in Rionegro (Barro Blanco), 230 m², 3 levels, $1.150.000.000, no admin fee.
-- Código **1912** — apartment in Belén Rosales (Malibú), 78 m², 3 bed / 2 bath, floor 8 with elevator, admin $270.000, estrato 5, $670.000.000 negotiable.
-
-  (The seed applies the seller's correction: the apartment's code is **1912**, not 008.)
+An `errors` array naming a field means the token lacks that scope; a 401 means
+the token is wrong.
 
 ### 4. Run
 
 ```bash
 npm run dev:server     # Fastify on :3001
-npm run dev:web        # Next.js on :3000  (open http://localhost:3000)
 ```
 
 ### 5. Pair the WhatsApp number
@@ -200,9 +223,9 @@ same idea for liveness, and is what Docker runs.
 > its own outgoing messages — otherwise every reply would loop back in as a new
 > message. Pair one number, message it from a different phone.
 
-A tunnel is still needed for **outbound links**, not for messages: the storefront
-URLs the assistant sends must resolve on the recipient's phone. Set
-`PUBLIC_BASE_URL` / `STOREFRONT_BASE_URL` to public addresses.
+No tunnel is needed for messages, and none is needed for links either: product
+URLs point at the Shopify store, which is already public. `PUBLIC_BASE_URL` only
+matters for the `/media` route that holds inbound owner photos in transit.
 
 ---
 
@@ -219,28 +242,30 @@ client and a ban takes the number with it.
 **Customer example**
 
 ```
-You:  Hola, busco apartamento en Belén hasta 700 millones
-Bot:  (searches the catalog) Tenemos el código 1912 en Belén Rosales (Malibú): 78 m²,
-      3 habitaciones, 2 baños, piso 8 con ascensor. Precio $670.000.000 negociable.
-      ¿Querés ver fotos o agendar una visita?
-You:  Mandame fotos
-Bot:  (sends up to 4 photos) …
-You:  Quiero visitarlo el sábado, soy Ana
-Bot:  (saves a visit_request lead) ¡Listo Ana! Registré tu solicitud de visita para el
-      código 1912. Un asesor te contacta para coordinar el sábado.
+You:  Hola, tienen camisetas negras en talla M?
+Bot:  (searches the catalog) Sí, la Camiseta negra manga corta en talla M está
+      disponible: $80.000, quedan 5. Te paso el link: https://…
+You:  Y en L?
+Bot:  (checks the variant) En L está agotada por ahora. ¿Te aviso cuando vuelva?
+You:  Sí, soy Ana
+Bot:  (saves a back_in_stock lead) Listo Ana, te escribimos apenas entre la talla L.
 ```
 
-**Owner example (ingestion + correction)** — from a number in `OWNER_PHONE_NUMBERS`:
+**Owner example (create, correct, publish)** — from a number in `OWNER_PHONE_NUMBERS`:
 
 ```
-You:  📣 VENDO CASA PARA ESTRENAR … 📐 Área: 230 metros cuadrados … 💲 Precio: 1.150.000.000
-Bot:  (parses it) Cargué un borrador. Para publicarlo necesito el código. ¿Cuál es?
-You:  Código 916
-Bot:  (upsert_product) Guardé el código 916. ¿Lo publico en la vitrina?
-You:  Sí
-Bot:  Publicado. Ya aparece en el catálogo.
-You:  El código 008 no es. Ya es código 1912
-Bot:  (upsert_product) Corregido: el apartamento ahora tiene el código 1912.
+You:  Voy a subir una camiseta negra, 80 mil, tallas S M L
+Bot:  (asks for what is missing) ¿Cuántas unidades tienes de cada talla?
+You:  10 de cada una
+Bot:  (create_product) Creé "Camiseta negra" como borrador con S, M y L a $80.000,
+      10 de cada una. ¿La publico?
+You:  (sends 4 photos)
+Bot:  (attach_pending_photos) Subí 4 fotos a camiseta-negra.
+You:  Publícala
+Bot:  (update_product, status ACTIVE + publish) Listo, camiseta-negra ya está
+      publicada en la tienda.
+You:  Vendí 3 de la M
+Bot:  (adjust_inventory) Ajusté CAM-NEG-M: quedan 7.
 ```
 
 ### Limitations of a linked device
@@ -263,9 +288,8 @@ Bot:  (upsert_product) Corregido: el apartamento ahora tiene el código 1912.
 ## Testing, building, running
 
 ```bash
-npm test                        # server unit tests (vitest) — no network, SDK mocked
-npm run build                   # server typecheck + tsc build (dist/) + next build
-npm run seed                    # (re)seed the catalog
+npm test                        # server unit tests (vitest) — no network, SDK and Shopify faked
+npm run build                   # server typecheck + tsc build (dist/)
 cd bridge && go test ./...      # bridge suite (Go)
 ```
 
@@ -275,8 +299,12 @@ cleanup), inbound message extraction (text / image / interactive / foreign-provi
 staging-path confinement and media release, per-phone queue ordering (including on
 failure) and cross-phone concurrency, rate limiting (sliding window, global cap, notice
 throttling), failure alerting, session expiry, the owner/customer tool privilege
-boundary, `search_catalog` filtering, `upsert_product` merge + audit trail,
-`attach_pending_photos`, and listing-parser sanity (including the 008→1912 correction).
+boundary, and both halves of the Shopify layer: the client's throttle retry and
+`userErrors` handling, the catalog's resolve order and query escaping, the
+idempotency key on a stock delta and the compare-and-set on an absolute count,
+photo upload order and partial failure, the relevance scorer (accents, glued
+word breaks, digits that never fuzzy-match), and the catalog cache's TTL,
+keying and concurrent-miss collapsing.
 
 Bridge tests cover: outbox ordering, durability across a restart, retry with backoff,
 and poison-row discard; every branch of LID→phone resolution including the unpaired
@@ -288,15 +316,13 @@ verifies in Node, and nothing else would catch the two drifting apart.
 
 ## Docker
 
-`compose.yaml` runs `server` (Fastify), `web` (Next.js), and `bridge` (Go) as separate
-images. The server and web share one SQLite database + media directory over a named
-volume; the bridge shares that same volume to hand over decrypted media, plus its own
-volume for the pairing. Works the same for local testing and for a copy-paste deploy
-onto a real server.
+`compose.yaml` runs `server` (Fastify) and `bridge` (Go) as separate images. They
+share a named volume so the bridge can hand over decrypted media by path; the
+bridge has a second volume for the pairing. Works the same for local testing and
+for a copy-paste deploy onto a real server.
 
 ```bash
 docker compose build
-docker compose --profile seed run --rm seed               # one-time: seed the catalog
 ./scripts/with-secrets.sh docker compose up -d             # secrets injected from gopass
 docker compose logs -f                                     # tail both services
 docker compose down                                        # stop (add -v to also drop the data volume)
@@ -308,28 +334,22 @@ repo-root `.env` into the same variables.
 
 Notes:
 
-- `seed` only runs when explicitly invoked with `--profile seed` — it never runs on a
-  plain `docker compose up`. It needs no secrets, only `DB_PATH` / `MEDIA_DIR` /
-  `PUBLIC_BASE_URL` (all provided by compose or defaulted).
 - **`vitrina-whatsapp` is the one volume you cannot recreate.** It holds the pairing
   and the delivery outbox. Dropping it (`docker compose down -v`) unlinks the number
   and someone has to re-pair by hand, phone in reach.
 - The `bridge` is deliberately unpublished — no `ports:`, and no domain on Coolify.
   Anyone who can reach `/send` can send WhatsApp messages as the business.
-- `NEXT_PUBLIC_BRAND_NAME` and `NEXT_PUBLIC_WHATSAPP_NUMBER` are inlined into the web
-  bundle at **build** time. Set them in `.env` before `docker compose build`, not just in
-  the running container's environment — otherwise the WhatsApp CTA silently breaks.
-- On a real server, `PUBLIC_BASE_URL` (in `.env`, used by the `server` and `seed`
-  services) must point at a public domain — never `localhost` — or the photo URLs and
-  storefront links the assistant sends will not resolve on the recipient's phone.
+- `SHOPIFY_STORE_DOMAIN` and `SHOPIFY_ADMIN_TOKEN` are interpolated with **no
+  default**, so a bare `docker compose up` starts the server with blank values and
+  it fails its boot check. That is the intent — use `./scripts/with-secrets.sh`,
+  which exports the token from gopass.
 - The data volume (`vitrina-data`) is a Docker-managed named volume, not a host bind
   mount, so it already has the right ownership for the containers' non-root user.
-- The `web` container mounts the data volume read-write even though it only reads: SQLite
-  in WAL mode writes the `-shm` / `-wal` sidecar files even for read-only connections.
 
 ### Backups
 
-The catalog and every captured lead live in one SQLite file — back it up. Snapshots
+The catalog is in Shopify and backed up by Shopify. What lives only here is the
+inbox, the agent sessions and every captured lead — back that up. Snapshots
 use SQLite's online backup API (consistent even while the server is writing) and are
 pruned to the `BACKUP_KEEP` most recent (default 14):
 
@@ -387,16 +407,25 @@ test can cover:
   for the boot-time replay to find. `bridge/outbox.go` is that guarantee moved into our
   own process: durable before delivery, strictly ordered, retried forever, with a
   poison-row escape hatch so one bad payload cannot wedge the queue.
-- **Draft previews.** The catalog renders only `active` products, so an owner could
-  otherwise review a new listing only as a text summary over WhatsApp — or by publishing
-  it to customers first, which defeats the point of a draft. `/preview/<code>` renders the
-  real page (photos included) for any status, and the assistant includes the link in its
-  `upsert_product` result while the product is not active. The page is **unlisted, not
-  private**: no token, no access control — a deliberate pilot tradeoff, since the catalog
-  holds no sensitive data. It IS `noindex`'d, which is not about secrecy but about data
-  quality: a draft is unreviewed (the assistant has invented an attribute on a real
-  listing before), and a wrong fact about a real property indexed by a search engine
-  outlives the draft.
+- **Drafts instead of previews.** A new product is created as a Shopify `DRAFT`, so
+  the owner reviews it in the Shopify admin — which already renders it properly and
+  already has access control — rather than on a page we would have to build and then
+  decide how to protect. Publishing is a separate, explicit step, and it is two
+  operations rather than one: setting status `ACTIVE` does **not** put a product on
+  the storefront, publication to the Online Store sales channel does. The tools do
+  both and report which of the two actually succeeded, because reporting "publicado"
+  on the strength of the status field is the most plausible wrong-but-plausible bug
+  in this integration.
+- **Retrying a stock change is not free.** Delivery through this pipeline is
+  at-least-once by design, and that is safe for a product update (writing the same
+  fields twice is the same as writing them once) but not for a stock `delta`: applied
+  twice it removes six shirts where the owner sold three, and nothing anywhere
+  records that it happened. Two defences, both needed. The batcher mints a turn key
+  from the first inbox row of the batch — stable across retries even as the batch
+  absorbs newer messages — and it becomes Shopify's idempotency key, so a replay of
+  the same turn is discarded. And the prompt prefers `set_to`, which is a
+  compare-and-set against the current count, whenever the owner's words give the
+  resulting number.
 - **Message coalescing.** People send one thought per WhatsApp message, so a single
   listing can arrive as twenty of them. Rather than one agent turn (and one Claude call)
   per message — each seeing only a fragment of what was said — a phone's burst is
@@ -421,14 +450,24 @@ test can cover:
   Anthropic bill. Idle sessions expire after `SESSION_MAX_AGE_DAYS` so long-lived contacts
   do not drag months of history — and cost — into every turn. After repeated consecutive
   agent failures the owner is notified on WhatsApp (throttled to once per hour).
-- **Storefront photo serving.** Rather than copying `MEDIA_DIR` into `web/public`, the
-  web app serves photos through its own `/media/[file]` route reading `MEDIA_DIR`
-  directly — robust and independent of the server process.
+- **Photos leave the network now.** In the real-estate build a 37-photo owner burst
+  moved zero image bytes between services: the bridge decrypted into a shared volume
+  and handed the server a path. That still holds between our own containers, but every
+  photo now uploads to Shopify — 37 staged uploads against a rate-limited API. They run
+  strictly one at a time, because a concurrent map would be faster and would silently
+  shuffle the gallery: arrival order is the order the owner shot them in, and the first
+  photo becomes the product's cover.
 - **Agent runtime.** `@anthropic-ai/claude-agent-sdk` bundles its own runtime (`cli.js`),
   so no separate Claude Code install is required — only Node and `ANTHROPIC_API_KEY`. The
   agent is locked down: it can call **only** the in-process Vitrina tools (every built-in
   tool is denied), and the system prompt forbids stating any product fact not returned by
   a tool.
-- **SQLite + JSON attributes** keeps the catalog product-agnostic (real estate is just the
-  first attribute template); a future vertical is a new template, not new tables.
+- **Relevance stayed local even though the catalog did not.** Shopify is the source of
+  truth for every fact, but its product search has no accent folding, no typo tolerance
+  and no comparable score — pointing the tool straight at it would silently delete the
+  `match=NN%` contract and the approximate-match warning that keeps the agent from
+  confidently offering the wrong thing. So the scorer ranks a short-lived read-only
+  snapshot (`shopify/cache.ts`), and the two facts that must never be stale — price and
+  stock — are re-read live for the products actually shown. No write-back, no
+  reconciliation: it is a cache, not a mirror.
 ```

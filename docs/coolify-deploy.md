@@ -1,6 +1,6 @@
 # Deploying to Coolify
 
-> **Sections 1 and 4 have already happened.** They described the one-time move off Kapso onto the containerised stack, and `main` now carries `compose.yaml`, the three Dockerfiles and `bridge/`. They are kept as the record of how the deployment got its shape — read them to understand why the bridge exists and why its volume is the one that matters, not as steps to perform. **Sections 2, 3 and 5 stay live** and are what a deploy is checked against.
+> **Sections 1 and 4 have already happened.** They described the one-time move off Kapso onto the containerised stack, and `main` now carries `compose.yaml`, both Dockerfiles and `bridge/`. They are kept as the record of how the deployment got its shape — read them to understand why the bridge exists and why its volume is the one that matters, not as steps to perform. **Sections 2, 3 and 5 stay live** and are what a deploy is checked against.
 >
 > For an existing deployment, the only thing a new merge asks of you is §2: whether it introduces a variable Coolify does not have yet.
 
@@ -70,17 +70,18 @@ The number that was served through Kapso must now be **paired to the bridge as a
 
 To stay on Anthropic instead, leave all five unset (the defaults are Anthropic + `claude-haiku-4-5`) and set `ANTHROPIC_API_KEY`.
 
-### URLs and build args
+### Shopify and URLs
 
 | Variable | Notes |
 | --- | --- |
-| `PUBLIC_BASE_URL` | Public URL of the **server**. Baked into photo URLs WhatsApp fetches. |
-| `STOREFRONT_BASE_URL` | Public URL of the **branded** web domain — a different host from the server. Owner preview links and the `/propiedad/<code>` links customers receive. |
-| `ANON_BASE_URL` | Public URL of the **anonymous** web domain (`/ver/<token>` links). Optional; empty falls back to `STOREFRONT_BASE_URL`. See "Two domains, one web container" below. |
-| `NEXT_PUBLIC_BRAND_NAME` | **Build arg.** |
-| `NEXT_PUBLIC_WHATSAPP_NUMBER` | **Build arg.** E.164 digits, no `+`. |
+| `SHOPIFY_STORE_DOMAIN` | **Required.** The store's myshopify domain. Interpolated with no default, so a blank value fails the boot rather than crash-looping later. |
+| `SHOPIFY_ADMIN_TOKEN` | **Required, secret.** Admin API token from a custom app in the store admin. Scopes: `read/write_products`, `read/write_inventory`, `read_locations`. |
+| `SHOPIFY_API_VERSION` | Optional; empty uses the pin in `server/src/config.ts`. Bump it deliberately, with a test run — it changes agent behaviour. |
+| `SHOPIFY_LOCATION_ID` | Optional. Only needed when the store has more than one location. |
+| `CATALOG_CACHE_TTL_MS` | Optional; empty uses 60000. `0` disables the ranking cache. |
+| `PUBLIC_BASE_URL` | Public URL of the **server**. Only the `/media` route for inbound owner photos in transit; product photos live in Shopify. |
 
-`NEXT_PUBLIC_*` are inlined by Next.js at **build** time. In Coolify they must be set as build variables, and changing them later requires a **rebuild of the web image**, not a restart.
+There are no build args left: the storefront was Shopify's from the moment the catalog moved there, so nothing is inlined at build time any more. Every variable above is runtime env, and changing one is a restart.
 
 ### Voice notes
 
@@ -105,12 +106,11 @@ Catalog search needs **no variables at all**: the relevance scoring, its floor a
 
 ## 3. Service configuration
 
-Three long-running services. `seed`, `backup` and `purge-sessions` sit behind compose profiles and never start with `up`.
+Two long-running services. `backup` and `purge-sessions` sit behind compose profiles and never start with `up`.
 
 | Service | Port | Domain | Volumes |
 | --- | --- | --- | --- |
 | `server` | 3001 | yes → `PUBLIC_BASE_URL` | `vitrina-data:/data`, `vitrina-sessions:/home/node/.claude` |
-| `web` | 3000 | yes → `STOREFRONT_BASE_URL` | `vitrina-data:/data` |
 | **`bridge`** | 3002 | **NO DOMAIN, NO PUBLISHED PORT** | `vitrina-whatsapp:/session`, `vitrina-data:/data` |
 
 > 🔒 **The bridge must never be reachable from the internet.** It has no authentication beyond `BRIDGE_API_TOKEN`, and anyone who can reach `/send` can send WhatsApp messages as the business. It needs to reach the server on the internal network and nothing else. If Coolify offers to assign it a domain, decline.
@@ -127,68 +127,12 @@ Use named volumes, not host bind mounts. The images create these directories own
 
 The bridge runs as **uid 1000**, matching the server image's `node` user, because both mount `vitrina-data`. The bridge writes decrypted photos there and the server unlinks them after reading. Unlinking needs write permission on the *directory* — mismatched uids mean the server reads every photo fine and silently leaks all of them.
 
-### Two domains, one web container
-
-The `web` service answers on **two** domains, both routed to the same container by Host header:
-
-| Domain | Serves | Set as |
-| --- | --- | --- |
-| the branded one | `/`, `/catalogo`, `/propiedad/<code>`, `/preview/<code>` | `STOREFRONT_BASE_URL` |
-| the anonymous one | `/ver/<token>` and its photos, nothing else | `ANON_BASE_URL` |
-
-Add both under the `web` service's domains in Coolify. Both variables are **runtime** env, not build args — changing a domain is a restart, not a rebuild (unlike `NEXT_PUBLIC_*`).
-
-The split is not cosmetic. The anonymous page already hides the logo, the footer and the WhatsApp button; the domain is the last thing it cannot hide, since the colleague's client reads the address bar before the page renders. So the web app **404s every branded route on the anonymous host** — a client who truncates `…/ver/<token>` down to `/` gets nothing, not the company's catalog.
-
-That 404 is deliberate and must not be softened into a redirect: redirecting to the branded domain would announce the company to exactly the person the anonymous link exists to hide it from. Links already sent to customers are grandfathered **at the edge** instead — a Cloudflare redirect rule on the anonymous host:
-
-```
-(http.host eq "<anon-host>" and
- (starts_with(http.request.uri.path, "/propiedad/") or http.request.uri.path eq "/catalogo"))
-→ 301: concat("https://<branded-host>", http.request.uri.path)
-```
-
-Path-specific policy belongs at the edge; the app keeps one rule it cannot get wrong.
-
-The new domain also needs its **own** TLS: a Cloudflare Origin Certificate is issued per hostname list, so the one covering the old domain does not cover this one. Either issue a second origin cert and install it, or create the DNS record **grey-clouded (DNS only)** first so Coolify's Let's Encrypt challenge resolves, then switch it to proxied.
-
-Leaving `ANON_BASE_URL` empty collapses everything back to one domain and turns every host check inert — the correct state for a local or single-domain deployment.
-
----
-
-## 4. Pairing the WhatsApp number
-
-Nothing works until this is done, and it cannot be scripted from here.
-
-1. Set `BRIDGE_PAIR_PHONE` to the number's bare E.164 digits (no `+`). Leave it unset to pair by QR code instead, rendered into the logs.
-2. Deploy and open the bridge's container logs.
-3. The bridge prints an 8-character pairing code.
-4. On the phone: **WhatsApp → Settings → Linked devices → Link with phone number**, enter the code.
-5. Confirm it took: `/status` on the bridge, **not** `/health`.
-
-**`/health` is liveness only and ignores the WhatsApp connection on purpose** — a restart cannot fix being unlinked, and failing health on it would crash-loop over the real problem.
-
-That distinction matters operationally: WhatsApp unlinks a device when the primary phone stays offline past its window, and that failure is **silent**. The process keeps running and simply stops receiving. Monitor `/status`.
-
----
-
-## 5. Deploy order
-
-1. Remove the three `KAPSO_*` variables.
-2. Add the variables from §2. Set `CUSTOMER_AGENT_ENABLED=false` for the first deploy if you want only the owner path live.
-3. Create the three persistent volumes.
-4. Deploy `bridge` first, with no domain, and pair the number (§4).
-5. Deploy `server`, then `web`.
-6. Check the server's startup log for the credential preflight. Against DeepSeek it will report **`unknown`, not `valid`** — DeepSeek serves `/v1/messages` but answers 404 on `/v1/models`. That is expected and is not an error.
-7. Send one owner message. In the server log, confirm `servedModel` on the `agent turn complete` line reads `deepseek-v4-flash`.
-
 Step 7 is not optional. **DeepSeek resolves an unrecognised model id to its own default silently**, so a typo in `MODEL` produces perfectly good replies from a model you did not choose. `servedModel` is the only evidence of what actually answered.
 
-Seed the catalog if this is a fresh database:
-
-```bash
-docker compose --profile seed run --rm seed
-```
+There is nothing to seed — the catalog is whatever the Shopify store already
+holds. Instead, confirm the store is reachable: send the owner number a
+`¿qué productos tengo?` and check the reply against the Shopify admin. A
+`Listing products failed` reply means the token or its scopes are wrong.
 
 ---
 

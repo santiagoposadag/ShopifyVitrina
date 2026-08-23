@@ -25,26 +25,25 @@ x-data-env: &data-env
   DB_PATH: /data/vitrina.db
   MEDIA_DIR: /data/media
 
-# Shared by the server (mints anonymous /ver/<token> share links) and the web
-# storefront (resolves them). Both must see the SAME value or a minted link won't
-# open, so it is interpolated once here and merged into both services below.
-# Runtime env for web, NOT a build arg: it stays server-side and never reaches the
-# browser, so changing it needs a restart, not a rebuild. Empty disables sharing.
-x-anon-env: &anon-env
-  ANON_SHARE_SECRET: ${ANON_SHARE_SECRET:-}
-
-# The two public storefront hosts, shared by the server (which MINTS every link)
-# and the web app (which decides what each host is allowed to serve). They must
-# agree: the server minting an anonymous link for a host the web app treats as
-# branded produces a link that 404s.
-#
-# ANON_BASE_URL empty means "one domain" — both fall back to STOREFRONT_BASE_URL
-# and the host split is inert, which is the local and single-domain setup.
-# Runtime env for web, NOT build args: a domain change is a restart, not a
-# rebuild (unlike the NEXT_PUBLIC_* pair below).
-x-urls-env: &urls-env
-  STOREFRONT_BASE_URL: ${STOREFRONT_BASE_URL:-http://localhost:3000}
-  ANON_BASE_URL: ${ANON_BASE_URL:-}
+# The Shopify store IS the catalog: there is no local products table and no
+# storefront container any more. Without these the server refuses to boot,
+# which is deliberate — every product tool would otherwise fail on its first
+# call and the owner would get an apology instead of a startup error.
+x-shopify-env: &shopify-env
+  SHOPIFY_STORE_DOMAIN: ${SHOPIFY_STORE_DOMAIN}
+  SHOPIFY_ADMIN_TOKEN: ${SHOPIFY_ADMIN_TOKEN}
+  # Pinned, not "latest": Shopify ships quarterly and deprecates on a rolling
+  # schedule, so an unpinned version is a silently-changing agent. Empty falls
+  # back to the pin in server/src/config.ts.
+  SHOPIFY_API_VERSION: ${SHOPIFY_API_VERSION:-}
+  # Only needed when the store has more than one location; with one, the agent
+  # resolves it silently. With several and none set here, the agent asks.
+  SHOPIFY_LOCATION_ID: ${SHOPIFY_LOCATION_ID:-}
+  # How long a fetched catalog stays usable for RANKING search results. Price
+  # and stock are re-read live for the products actually shown, so this only
+  # bounds how fast a brand-new product becomes findable by text. 0 = never
+  # cache, which is right for a store edited in the Shopify admin all day.
+  CATALOG_CACHE_TTL_MS: ${CATALOG_CACHE_TTL_MS:-}
 
 services:
   server:
@@ -53,14 +52,14 @@ services:
       context: .
       dockerfile: server/Dockerfile
     environment:
-      <<: [*secrets-env, *data-env, *anon-env, *urls-env]
+      <<: [*secrets-env, *data-env, *shopify-env]
       # The bridge is reachable on the compose network only — never published,
       # never given a domain.
       BRIDGE_URL: http://bridge:3002
       BRIDGE_STAGING_DIR: /data/inbound
-      # This server's own URL, which is neither storefront host: it is what
-      # WhatsApp fetches product photos from. The storefront hosts arrive via
-      # *urls-env above.
+      # This server's own URL. Product photos live in Shopify now, so this is
+      # only the origin the /media route serves inbound owner photos from while
+      # they wait to be uploaded.
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
       PORT: "3001"
       # Provider routing. Empty values fall back to the defaults in
@@ -122,7 +121,7 @@ services:
       # and the agent fails to resume them (runAgentTurn falls back to a fresh
       # session, so replies survive, but the conversation history does not).
       # Mounting the whole directory also persists the SDK's .cache — intended.
-      # Only the server runs the agent; seed and backup share the image but not
+      # Only the server runs the agent; backup and purge share the image but not
       # this volume. The purge-sessions profile mounts it too, because deleting a
       # conversation means deleting the transcript, not just the SQLite row.
       - vitrina-sessions:/home/node/.claude
@@ -132,32 +131,6 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
-    restart: unless-stopped
-
-  web:
-    image: vitrina-web
-    build:
-      context: .
-      dockerfile: web/Dockerfile
-      args:
-        # NEXT_PUBLIC_* vars are inlined at build time by Next.js — they must
-        # be build args, not just runtime `environment:` below.
-        NEXT_PUBLIC_BRAND_NAME: ${NEXT_PUBLIC_BRAND_NAME:-Vitrina}
-        NEXT_PUBLIC_WHATSAPP_NUMBER: ${NEXT_PUBLIC_WHATSAPP_NUMBER:-}
-    environment:
-      <<: [*data-env, *anon-env, *urls-env]
-    ports:
-      # Host port is configurable so the storefront can coexist with other
-      # local apps that claim 3000 (set WEB_PORT in the shell or compose .env).
-      - "${WEB_PORT:-3000}:3000"
-    volumes:
-      # Read-write, NOT read-only: SQLite in WAL mode writes -shm and -wal
-      # sidecar files next to the DB even for read-only queries, so a
-      # read-only mount here would break every read the storefront does.
-      - vitrina-data:/data
-    depends_on:
-      server:
-        condition: service_healthy
     restart: unless-stopped
 
   # The WhatsApp channel: a linked device speaking the whatsmeow (WhatsApp Web
@@ -205,25 +178,6 @@ services:
       # zero image bytes over HTTP.
       - vitrina-data:/data
     restart: unless-stopped
-
-  # Seeds the two example properties. Excluded from `docker compose up` via
-  # the "seed" profile — run it explicitly with:
-  #   docker compose --profile seed run --rm seed
-  # Shares the server image (same `image:` tag) so it is built only once.
-  # Needs no secrets (seed.ts never reads them), but DOES need PUBLIC_BASE_URL:
-  # it is baked into the seeded photo URLs that WhatsApp later fetches.
-  seed:
-    image: vitrina-server
-    build:
-      context: .
-      dockerfile: server/Dockerfile
-    environment:
-      <<: *data-env
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3001}
-    command: ["node", "server/dist/seed/seed.js"]
-    volumes:
-      - vitrina-data:/data
-    profiles: ["seed"]
 
   # One-off consistent SQLite snapshot (online backup API, safe under writes).
   #   docker compose --profile backup run --rm backup   # snapshot inside the volume
@@ -275,11 +229,14 @@ volumes:
   # owned by the non-root `node` user (see the Dockerfiles). A named volume
   # inherits that ownership on first use; a host bind mount would land
   # root-owned on most hosts and the non-root process could not write to it.
+  #
+  # No longer holds the catalog — that is in Shopify. What is left is the
+  # durable inbox, agent sessions, leads, and inbound photos in transit.
   vitrina-data: {}
   # Same reasoning for the Agent SDK's home: server/Dockerfile creates
   # /home/node/.claude owned by node so this volume inherits that ownership.
   # Separate from vitrina-data because it is disposable — losing it costs
-  # conversation history, not business data, and the storefront never reads it.
+  # conversation history, not business data.
   vitrina-sessions: {}
   # whatsmeow's device store (the pairing) and its delivery outbox. The one
   # volume here that is NOT disposable: losing it unlinks the number and someone

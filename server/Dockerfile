@@ -21,8 +21,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 COPY server/package.json server/package.json
-# npm ci reads every workspace manifest declared at the root, shared included.
-COPY shared/package.json shared/package.json
 RUN npm ci -w server --include-workspace-root --omit=dev
 # Guard against a hoisted install layout where server/node_modules never gets
 # created — the runtime stage COPY below must not fail on a missing dir.
@@ -37,16 +35,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 COPY server/package.json server/package.json
-COPY shared/package.json shared/package.json
 RUN npm ci -w server --include-workspace-root
 COPY server/ server/
-# Type-only workspace: tsc resolves node_modules/@vitrina/shared through the
-# workspace symlink, which must point at real files. Never needed at runtime.
-COPY shared/ shared/
 RUN npm run build -w server
 
 # ---------------------------------------------------------------------------
-# runtime: minimal image — compiled JS + prod node_modules + seed source data.
+# runtime: minimal image — compiled JS + prod node_modules. Nothing else: the
+# catalog lives in Shopify, so there is no seed data to carry.
 # ---------------------------------------------------------------------------
 FROM base AS runtime
 ENV NODE_ENV=production
@@ -55,12 +50,9 @@ COPY --from=prod-deps /app/server/node_modules ./server/node_modules
 COPY --from=build /app/server/dist ./server/dist
 COPY package.json ./
 COPY server/package.json server/package.json
-# Source data the seed job reads photos/messages from — needed at runtime
-# because `seed` is a separate compose service built from this same image.
-COPY propiedad_1/ propiedad_1/
-COPY propiedad_2/ propiedad_2/
 
-# /data holds the SQLite db and media; /home/node/.claude is where the Agent SDK
+# /data holds the SQLite db (inbox, sessions, leads) and inbound photos waiting
+# to be uploaded to Shopify; /home/node/.claude is where the Agent SDK
 # writes its session transcripts. BOTH are named-volume mountpoints in
 # compose.yaml, and both MUST exist here owned by node: a named volume inherits
 # the ownership of the image directory it covers, but when that directory does

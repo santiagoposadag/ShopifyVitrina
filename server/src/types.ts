@@ -1,12 +1,14 @@
-// The row shapes both apps must agree on live in the shared workspace —
-// type-only, erased at compile time (see shared/index.d.ts).
-import type { ProductAttributes, ProductStatus } from "@vitrina/shared";
-
-export type { ProductAttributes, ProductStatus };
-
 export type Role = "owner" | "customer";
 
-export type LeadType = "inquiry" | "visit_request";
+/**
+ * What a captured lead is for.
+ *
+ * Retail-shaped, unlike the real-estate build's visit requests: the three
+ * things a customer wants when they do not buy right now are to be told when
+ * something returns, to ask about something we do not carry, or to be called
+ * back. Mirrored in the leads table's CHECK constraint (data/db.ts).
+ */
+export type LeadType = "inquiry" | "back_in_stock" | "follow_up";
 
 /**
  * Whether an inbound message carried media. The webhook knows this from the
@@ -18,41 +20,10 @@ export type LeadType = "inquiry" | "visit_request";
  */
 export type MessageKind = "text" | "media";
 
-/**
- * Attributes as they arrive from the agent, where an explicit null means "clear
- * this key" — the owner never stated it, or un-said it. Stored attributes never
- * contain null (upsertProduct strips the keys), so ProductAttributes above stays
- * honest: a value is present or the key is absent, never a null in between.
- */
-export type ProductAttributeUpdates = {
-  [K in keyof ProductAttributes]: ProductAttributes[K] | null;
-};
-
-export interface Product {
-  id: number;
-  code: string;
-  title: string;
-  description: string | null;
-  price: number | null;
-  currency: string;
-  status: ProductStatus;
-  attributes: ProductAttributes;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface ProductPhoto {
-  id: number;
-  product_id: number;
-  file_path: string;
-  public_path: string;
-  caption: string | null;
-  sort: number;
-}
-
 export interface Lead {
   id: number;
   phone: string;
+  /** The SKU or handle the lead is about — free text, see data/db.ts. */
   product_code: string | null;
   type: LeadType;
   name: string | null;
@@ -78,12 +49,11 @@ export interface InboundMessage {
   kind: "text" | "image" | "audio" | "interactive" | "other";
   /** WhatsApp message id, used for dedupe. */
   id?: string;
-  /** Text to feed the agent (button title, caption, or body). */
-  agentText: string;
   /**
    * `ref` rather than `url`: it is a path in the bridge's staging directory,
    * resolvable only by the channel that produced it (see whatsapp/channel.ts).
    */
+  agentText: string;
   media?: { ref: string; filename?: string; contentType?: string };
 }
 
@@ -91,6 +61,18 @@ export interface InboundMessage {
 export interface TurnContext {
   phone: string;
   role: Role;
+  /**
+   * A stable identifier for the batch of messages that triggered this turn,
+   * derived from the inbox rows being processed.
+   *
+   * This is what makes a stock adjustment safe to retry. Delivery is
+   * at-least-once by design — rows are replayed on boot and a failed batch is
+   * retried — so a `delta` mutation would otherwise be applied twice and remove
+   * six shirts where the owner sold three, with nothing anywhere recording that
+   * it happened. Passed to Shopify as the idempotency key (see
+   * shopify/catalog.ts adjustInventory).
+   */
+  turnKey: string;
   /**
    * Set by a tool to change what happens to the stored agent session AFTER
    * this turn completes. "reset" clears it instead of persisting the new id,

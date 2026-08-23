@@ -17,39 +17,14 @@ export function openDb(dbPath: string): DB {
   return db;
 }
 
+/**
+ * The catalog is NOT in here. Products, variants, prices, stock and photos live
+ * in Shopify, which is the source of truth for all of them. SQLite keeps only
+ * what Shopify has no place for: the durable inbox, agent sessions, the leads
+ * the assistant captures, and inbound photos on their way to a product.
+ */
 export function createSchema(db: DB): void {
   db.exec(`
-    CREATE TABLE IF NOT EXISTS products (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      code TEXT UNIQUE NOT NULL,
-      title TEXT NOT NULL,
-      description TEXT,
-      price INTEGER,
-      currency TEXT NOT NULL DEFAULT 'COP',
-      status TEXT NOT NULL DEFAULT 'draft'
-        CHECK (status IN ('draft','active','sold','inactive')),
-      attributes TEXT NOT NULL DEFAULT '{}',
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS product_photos (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-      file_path TEXT NOT NULL,
-      public_path TEXT NOT NULL,
-      caption TEXT,
-      sort INTEGER NOT NULL DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS product_changes (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-      changed_by_phone TEXT,
-      change_summary TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
     CREATE TABLE IF NOT EXISTS contacts (
       phone TEXT PRIMARY KEY,
       name TEXT,
@@ -60,8 +35,11 @@ export function createSchema(db: DB): void {
     CREATE TABLE IF NOT EXISTS leads (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       phone TEXT NOT NULL,
+      -- The SKU or handle the lead is about. Deliberately free text and NOT a
+      -- foreign key: the product it names lives in Shopify, and a lead must
+      -- survive that product being renamed, archived or deleted.
       product_code TEXT,
-      type TEXT NOT NULL CHECK (type IN ('inquiry','visit_request')),
+      type TEXT NOT NULL CHECK (type IN ('inquiry','back_in_stock','follow_up')),
       name TEXT,
       note TEXT,
       status TEXT NOT NULL DEFAULT 'new',
@@ -103,7 +81,7 @@ export function createSchema(db: DB): void {
       processed_at TEXT
     );
 
-    -- Inbound media received on a conversation but not yet attached to a
+    -- Inbound media received on a conversation but not yet uploaded to a
     -- product. Owner tool attach_pending_photos consumes rows from here.
     CREATE TABLE IF NOT EXISTS pending_media (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,10 +90,14 @@ export function createSchema(db: DB): void {
       public_path TEXT NOT NULL,
       caption TEXT,
       received_at TEXT NOT NULL DEFAULT (datetime('now')),
-      attached_product_id INTEGER REFERENCES products(id) ON DELETE SET NULL
+      -- The Shopify product gid this photo was uploaded to, and when. A gid
+      -- rather than a local id because the product is not ours: nothing here
+      -- can reference it, and the column's only job is to keep the housekeeping
+      -- sweep from deleting a file that already made it to the store.
+      attached_to TEXT,
+      attached_at TEXT
     );
 
-    CREATE INDEX IF NOT EXISTS idx_products_status ON products(status);
     CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
     -- Every batch flush claims one phone's un-settled rows by (phone, status).
     CREATE INDEX IF NOT EXISTS idx_inbox_phone_status ON inbox(phone, status);
@@ -143,6 +125,9 @@ function migrate(db: DB): void {
   // existing CHECK with ALTER TABLE, so audio rides on kind='text' plus this
   // column rather than forcing a table rebuild on the running pilot.
   addColumn(db, "inbox", "audio_path", "TEXT");
+  // The Shopify cut-over: pending_media used to point at a local products row.
+  addColumn(db, "pending_media", "attached_to", "TEXT");
+  addColumn(db, "pending_media", "attached_at", "TEXT");
 }
 
 /** Add a column unless the table already has it. Table/column names are literals. */

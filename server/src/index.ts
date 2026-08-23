@@ -18,6 +18,8 @@ import {
   upsertContact,
 } from "./data/repo.js";
 import { sweepOrphanedTranscripts, transcriptsDir } from "./data/transcripts.js";
+import { CatalogCache } from "./shopify/cache.js";
+import { ShopifyClient } from "./shopify/client.js";
 import { registerWebhook, type WebhookDeps } from "./inbox/webhook.js";
 import type { TurnContext } from "./types.js";
 
@@ -38,6 +40,11 @@ async function main(): Promise<void> {
   // below takes the WhatsAppChannel interface, which is what lets the pipeline
   // be tested without an HTTP client or a paired device anywhere in sight.
   const channel: WhatsAppChannel = new BridgeChannel(config);
+  // One client and one cache for the whole process: the cache exists so a burst
+  // of messages does not pay for a full catalog fetch per turn, which only works
+  // if every turn shares it.
+  const shopify = new ShopifyClient(config);
+  const cache = new CatalogCache(shopify, config.catalogCacheTtlMs);
   const queue = new PerPhoneQueue();
   const rateLimiter = new RateLimiter({
     perPhonePerHour: config.rateLimitPerPhonePerHour,
@@ -181,7 +188,7 @@ async function main(): Promise<void> {
       // A throw here reaches the batcher, which retries the batch with backoff
       // and settles it as failed once the attempt budget is spent — the
       // user-facing side effects live in onBatchFailure below.
-      await runAgentTurn({ db, channel, config, log: app.log }, ctx, text);
+      await runAgentTurn({ db, channel, config, shopify, cache, log: app.log }, ctx, text);
       failureAlert.recordSuccess();
     },
     onBatchFailure: async (ctx, { final }) => {

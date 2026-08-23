@@ -10,8 +10,8 @@
 #   ./scripts/with-secrets.sh --profile deepseek npm run dev -w server
 #
 # Secrets live GPG-encrypted in the gopass store (see docs/secrets-management.md).
-# Non-secret config (OWNER_PHONE_NUMBERS, PUBLIC_BASE_URL, NEXT_PUBLIC_*) is not
-# handled here — set it in the shell or a .env file as before.
+# Non-secret config (OWNER_PHONE_NUMBERS, PUBLIC_BASE_URL, SHOPIFY_STORE_DOMAIN)
+# is not handled here — set it in the shell or a .env file as before.
 set -eu
 
 if ! command -v gopass >/dev/null 2>&1; then
@@ -108,5 +108,11 @@ done
 # inbound events with the first and accepts /send calls with the second.
 load_secret BRIDGE_WEBHOOK_SECRET vitrina/bridge_webhook_secret
 load_secret BRIDGE_API_TOKEN vitrina/bridge_api_token
+
+# The Admin API token for the store. Required, like the bridge pair above: the
+# catalog IS Shopify, so a run without it boots into a server whose every
+# product tool fails. compose.yaml interpolates it with no default for the same
+# reason.
+load_secret SHOPIFY_ADMIN_TOKEN vitrina/shopify_admin_token
 
 exec "$@"

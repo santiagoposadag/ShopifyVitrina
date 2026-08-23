@@ -80,15 +80,22 @@ them:
 ```sh
 gopass generate -n vitrina/bridge_webhook_secret 48   # signs bridge → server events
 gopass generate -n vitrina/bridge_api_token 48        # guards the bridge's /send
+gopass insert vitrina/shopify_admin_token             # Admin API token, from the store admin
 gopass git push
 ```
+
+`vitrina/shopify_admin_token` is *inserted*, not generated: Shopify issues it
+when a custom app is installed in the store admin, and it is shown once. Its
+blast radius is the whole catalog — prices and stock on a store that takes money
+— so scope the custom app to `read/write_products`, `read/write_inventory` and
+`read_locations`, and nothing else.
 
 Treat `BRIDGE_API_TOKEN` as the most sensitive value here: anyone holding it can
 send WhatsApp messages as the business, with no Meta account in the loop to
 revoke. Rotating it means restarting both containers together — they must agree.
 
-Non-secret config (`OWNER_PHONE_NUMBERS`, `PUBLIC_BASE_URL`, `NEXT_PUBLIC_*`,
-`WHATSAPP_PROVIDER`, `BRIDGE_PAIR_PHONE`) stays out of the vault — shell env or
+Non-secret config (`OWNER_PHONE_NUMBERS`, `PUBLIC_BASE_URL`,
+`SHOPIFY_STORE_DOMAIN`, `BRIDGE_PAIR_PHONE`) stays out of the vault — shell env or
 `.env` fallback.
 
 ### Daily use
