@@ -11,6 +11,9 @@ export function resolveDataPath(p: string): string {
   return isAbsolute(p) ? p : resolve(REPO_ROOT, p);
 }
 
+/** The two WhatsApp transports this server can run behind WhatsAppChannel. */
+export type WhatsAppProvider = "bridge" | "cloud";
+
 /**
  * Runtime configuration, read once from the environment at boot.
  * Fails fast with a clear message when a required variable is missing.
@@ -32,8 +35,46 @@ export interface Config {
    * to serve every turn from another provider without a code change.
    */
   agentBaseUrl: string;
-  /** HMAC secret the bridge signs inbound events with (bridge/delivery.go). */
+  /**
+   * Which WhatsApp transport this deployment runs.
+   *
+   * "cloud" is Meta's official Business Cloud API; "bridge" is the whatsmeow
+   * sidecar paired as a linked device. Both are kept behind WhatsAppChannel so
+   * a bad number registration can be rolled back with one variable instead of
+   * a revert — see docs/whatsapp-cloud-api.md.
+   */
+  whatsappProvider: WhatsAppProvider;
+  /**
+   * The secret the inbound webhook verifies signatures with. Which secret that
+   * IS depends on the provider: the bridge signs with BRIDGE_WEBHOOK_SECRET,
+   * Meta signs with the app secret (WHATSAPP_APP_SECRET). Both are HMAC-SHA256
+   * over the raw body; only the header name and the key differ.
+   */
   webhookSecret: string;
+  /**
+   * Cloud API only. The token echoed back during Meta's webhook verification
+   * handshake (GET /webhook). It is a shared string we choose, unrelated to
+   * the app secret, and Meta re-runs the handshake whenever the callback URL
+   * is edited — so it has to survive in config, not in someone's clipboard.
+   */
+  whatsappVerifyToken: string;
+  /** Cloud API only. The phone number ID from the panel — NOT the number. */
+  whatsappPhoneNumberId: string;
+  /**
+   * Cloud API only. System user access token. Its blast radius is every
+   * message the business can send, so it is a System User token scoped to this
+   * WABA rather than a personal one.
+   */
+  whatsappAccessToken: string;
+  /** Graph API origin. A variable so tests can point it at a fake. */
+  whatsappGraphBaseUrl: string;
+  /**
+   * Pinned Graph API version, for the same reason SHOPIFY_API_VERSION is
+   * pinned: Meta ships versions on a schedule and deprecates on a rolling one,
+   * so "whatever is newest" is a silently-changing transport. Bump it
+   * deliberately, to the version the app panel shows.
+   */
+  whatsappGraphVersion: string;
   /** Internal URL of the bridge sidecar, e.g. http://bridge:3002 */
   bridgeUrl: string;
   /** Bearer token for the bridge's /send endpoint. */
@@ -247,6 +288,20 @@ export function loadConfig(): Config {
 
   const model = optional("MODEL", "claude-haiku-4-5");
 
+  // The transport decides which credentials are mandatory. Demanding all of
+  // them would make either deployment impossible to boot: a Cloud API deploy
+  // has no bridge and no staging volume, and a bridge deploy has no Meta app.
+  // Defaulting to "bridge" keeps every existing deployment booting unchanged.
+  const whatsappProvider = optional("WHATSAPP_PROVIDER", "bridge") as WhatsAppProvider;
+  if (whatsappProvider !== "bridge" && whatsappProvider !== "cloud") {
+    throw new Error(
+      `Invalid value for WHATSAPP_PROVIDER: expected "bridge" or "cloud", got "${whatsappProvider}"`,
+    );
+  }
+  const isCloud = whatsappProvider === "cloud";
+  const requiredFor = (name: string, wanted: WhatsAppProvider): string =>
+    whatsappProvider === wanted ? required(name) : optional(name, "");
+
   // Accept a full URL and keep only the host: the token header goes to
   // https://<domain>/admin/api/<version>/graphql.json, and a domain that
   // already carries a scheme would build a URL with two of them.
@@ -258,10 +313,25 @@ export function loadConfig(): Config {
     anthropicApiKey,
     agentAuthToken,
     agentBaseUrl: optional("ANTHROPIC_BASE_URL", "https://api.anthropic.com").replace(/\/+$/, ""),
-    webhookSecret: required("BRIDGE_WEBHOOK_SECRET"),
-    bridgeUrl: required("BRIDGE_URL").replace(/\/+$/, ""),
-    bridgeApiToken: required("BRIDGE_API_TOKEN"),
-    bridgeStagingDir: resolveDataPath(required("BRIDGE_STAGING_DIR")),
+    whatsappProvider,
+    // One field, two owners. The webhook route picks the header that goes with
+    // it (see inbox/webhook.ts) — a deployment that swapped one without the
+    // other would reject every inbound message with a valid signature.
+    webhookSecret: isCloud ? required("WHATSAPP_APP_SECRET") : required("BRIDGE_WEBHOOK_SECRET"),
+    whatsappVerifyToken: requiredFor("WHATSAPP_VERIFY_TOKEN", "cloud"),
+    whatsappPhoneNumberId: requiredFor("WHATSAPP_PHONE_NUMBER_ID", "cloud"),
+    whatsappAccessToken: requiredFor("WHATSAPP_ACCESS_TOKEN", "cloud"),
+    whatsappGraphBaseUrl: optional("WHATSAPP_GRAPH_BASE_URL", "https://graph.facebook.com").replace(
+      /\/+$/,
+      "",
+    ),
+    whatsappGraphVersion: optional("WHATSAPP_GRAPH_VERSION", "v23.0"),
+    bridgeUrl: requiredFor("BRIDGE_URL", "bridge").replace(/\/+$/, ""),
+    bridgeApiToken: requiredFor("BRIDGE_API_TOKEN", "bridge"),
+    // Empty on the Cloud API, where nothing is staged on disk. Both consumers
+    // already treat an empty directory as "nothing to do" (isAllowedMediaPath
+    // refuses it, sweepStagedMedia returns 0), so this needs no branch.
+    bridgeStagingDir: isCloud ? "" : resolveDataPath(required("BRIDGE_STAGING_DIR")),
     ownerPhoneNumbers,
     dbPath: resolveDataPath(optional("DB_PATH", "./data/vitrina.db")),
     mediaDir: resolveDataPath(optional("MEDIA_DIR", "./data/media")),

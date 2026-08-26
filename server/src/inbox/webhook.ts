@@ -4,6 +4,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { InboxBatcher } from "./batcher.js";
 import type { Config } from "../config.js";
 import type { DB } from "../data/db.js";
+import { extractCloudInbound, extractCloudStatusErrors } from "./cloud.js";
 import { extractInbound } from "./whatsmeow.js";
 import type { WhatsAppChannel } from "../whatsapp/channel.js";
 import { saveAudio, saveMedia } from "../whatsapp/media.js";
@@ -11,6 +12,13 @@ import { addPendingMedia, insertInboxMessage } from "../data/repo.js";
 import type { InboundMessage, MessageKind, TurnContext } from "../types.js";
 
 export const SIGNATURE_HEADER = "x-webhook-signature";
+
+/**
+ * Meta's signature header. Same construction as the bridge's — HMAC-SHA256 over
+ * the raw body — but keyed with the app secret and always "sha256=" prefixed,
+ * which verifySignature already accepts.
+ */
+export const META_SIGNATURE_HEADER = "x-hub-signature-256";
 
 /**
  * Ceiling on reading one staged media file.
@@ -21,6 +29,19 @@ export const SIGNATURE_HEADER = "x-webhook-signature";
  * the request open forever.
  */
 export const MEDIA_READ_TIMEOUT_MS = 5000;
+
+/**
+ * Constant-time string compare, for the webhook verification token.
+ *
+ * Meta's handshake is a plain query-string comparison, and `===` on a secret
+ * leaks its prefix through timing the same way a signature check would.
+ */
+function secretEquals(a: string, b: string): boolean {
+  const left = Buffer.from(a, "utf8");
+  const right = Buffer.from(b, "utf8");
+  if (left.length === 0 || left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
 
 /**
  * Verify a webhook HMAC-SHA256 signature against the RAW request body.
@@ -81,7 +102,7 @@ async function storeInboundMedia(
   try {
     const buffer = await deps.channel.downloadMedia(
       item.media!.ref,
-      AbortSignal.timeout(MEDIA_READ_TIMEOUT_MS),
+      AbortSignal.timeout(deps.channel.mediaTimeoutMs ?? MEDIA_READ_TIMEOUT_MS),
     );
     const saved = await saveMedia(deps.config, buffer, {
       mimeType: item.media!.contentType,
@@ -93,6 +114,8 @@ async function storeInboundMedia(
       public_path: saved.publicPath,
       // Only what the owner actually wrote about this photo, or nothing.
       caption: item.agentText.trim() || null,
+      // What orders the gallery when the transport does not order the delivery.
+      sent_at: item.sentAt ?? null,
     });
   } catch (err) {
     // The message still reaches the agent — it just arrives without its image.
@@ -127,7 +150,7 @@ async function storeInboundAudio(
   try {
     const buffer = await deps.channel.downloadMedia(
       item.media!.ref,
-      AbortSignal.timeout(MEDIA_READ_TIMEOUT_MS),
+      AbortSignal.timeout(deps.channel.mediaTimeoutMs ?? MEDIA_READ_TIMEOUT_MS),
     );
     if (buffer.byteLength > deps.config.transcriptionMaxBytes) {
       deps.log.warn(
@@ -172,6 +195,11 @@ export interface WebhookDeps {
 export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
   const { config, db, channel, batcher, roleFor } = deps;
 
+  // Defaults to the bridge, so every deployment and test harness that predates
+  // the Cloud API keeps its exact behaviour without setting a new variable.
+  const provider = config.whatsappProvider ?? "bridge";
+  const signatureHeader = provider === "cloud" ? META_SIGNATURE_HEADER : SIGNATURE_HEADER;
+
   // Keep the raw body so we can verify the signature over exact bytes.
   app.addContentTypeParser(
     "application/json",
@@ -187,9 +215,27 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
     },
   );
 
+  // Meta's verification handshake, and the ONLY reason this route is a GET.
+  // Meta calls it when the callback URL is first saved and again on every edit;
+  // it must echo hub.challenge back as raw text, because a JSON-quoted copy
+  // fails the check and the panel simply refuses to save the URL.
+  if (provider === "cloud") {
+    app.get("/webhook", async (request, reply) => {
+      const query = (request.query ?? {}) as Record<string, string | undefined>;
+      const mode = query["hub.mode"];
+      const token = query["hub.verify_token"] ?? "";
+      const challenge = query["hub.challenge"] ?? "";
+      if (mode === "subscribe" && secretEquals(token, config.whatsappVerifyToken)) {
+        return reply.code(200).type("text/plain").send(challenge);
+      }
+      request.log.warn({ mode }, "rejected a webhook verification attempt");
+      return reply.code(403).send({ error: "verification_failed" });
+    });
+  }
+
   app.post("/webhook", async (request, reply) => {
     const rawBody = rawBodies.get(request) ?? "";
-    const signature = request.headers[SIGNATURE_HEADER];
+    const signature = request.headers[signatureHeader];
     const signatureValue = Array.isArray(signature) ? signature[0] : signature;
 
     if (!verifySignature(rawBody, signatureValue, config.webhookSecret)) {
@@ -203,6 +249,7 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
 
     // A file the bridge already wrote and we decide not to keep has to be
     // released, or it sits on the volume forever — nothing else deletes it.
+    // A no-op on the Cloud API, which stages nothing on our disk.
     const release = async (ref: string | undefined): Promise<void> => {
       if (!ref) return;
       try {
@@ -213,69 +260,104 @@ export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {
       }
     };
 
-    const inbound = extractInbound(event);
-    // No agent-worthy content and no media side effects: nothing to do.
-    if (!inbound || (inbound.agentText.trim().length === 0 && !hasContentWithoutText(inbound))) {
-      await release(inbound?.media?.ref);
-      return reply.code(200).send({ status: "ok" });
-    }
-
-    // Audio is stored BEFORE the insert, because the row has to carry the path
-    // the worker will transcribe from. That ordering can orphan a file when the
-    // insert turns out to be a redelivery, so the dedupe branch below unlinks it.
-    const audioPath =
-      inbound.kind === "audio"
-        ? await storeInboundAudio(inbound, { config, channel, log: request.log })
-        : null;
-
-    // A voice note is persisted as 'text', not 'media'. Its transcript is a line
-    // the person spoke, not a caption under a photo count — and the media
-    // debounce window exists for photo bursts arriving in waves, which would
-    // make a single voice note wait 45s for an answer.
-    const persistedKind: MessageKind =
-      inbound.media && inbound.kind !== "audio" ? "media" : "text";
-
-    // Persist BEFORE processing: the UNIQUE dedupe key absorbs the bridge's
-    // outbox retries, and a crash before the agent runs is replayed on boot
-    // instead of silently losing the message (at-least-once).
-    const row = insertInboxMessage(db, {
-      dedupe_key: stableEventKey(event, inbound.id),
-      phone: inbound.from,
-      agent_text: inbound.agentText,
-      // Stored, not inferred later: a captioned photo's text IS the caption,
-      // so nothing downstream could tell it apart from someone typing.
-      kind: persistedKind,
-      audio_path: audioPath,
-    });
-    if (!row) {
-      // Redelivery of an event we already handled; its media went with the first
-      // pass, so this copy is released rather than left behind.
-      await release(inbound.media?.ref);
-      if (audioPath) {
-        // The first pass already stored this note and will transcribe it. This
-        // copy would otherwise sit in the audio directory forever, unreferenced.
-        await unlink(audioPath).catch(() => undefined);
-      }
-      return reply.code(200).send({ status: "ok" });
-    }
-
-    // Persist inbound PHOTOS only for owners (they ingest listings). Customers'
-    // images are acknowledged in the agent context but never stored or served —
-    // and "never stored" still means a file to clean up. Audio took its own path
-    // above, for both roles, and deliberately never reaches pending_media.
-    if (inbound.media && inbound.kind !== "audio") {
-      if (roleFor(inbound.from) === "owner") {
-        await storeInboundMedia(inbound, { config, db, channel, log: request.log });
-      } else {
-        await release(inbound.media.ref);
+    if (provider === "cloud") {
+      // A send Meta ACCEPTED and then could not deliver surfaces ONLY here: the
+      // POST that carried the reply already returned 200, so without this line
+      // a reply that fell outside the 24h window is invisible.
+      for (const failure of extractCloudStatusErrors(event)) {
+        request.log.warn(
+          {
+            recipient: failure.recipient,
+            code: failure.code,
+            detail: failure.detail,
+          },
+          "WhatsApp could not deliver a message we sent",
+        );
       }
     }
 
-    // Hand the row to the batcher; it debounces and runs the agent on the async
-    // worker. Only timer state is touched here, so the ACK stays fast. The media
-    // flag comes from the parsed event — a photo burst needs a much longer
-    // window than chat (see InboxBatcher).
-    batcher.schedule(row.phone, persistedKind);
+    // One POST carries at most one message from the bridge, and any number from
+    // the Cloud API. Handled sequentially, in the order Meta listed them: this
+    // is a photo burst's order, and the first photo becomes the cover.
+    const inboundItems =
+      provider === "cloud"
+        ? extractCloudInbound(event)
+        : ((item) => (item ? [item] : []))(extractInbound(event));
+
+    for (const inbound of inboundItems) {
+      // No agent-worthy content and no media side effects: nothing to do.
+      if (inbound.agentText.trim().length === 0 && !hasContentWithoutText(inbound)) {
+        await release(inbound.media?.ref);
+        continue;
+      }
+
+      // Audio is stored BEFORE the insert, because the row has to carry the path
+      // the worker will transcribe from. That ordering can orphan a file when the
+      // insert turns out to be a redelivery, so the dedupe branch below unlinks it.
+      const audioPath =
+        inbound.kind === "audio"
+          ? await storeInboundAudio(inbound, {
+              config,
+              channel,
+              log: request.log,
+            })
+          : null;
+
+      // A voice note is persisted as 'text', not 'media'. Its transcript is a line
+      // the person spoke, not a caption under a photo count — and the media
+      // debounce window exists for photo bursts arriving in waves, which would
+      // make a single voice note wait 45s for an answer.
+      const persistedKind: MessageKind =
+        inbound.media && inbound.kind !== "audio" ? "media" : "text";
+
+      // Persist BEFORE processing: the UNIQUE dedupe key absorbs the transport's
+      // retries — the bridge's outbox and Meta's own redelivery alike — and a
+      // crash before the agent runs is replayed on boot instead of silently
+      // losing the message (at-least-once).
+      const row = insertInboxMessage(db, {
+        dedupe_key: stableEventKey(event, inbound.id),
+        phone: inbound.from,
+        agent_text: inbound.agentText,
+        // Stored, not inferred later: a captioned photo's text IS the caption,
+        // so nothing downstream could tell it apart from someone typing.
+        kind: persistedKind,
+        audio_path: audioPath,
+      });
+      if (!row) {
+        // Redelivery of an event we already handled; its media went with the first
+        // pass, so this copy is released rather than left behind.
+        await release(inbound.media?.ref);
+        if (audioPath) {
+          // The first pass already stored this note and will transcribe it. This
+          // copy would otherwise sit in the audio directory forever, unreferenced.
+          await unlink(audioPath).catch(() => undefined);
+        }
+        continue;
+      }
+
+      // Persist inbound PHOTOS only for owners (they ingest listings). Customers'
+      // images are acknowledged in the agent context but never stored or served —
+      // and "never stored" still means a file to clean up. Audio took its own path
+      // above, for both roles, and deliberately never reaches pending_media.
+      if (inbound.media && inbound.kind !== "audio") {
+        if (roleFor(inbound.from) === "owner") {
+          await storeInboundMedia(inbound, {
+            config,
+            db,
+            channel,
+            log: request.log,
+          });
+        } else {
+          await release(inbound.media.ref);
+        }
+      }
+
+      // Hand the row to the batcher; it debounces and runs the agent on the async
+      // worker. Only timer state is touched here, so the ACK stays fast. The media
+      // flag comes from the parsed event — a photo burst needs a much longer
+      // window than chat (see InboxBatcher).
+      batcher.schedule(row.phone, persistedKind);
+    }
 
     return reply.code(200).send({ status: "ok" });
   });

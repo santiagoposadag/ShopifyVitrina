@@ -63,10 +63,12 @@ phone stays offline too long. See `bridge/` and CLAUDE.md.
 - `src/config.ts` — env loading, role detection (`OWNER_PHONE_NUMBERS` allowlist), and the Shopify block. Fails fast: a missing store domain or token dies at boot rather than on the owner's first message.
 - `src/data/db.ts` — SQLite (WAL), schema created on boot. No catalog tables.
 - `src/data/repo.ts` — leads, contacts, sessions, the inbox, and pending photos.
-- `src/whatsapp/channel.ts` — the transport seam: `sendText`, `downloadMedia(ref)`, optional `releaseMedia`. Outbound is text-only on purpose — photos go to Shopify, never back into the chat.
-- `src/whatsapp/bridge.ts` — the one implementation: posts replies to the sidecar, reads staged media off the shared volume (`isAllowedMediaPath` confines it), sweeps files orphaned by a crash.
+- `src/whatsapp/channel.ts` — the transport seam: `sendText`, `downloadMedia(ref)`, optional `releaseMedia`. Outbound is text-only on purpose — photos go to Shopify, never back into the chat. `WHATSAPP_PROVIDER` picks which implementation runs.
+- `src/whatsapp/cloud.ts` — Meta's official Business Cloud API: sends through Graph, resolves a media id to a short-lived URL and downloads it (`isAllowedMediaHost` keeps the access token on Meta hosts), and names error 131047 for what it is — a reply outside the 24h window.
+- `src/whatsapp/bridge.ts` — the linked-device sidecar: posts replies to it, reads staged media off the shared volume (`isAllowedMediaPath` confines it), sweeps files orphaned by a crash.
+- `src/inbox/cloud.ts` — parses Meta's payload into `InboundMessage[]` (one POST can carry many), skips delivery statuses, and surfaces the failed ones.
 - `src/inbox/whatsmeow.ts` — parses the bridge's event shape into an `InboundMessage`.
-- `src/inbox/webhook.ts` — `POST /webhook`: HMAC verify (raw body), persisted inbox (dedupe + at-least-once: unfinished messages are replayed on boot), media handoff, fast ACK.
+- `src/inbox/webhook.ts` — `POST /webhook`: HMAC verify (raw body), persisted inbox (dedupe + at-least-once: unfinished messages are replayed on boot), media handoff, fast ACK. Plus `GET /webhook`, Meta's verification handshake, registered only on the Cloud API.
 - `src/inbox/batcher.ts` — coalesces each phone's message burst into ONE agent turn (`BATCH_DEBOUNCE_MS` of silence, `BATCH_MAX_WAIT_MS` ceiling) and settles its inbox rows. Also mints the turn key that makes a stock adjustment safe to retry.
 - `src/inbox/queue.ts` — in-process FIFO with per-phone serialization.
 - `src/agent/agent.ts` — Claude Agent SDK integration: resume per-phone session (idle sessions expire after `SESSION_MAX_AGE_DAYS`; an unresumable session falls back once to a fresh one), run tools, reply in Spanish. `systemPrompt` holds both personas.

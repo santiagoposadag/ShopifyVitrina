@@ -8,6 +8,7 @@ import { isOwner, loadConfig, loadDotEnv } from "./config.js";
 import { openDb } from "./data/db.js";
 import { BridgeChannel, sweepStagedMedia } from "./whatsapp/bridge.js";
 import type { WhatsAppChannel } from "./whatsapp/channel.js";
+import { CloudApiChannel } from "./whatsapp/cloud.js";
 import { registerMediaRoutes } from "./whatsapp/media.js";
 import { PerPhoneQueue } from "./inbox/queue.js";
 import { RateLimiter } from "./inbox/rate-limit.js";
@@ -38,8 +39,11 @@ async function main(): Promise<void> {
   const db = openDb(config.dbPath);
   // The composition root is the only place that names the transport. Everything
   // below takes the WhatsAppChannel interface, which is what lets the pipeline
-  // be tested without an HTTP client or a paired device anywhere in sight.
-  const channel: WhatsAppChannel = new BridgeChannel(config);
+  // be tested without an HTTP client or a paired device anywhere in sight — and
+  // what makes the choice between Meta's official API and the linked-device
+  // bridge one variable rather than a rewrite.
+  const channel: WhatsAppChannel =
+    config.whatsappProvider === "cloud" ? new CloudApiChannel(config) : new BridgeChannel(config);
   // One client and one cache for the whole process: the cache exists so a burst
   // of messages does not pay for a full catalog fetch per turn, which only works
   // if every turn shares it.
@@ -93,6 +97,15 @@ async function main(): Promise<void> {
   housekeepingTimer.unref();
 
   app.get("/health", async () => ({ status: "ok", time: new Date().toISOString() }));
+
+  // Said once at boot: which transport is live decides where an inbound message
+  // that never arrives should be chased — Meta's webhook delivery panel, or the
+  // bridge's /status. They fail in completely different ways.
+  app.log.info(
+    config.whatsappProvider === "cloud"
+      ? `WhatsApp transport: Meta Cloud API (phone number id ${config.whatsappPhoneNumberId}, ${config.whatsappGraphVersion})`
+      : "WhatsApp transport: whatsmeow bridge (linked device)",
+  );
 
   // Never blocks startup: a credential problem must not stop the server from
   // accepting and PERSISTING inbound messages. The inbox is durable, so messages

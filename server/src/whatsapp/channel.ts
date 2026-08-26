@@ -14,6 +14,17 @@
  */
 export interface WhatsAppChannel {
   /**
+   * How long the webhook may spend fetching one inbound media file, when this
+   * transport needs longer than a local read.
+   *
+   * The bridge hands over a path on a shared volume, so its ceiling is small.
+   * The Cloud API needs two network round trips for the same file and would
+   * time out under that ceiling on every photo — a limit that belongs to the
+   * transport, not to the route that calls it.
+   */
+  readonly mediaTimeoutMs?: number;
+
+  /**
    * Deliver a plain-text reply. Outbound is text-only by design: a product's
    * photos live on its storefront page and the assistant relays that link.
    */

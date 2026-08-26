@@ -15,9 +15,29 @@ x-secrets-env: &secrets-env
   # Shared with the bridge: it signs inbound events with the first and accepts
   # the second on /send. Both sides must see the SAME values or the channel is
   # silently one-way, so they are interpolated once here and reused below.
-  BRIDGE_WEBHOOK_SECRET: ${BRIDGE_WEBHOOK_SECRET}
-  BRIDGE_API_TOKEN: ${BRIDGE_API_TOKEN}
+  #
+  # Defaulted to empty since the Cloud API transport has no bridge at all.
+  # Nothing is lost by that: server/src/config.ts requires whichever set the
+  # chosen WHATSAPP_PROVIDER actually needs, so a misconfigured deploy still
+  # fails at boot with the name of the missing variable.
+  BRIDGE_WEBHOOK_SECRET: ${BRIDGE_WEBHOOK_SECRET:-}
+  BRIDGE_API_TOKEN: ${BRIDGE_API_TOKEN:-}
   OWNER_PHONE_NUMBERS: ${OWNER_PHONE_NUMBERS:-}
+
+# Meta's official WhatsApp Business Cloud API. Only read when
+# WHATSAPP_PROVIDER=cloud; see docs/whatsapp-cloud-api.md.
+x-whatsapp-env: &whatsapp-env
+  WHATSAPP_PROVIDER: ${WHATSAPP_PROVIDER:-bridge}
+  # Meta signs every webhook with the app secret; the verify token is echoed
+  # back during the GET handshake. Different secrets, different jobs — swapping
+  # them rejects every inbound message with a perfectly valid signature.
+  WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:-}
+  WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:-}
+  WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+  # A System User token. The 24-hour token from the panel starts failing every
+  # reply a day after the deploy, in the middle of live conversations.
+  WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN:-}
+  WHATSAPP_GRAPH_VERSION: ${WHATSAPP_GRAPH_VERSION:-}
 
 # Absolute paths inside the containers. server/src/config.ts short-circuits on
 # isAbsolute(), so these override anything set in .env.
@@ -52,7 +72,7 @@ services:
       context: .
       dockerfile: server/Dockerfile
     environment:
-      <<: [*secrets-env, *data-env, *shopify-env]
+      <<: [*secrets-env, *data-env, *shopify-env, *whatsapp-env]
       # The bridge is reachable on the compose network only — never published,
       # never given a domain.
       BRIDGE_URL: http://bridge:3002
@@ -141,6 +161,12 @@ services:
   # DELIBERATELY NOT PUBLISHED: no `ports:` and, on Coolify, no domain. Anyone who
   # can reach /send can send WhatsApp messages as the business. The only exposure
   # it needs is to the server, on the compose network.
+  #
+  # On WHATSAPP_PROVIDER=cloud this container has no job — and once the number is
+  # registered with Meta its pairing is dead anyway, so it can only reconnect and
+  # fail. Stop it rather than leaving it to churn:  docker compose stop bridge
+  # It is left in the default set on purpose: while the cut-over is being
+  # rehearsed, rolling back is one variable and a restart, not a re-pair.
   bridge:
     image: vitrina-bridge
     build:
