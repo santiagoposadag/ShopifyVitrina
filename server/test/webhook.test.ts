@@ -255,3 +255,250 @@ describe("inbound audio reaches the inbox", () => {
     await h.app.close();
   });
 });
+
+/**
+ * The Cloud API half of the same route.
+ *
+ * Two things here are not variations on the bridge's behaviour but reversals of
+ * it: one POST can carry several messages, and Meta gives NO ordering guarantee
+ * where the bridge's outbox gave a strict one.
+ */
+describe("Meta Cloud API webhook", () => {
+  const APP_SECRET = "meta-app-secret";
+  const VERIFY_TOKEN = "vitrina-verify-token";
+
+  function metaPayload(messages: Record<string, unknown>[]): Record<string, unknown> {
+    return {
+      object: "whatsapp_business_account",
+      entry: [
+        {
+          id: "WABA",
+          changes: [
+            {
+              field: "messages",
+              value: {
+                messaging_product: "whatsapp",
+                metadata: {
+                  display_phone_number: "573001112233",
+                  phone_number_id: "1234567890",
+                },
+                messages,
+              },
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  function photo(id: string, caption: string, timestamp: number): Record<string, unknown> {
+    return {
+      from: "573001112233",
+      id,
+      timestamp: String(timestamp),
+      type: "image",
+      image: { id: `MEDIA_${id}`, mime_type: "image/jpeg", caption },
+    };
+  }
+
+  async function harness() {
+    const { default: Fastify } = await import("fastify");
+    const { registerWebhook } = await import("../src/inbox/webhook.js");
+
+    const dir = await mkdtemp(join(tmpdir(), "vitrina-cloud-"));
+    const db = openDb(":memory:");
+    const scheduled: { phone: string; kind: string }[] = [];
+
+    const app = Fastify();
+    registerWebhook(app, {
+      config: {
+        whatsappProvider: "cloud",
+        webhookSecret: APP_SECRET,
+        whatsappVerifyToken: VERIFY_TOKEN,
+        audioDir: join(dir, "audio"),
+        mediaDir: join(dir, "media"),
+        publicBaseUrl: "http://localhost:3001",
+        transcriptionMaxBytes: 25 * 1024 * 1024,
+      } as never,
+      db,
+      channel: {
+        sendText: async () => undefined,
+        downloadMedia: async () => Buffer.from("jpeg-bytes"),
+      } as never,
+      batcher: {
+        schedule: (phone: string, kind: string) => {
+          scheduled.push({ phone, kind });
+        },
+      } as never,
+      roleFor: () => "owner",
+    });
+    await app.ready();
+
+    const post = async (body: Record<string, unknown>) => {
+      const raw = JSON.stringify(body);
+      return app.inject({
+        method: "POST",
+        url: "/webhook",
+        headers: {
+          "content-type": "application/json",
+          // Meta always sends the prefixed form, keyed with the APP SECRET.
+          "x-hub-signature-256": `sha256=${sign(raw, APP_SECRET)}`,
+        },
+        payload: raw,
+      });
+    };
+
+    return { app, db, post, scheduled };
+  }
+
+  it("echoes hub.challenge back as raw text so the panel can save the URL", async () => {
+    const h = await harness();
+
+    const res = await h.app.inject({
+      method: "GET",
+      url: `/webhook?hub.mode=subscribe&hub.verify_token=${VERIFY_TOKEN}&hub.challenge=1158201444`,
+    });
+
+    expect(res.statusCode).toBe(200);
+    // Raw, NOT JSON: a quoted copy fails Meta's check and the URL is refused.
+    expect(res.body).toBe("1158201444");
+    await h.app.close();
+  });
+
+  it("refuses the handshake when the verify token does not match", async () => {
+    const h = await harness();
+
+    const res = await h.app.inject({
+      method: "GET",
+      url: "/webhook?hub.mode=subscribe&hub.verify_token=guessed&hub.challenge=123",
+    });
+
+    expect(res.statusCode).toBe(403);
+    await h.app.close();
+  });
+
+  it("rejects a payload signed with anything but the app secret", async () => {
+    const h = await harness();
+    const raw = JSON.stringify(metaPayload([]));
+
+    const res = await h.app.inject({
+      method: "POST",
+      url: "/webhook",
+      headers: {
+        "content-type": "application/json",
+        "x-hub-signature-256": `sha256=${sign(raw, "not-the-app-secret")}`,
+      },
+      payload: raw,
+    });
+
+    expect(res.statusCode).toBe(401);
+    await h.app.close();
+  });
+
+  it("persists EVERY message in one POST, not just the first", async () => {
+    // The bridge posts one event per request, so the handler used to read one.
+    // Meta nests an array, and a burst can share a single POST.
+    const h = await harness();
+
+    await h.post(
+      metaPayload([
+        {
+          from: "573001112233",
+          id: "wamid.1",
+          timestamp: "1756200000",
+          type: "text",
+          text: { body: "uno" },
+        },
+        {
+          from: "573001112233",
+          id: "wamid.2",
+          timestamp: "1756200001",
+          type: "text",
+          text: { body: "dos" },
+        },
+      ]),
+    );
+
+    const rows = h.db.prepare(`SELECT agent_text FROM inbox ORDER BY id`).all();
+    expect(rows).toEqual([{ agent_text: "uno" }, { agent_text: "dos" }]);
+    expect(h.scheduled).toHaveLength(2);
+    await h.app.close();
+  });
+
+  it("orders a photo burst by WHEN IT WAS SENT, not by when it arrived", async () => {
+    // The invariant this replaces: the bridge's outbox delivered a burst
+    // strictly in order, so arrival order was listing order and the first photo
+    // became the cover. Meta gives no such guarantee — these three arrive
+    // backwards, and the gallery must still come out right.
+    const { listPendingMedia } = await import("../src/data/repo.js");
+    const h = await harness();
+
+    await h.post(metaPayload([photo("wamid.C", "tercera", 1756200002)]));
+    await h.post(metaPayload([photo("wamid.A", "primera", 1756200000)]));
+    await h.post(metaPayload([photo("wamid.B", "segunda", 1756200001)]));
+
+    const pending = listPendingMedia(h.db, "573001112233");
+    expect(pending.map((p) => p.caption)).toEqual(["primera", "segunda", "tercera"]);
+    await h.app.close();
+  });
+
+  it("absorbs Meta's redelivery on the message id", async () => {
+    const h = await harness();
+    const body = metaPayload([
+      {
+        from: "573001112233",
+        id: "wamid.DUP",
+        timestamp: "1756200000",
+        type: "text",
+        text: { body: "hola" },
+      },
+    ]);
+
+    await h.post(body);
+    await h.post(body);
+
+    expect(h.db.prepare(`SELECT COUNT(*) n FROM inbox`).get()).toEqual({
+      n: 1,
+    });
+    await h.app.close();
+  });
+
+  it("ACKs a status-only callback without inventing an agent turn", async () => {
+    // These outnumber real messages, and one parsed as inbound would answer a
+    // customer who never wrote.
+    const h = await harness();
+
+    const res = await h.post({
+      object: "whatsapp_business_account",
+      entry: [
+        {
+          id: "WABA",
+          changes: [
+            {
+              field: "messages",
+              value: {
+                messaging_product: "whatsapp",
+                metadata: { phone_number_id: "1234567890" },
+                statuses: [
+                  {
+                    id: "wamid.OUT",
+                    status: "failed",
+                    recipient_id: "573001112233",
+                    errors: [{ code: 131047 }],
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(h.db.prepare(`SELECT COUNT(*) n FROM inbox`).get()).toEqual({
+      n: 0,
+    });
+    expect(h.scheduled).toHaveLength(0);
+    await h.app.close();
+  });
+});

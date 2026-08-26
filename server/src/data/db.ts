@@ -128,6 +128,12 @@ function migrate(db: DB): void {
   // The Shopify cut-over: pending_media used to point at a local products row.
   addColumn(db, "pending_media", "attached_to", "TEXT");
   addColumn(db, "pending_media", "attached_at", "TEXT");
+  // The Cloud API cut-over. Photo order is listing order, and Meta does not
+  // guarantee webhook ordering the way the bridge's sequential outbox did — so
+  // the order has to come from WhatsApp's own timestamp rather than from the
+  // row's autoincrement id. NULL on every bridge-era row, which is exactly how
+  // they already sort (see listPendingMedia).
+  addColumn(db, "pending_media", "sent_at", "INTEGER");
 }
 
 /** Add a column unless the table already has it. Table/column names are literals. */

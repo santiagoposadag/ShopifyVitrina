@@ -246,3 +246,108 @@ describe("loadDotEnv", () => {
     expect(process.env["OWNER_PHONE_NUMBERS"]).toBeDefined();
   });
 });
+
+describe("loadConfig WhatsApp transport", () => {
+  const OWNED = [
+    "WHATSAPP_PROVIDER",
+    "WHATSAPP_APP_SECRET",
+    "WHATSAPP_VERIFY_TOKEN",
+    "WHATSAPP_PHONE_NUMBER_ID",
+    "WHATSAPP_ACCESS_TOKEN",
+    "WHATSAPP_GRAPH_VERSION",
+    "BRIDGE_WEBHOOK_SECRET",
+    "BRIDGE_URL",
+    "BRIDGE_API_TOKEN",
+    "BRIDGE_STAGING_DIR",
+  ] as const;
+  const saved = new Map<string, string | undefined>();
+
+  beforeEach(() => {
+    for (const name of OWNED) {
+      saved.set(name, process.env[name]);
+      delete process.env[name];
+    }
+    process.env["ANTHROPIC_API_KEY"] = "sk-ant-1";
+    process.env["SHOPIFY_STORE_DOMAIN"] = "tienda.myshopify.com";
+    process.env["SHOPIFY_ADMIN_TOKEN"] = "shpat_x";
+  });
+
+  afterEach(() => {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
+  function cloudEnv(): void {
+    process.env["WHATSAPP_PROVIDER"] = "cloud";
+    process.env["WHATSAPP_APP_SECRET"] = "app-secret";
+    process.env["WHATSAPP_VERIFY_TOKEN"] = "verify-token";
+    process.env["WHATSAPP_PHONE_NUMBER_ID"] = "1234567890";
+    process.env["WHATSAPP_ACCESS_TOKEN"] = "system-user-token";
+  }
+
+  function bridgeEnv(): void {
+    process.env["BRIDGE_WEBHOOK_SECRET"] = "whsec";
+    process.env["BRIDGE_URL"] = "http://bridge:3002";
+    process.env["BRIDGE_API_TOKEN"] = "tok";
+    process.env["BRIDGE_STAGING_DIR"] = "/tmp/inbound";
+  }
+
+  // The bridge stays the default so an existing deployment boots unchanged
+  // after this merge, without anyone setting a new variable first.
+  it("runs the bridge when nothing says otherwise", () => {
+    bridgeEnv();
+    expect(loadConfig().whatsappProvider).toBe("bridge");
+  });
+
+  it("boots a Cloud API deployment that has no bridge variables at all", () => {
+    // There is no sidecar and no staging volume in that deployment. Requiring
+    // BRIDGE_URL there would make the officially-supported transport the one
+    // that cannot be deployed.
+    cloudEnv();
+    const config = loadConfig();
+    expect(config.whatsappProvider).toBe("cloud");
+    expect(config.whatsappPhoneNumberId).toBe("1234567890");
+    // Empty, and both consumers already read that as "nothing staged here".
+    expect(config.bridgeStagingDir).toBe("");
+  });
+
+  it("verifies inbound signatures with the app secret on the Cloud API", () => {
+    // Meta signs with the app secret; the bridge signs with its own. Getting
+    // this wrong rejects every inbound message with a perfectly valid signature.
+    cloudEnv();
+    expect(loadConfig().webhookSecret).toBe("app-secret");
+    bridgeEnv();
+    delete process.env["WHATSAPP_PROVIDER"];
+    expect(loadConfig().webhookSecret).toBe("whsec");
+  });
+
+  it("refuses to boot a Cloud API deployment missing a credential", () => {
+    // Every one of these fails on the first real message instead, which is the
+    // failure this check exists to convert into a startup error.
+    for (const missing of [
+      "WHATSAPP_APP_SECRET",
+      "WHATSAPP_VERIFY_TOKEN",
+      "WHATSAPP_PHONE_NUMBER_ID",
+      "WHATSAPP_ACCESS_TOKEN",
+    ]) {
+      cloudEnv();
+      delete process.env[missing];
+      expect(() => loadConfig()).toThrow(new RegExp(missing));
+    }
+  });
+
+  it("rejects a misspelled provider instead of silently running the other one", () => {
+    bridgeEnv();
+    process.env["WHATSAPP_PROVIDER"] = "meta";
+    expect(() => loadConfig()).toThrow(/WHATSAPP_PROVIDER/);
+  });
+
+  it("pins the Graph version and lets a deploy bump it", () => {
+    cloudEnv();
+    expect(loadConfig().whatsappGraphVersion).toBe("v23.0");
+    process.env["WHATSAPP_GRAPH_VERSION"] = "v24.0";
+    expect(loadConfig().whatsappGraphVersion).toBe("v24.0");
+  });
+});

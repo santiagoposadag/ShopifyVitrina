@@ -282,16 +282,24 @@ export function deleteStaleInboxRows(
 
 export function addPendingMedia(
   db: DB,
-  media: { phone: string; file_path: string; public_path: string; caption?: string | null },
+  media: {
+    phone: string;
+    file_path: string;
+    public_path: string;
+    caption?: string | null;
+    /** WhatsApp's own send timestamp (unix seconds), when the transport has one. */
+    sent_at?: number | null;
+  },
 ): void {
   db.prepare(
-    `INSERT INTO pending_media (phone, file_path, public_path, caption)
-     VALUES (@phone, @file_path, @public_path, @caption)`,
+    `INSERT INTO pending_media (phone, file_path, public_path, caption, sent_at)
+     VALUES (@phone, @file_path, @public_path, @caption, @sent_at)`,
   ).run({
     phone: media.phone,
     file_path: media.file_path,
     public_path: media.public_path,
     caption: media.caption ?? null,
+    sent_at: media.sent_at ?? null,
   });
 }
 
@@ -336,9 +344,18 @@ export function deleteStalePendingMedia(db: DB, olderThanHours: number): number 
  * This phone's photos that have not been uploaded to a product yet, oldest
  * first.
  *
- * Arrival order IS listing order: the bridge's outbox delivers a WhatsApp photo
- * burst strictly sequentially, so the order these come back in is the order the
- * owner sent them, and the first one becomes the product's cover image.
+ * Send order IS listing order — the first photo becomes the product's cover —
+ * so the ordering here is load-bearing, and the two transports establish it
+ * differently. The bridge's outbox delivers a burst strictly sequentially, so
+ * arrival order (received_at, id) is send order. The Cloud API gives no
+ * ordering guarantee at all: Meta may deliver a burst's webhooks concurrently
+ * and out of order, so sent_at — WhatsApp's own stamp on the message — leads,
+ * and arrival order only breaks its ties.
+ *
+ * COALESCE, not a branch: bridge rows carry no sent_at, so they all collapse to
+ * 0 and sort exactly as they always did. That tie-break also carries the
+ * Cloud API's weak spot — sent_at has second resolution, and photos shot inside
+ * one second fall back to the order they happened to arrive in.
  *
  * Deliberately does NOT mark anything: the upload can fail halfway, and a row
  * claimed before the network call would leave photos that never reached Shopify
@@ -351,7 +368,7 @@ export function listPendingMedia(db: DB, phone: string): PendingMedia[] {
       `SELECT id, phone, file_path, public_path, caption
        FROM pending_media
        WHERE phone = ? AND attached_to IS NULL
-       ORDER BY received_at ASC, id ASC`,
+       ORDER BY COALESCE(sent_at, 0) ASC, received_at ASC, id ASC`,
     )
     .all(phone) as PendingMedia[];
 }

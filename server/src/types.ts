@@ -55,6 +55,19 @@ export interface InboundMessage {
    */
   agentText: string;
   media?: { ref: string; filename?: string; contentType?: string };
+  /**
+   * When WhatsApp says the person sent this, in unix seconds.
+   *
+   * Only the Cloud API provides it, and it exists for one reason: Meta does NOT
+   * guarantee webhook ordering, while the bridge's outbox did. Arrival order is
+   * listing order for a photo burst — the first photo becomes the product's
+   * cover — so on that provider the order has to be reconstructed from what
+   * WhatsApp stamped rather than from when we happened to receive it.
+   *
+   * Second resolution, so photos shot in the same second still tie; the
+   * pending_media query falls back to arrival order for those (data/repo.ts).
+   */
+  sentAt?: number;
 }
 
 /** Context bound to the tools for a single inbound message turn. */

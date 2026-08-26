@@ -81,9 +81,19 @@ Tools communicate back to `runAgentTurn` only through the shared mutable `TurnCo
 - The webhook must ACK fast: the bridge's outbox is strictly sequential, so a slow handler stalls every message behind it. Debouncing, agent work and every Shopify call happen on the async worker path only.
 - Agent replies and prompts are Spanish; code, comments, docs and prompt *instructions* are English.
 
-## The WhatsApp transport (`bridge/`)
+## The WhatsApp transport (two of them)
 
-Messages travel through a Go sidecar that pairs as a **linked device** and speaks the WhatsApp Web multidevice protocol via [whatsmeow](https://github.com/tulir/whatsmeow). No WhatsApp Business onboarding, no per-conversation fee, and **no official standing with Meta** — the paired number carries real ban risk, and it is unlinked whenever the primary phone stays offline past WhatsApp's window. That last one is a *silent* failure: the process keeps running and simply stops receiving, so watch the bridge's `/status`, not its `/health`.
+`WHATSAPP_PROVIDER` picks one, and both sit behind `WhatsAppChannel` — which is what makes the choice a variable and a restart rather than a revert. Defaults to `bridge`, so an untouched deployment keeps its exact behaviour.
+
+**`cloud` — Meta's official Business Cloud API** (`whatsapp/cloud.ts`, `inbox/cloud.ts`, runbook in `docs/whatsapp-cloud-api.md`). Five differences that are behaviour, not plumbing:
+
+- **One POST carries many messages** (`entry[].changes[].value.messages[]`), where the bridge posts exactly one. The handler loops; reading only the first silently drops the rest of a burst.
+- **The signature is `X-Hub-Signature-256`, keyed with the APP SECRET** — a different secret from the verify token, which is only echoed back during the GET handshake that Meta re-runs on every callback-URL edit.
+- **Media is an id, not a path.** `GET /{media-id}` yields a URL that expires in ~5 minutes, so the id is what travels through the pipeline and the URL is resolved at download time. `isAllowedMediaHost` confines it to Meta hosts: the value comes out of a response and we attach the token that can send as the business.
+- **Delivery order is not guaranteed.** The bridge's sequential outbox made arrival order the listing order; Meta gives nothing, so `pending_media.sent_at` (WhatsApp's own stamp) orders the gallery and arrival only breaks ties. Second resolution, so photos inside one second still fall back to arrival order.
+- **The 24-hour window is a hard error.** A free-form reply more than 24h after the person's last message is rejected with code 131047 — no template, no delivery. `statuses` callbacks are the ONLY place a send that Meta accepted and then failed to deliver ever shows up, which is why they are logged rather than skipped.
+
+**`bridge` — the whatsmeow sidecar.** Messages travel through a Go sidecar that pairs as a **linked device** and speaks the WhatsApp Web multidevice protocol via [whatsmeow](https://github.com/tulir/whatsmeow). No WhatsApp Business onboarding, no per-conversation fee, and **no official standing with Meta** — the paired number carries real ban risk, and it is unlinked whenever the primary phone stays offline past WhatsApp's window. That last one is a *silent* failure: the process keeps running and simply stops receiving, so watch the bridge's `/status`, not its `/health`.
 
 The sidecar knows nothing about products, owners, or agents. It POSTs inbound events to the server's `/webhook` (HMAC-SHA256 over the raw body) and accepts replies on an internal `/send`.
 
