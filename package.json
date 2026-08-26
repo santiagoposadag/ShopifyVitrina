@@ -9,7 +9,8 @@
   "scripts": {
     "dev:server": "npm run dev -w server",
     "test": "npm run test -w server",
-    "build": "npm run build -w server"
+    "build": "npm run build -w server",
+    "docs:check": "bash scripts/check-docs.sh"
   },
   "engines": {
     "node": ">=20"

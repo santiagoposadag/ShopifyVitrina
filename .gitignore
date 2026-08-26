@@ -1,4 +1,8 @@
+# Both forms: the trailing slash matches a DIRECTORY only, so a symlink named
+# node_modules slips past it — which is exactly how two self-referential ones
+# ended up committed and broke `npm run test` on a fresh checkout.
 node_modules/
+node_modules
 .next/
 # Leading slash: the runtime SQLite/media directory at the repo root ONLY.
 # Unanchored, this also matched server/src/data/ — real source, silently
