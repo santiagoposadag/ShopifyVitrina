@@ -134,6 +134,14 @@ Cinco diferencias con el bridge que sí cambian comportamiento:
    que viaja por el pipeline es el id y la URL se pide en el momento de bajar el archivo,
    nunca se guarda. El token solo se adjunta a hosts de Meta (`isAllowedMediaHost`) — la URL
    sale de una respuesta, y un host equivocado ahí es una credencial filtrada.
+
+   **Y por eso el archivo no se baja en el webhook.** El handler guarda el id en
+   `inbox.media_ref` y responde 200; la descarga la hace el worker
+   (`batcher.resolveMedia`) cuando cierra la ventana del batch. Son dos round trips a Graph
+   por archivo, y como un POST puede traer una ráfaga entera, hacerlo dentro del request
+   dejaba la respuesta abierta durante minutos con el listado de un dueño. **Meta reintenta
+   un webhook lento y, si insiste, puede desactivar la suscripción** — un fallo que se ve en
+   el panel de entrega, no en el log del servidor.
 4. **El orden de las fotos ya no lo garantiza el transporte.** El outbox del bridge entregaba
    una ráfaga estrictamente en orden, y ese orden es el orden del listado: la primera foto es
    la portada. Meta no garantiza nada, así que la galería se ordena por `sent_at` — la marca de

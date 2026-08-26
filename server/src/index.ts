@@ -9,7 +9,7 @@ import { openDb } from "./data/db.js";
 import { BridgeChannel, sweepStagedMedia } from "./whatsapp/bridge.js";
 import type { WhatsAppChannel } from "./whatsapp/channel.js";
 import { CloudApiChannel } from "./whatsapp/cloud.js";
-import { registerMediaRoutes } from "./whatsapp/media.js";
+import { registerMediaRoutes, saveAudio, saveMedia } from "./whatsapp/media.js";
 import { PerPhoneQueue } from "./inbox/queue.js";
 import { RateLimiter } from "./inbox/rate-limit.js";
 import {
@@ -154,6 +154,22 @@ async function main(): Promise<void> {
   const batcher = new InboxBatcher({
     db,
     queue,
+    // Fetching an inbound file belongs to the worker, not the webhook: the
+    // handler records a reference and ACKs, and this resolves it once the
+    // burst's debounce window closes. Meta retries a slow webhook and can
+    // disable the subscription outright; the bridge's outbox is sequential and
+    // stalls every message behind a slow handler. Both bills land here instead,
+    // where a burst was already waiting.
+    media: {
+      // The timeout is the transport's to declare — two Graph round trips need
+      // far longer than a read off a mounted volume — and it stays bounded so a
+      // hung fetch cannot pin one phone's queue forever.
+      download: (ref: string) =>
+        channel.downloadMedia(ref, AbortSignal.timeout(channel.mediaTimeoutMs ?? 5000)),
+      savePhoto: (buffer, opts) => saveMedia(config, buffer, opts),
+      saveAudio: (buffer, opts) => saveAudio(config, buffer, opts),
+      maxAudioBytes: config.transcriptionMaxBytes,
+    },
     log: app.log,
     debounceMs: config.batchDebounceMs,
     maxWaitMs: config.batchMaxWaitMs,

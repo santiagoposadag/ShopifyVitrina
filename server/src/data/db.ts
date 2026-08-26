@@ -74,6 +74,23 @@ export function createSchema(db: DB): void {
       -- grouped underneath, which is the wrong shape for a transcript — and the
       -- media debounce window would make one voice note wait 45s for a reply.
       audio_path TEXT,
+      -- An inbound file this row is entitled to but that nobody has fetched yet.
+      -- The webhook stores the transport's reference and ACKs; the worker
+      -- downloads it (inbox/batcher.ts resolveMedia) and clears media_ref, which
+      -- is the marker that the fetch has already been paid for.
+      --
+      -- Distinct from audio_path on purpose: audio_path means "on our disk,
+      -- awaiting transcription", media_ref means "not downloaded at all". A
+      -- retry has to tell those apart or it re-downloads what it already has.
+      media_ref TEXT,
+      -- 'photo' or 'audio'. Explicit rather than inferred from the kind column:
+      -- audio rides on kind='text' (see above), so inferring would couple this
+      -- to a rule stated three files away.
+      media_kind TEXT,
+      media_mime TEXT,
+      media_name TEXT,
+      -- WhatsApp's own send stamp, on its way to pending_media.sent_at.
+      media_sent_at INTEGER,
       status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending','processing','done','failed')),
       attempts INTEGER NOT NULL DEFAULT 0,
@@ -134,6 +151,18 @@ function migrate(db: DB): void {
   // row's autoincrement id. NULL on every bridge-era row, which is exactly how
   // they already sort (see listPendingMedia).
   addColumn(db, "pending_media", "sent_at", "INTEGER");
+  // An inbound file the webhook accepted but deliberately did NOT download.
+  //
+  // These five carry a media reference across the ACK so the fetch can happen on
+  // the worker instead of inside the request — see inbox/batcher.ts resolveMedia.
+  // Nullable with no CHECK for the same reason audio_path is: SQLite cannot add
+  // a CHECK to an existing table without rebuilding it, and the running pilot is
+  // not worth a table rebuild for a constraint two call sites already enforce.
+  addColumn(db, "inbox", "media_ref", "TEXT");
+  addColumn(db, "inbox", "media_kind", "TEXT");
+  addColumn(db, "inbox", "media_mime", "TEXT");
+  addColumn(db, "inbox", "media_name", "TEXT");
+  addColumn(db, "inbox", "media_sent_at", "INTEGER");
 }
 
 /** Add a column unless the table already has it. Table/column names are literals. */
