@@ -3,11 +3,14 @@ import type { FastifyBaseLogger } from "fastify";
 import type { DB } from "../data/db.js";
 import type { PerPhoneQueue } from "./queue.js";
 import {
+  addPendingMedia,
   claimInboxBatch,
+  clearInboxMedia,
   listReplayableInbox,
   markInboxBatchDone,
   markInboxBatchFailed,
   markInboxBatchPending,
+  setInboxAudioPath,
   setInboxTranscript,
   type InboxRow,
 } from "../data/repo.js";
@@ -101,6 +104,28 @@ export const AUDIO_FALLBACK =
 
 export type { MessageKind };
 
+/**
+ * Fetching and storing one inbound file, as the batcher needs it.
+ *
+ * A narrow port rather than the WhatsAppChannel plus the Config, for the reason
+ * the rest of this module takes plain functions: the whole resolve step is then
+ * testable against an object literal, with no HTTP client, no paired device and
+ * no casts. index.ts is the only place that knows which transport is behind it.
+ */
+export interface InboundMediaStore {
+  /** Fetch the bytes a transport reference points at. */
+  download(ref: string): Promise<Buffer>;
+  /** Persist an owner's product photo where attach_pending_photos will find it. */
+  savePhoto(
+    buffer: Buffer,
+    opts: { mimeType?: string; suggestedName?: string },
+  ): Promise<{ filePath: string; publicPath: string }>;
+  /** Persist a voice note OUTSIDE the publicly served media directory. */
+  saveAudio(buffer: Buffer, opts: { suggestedName?: string }): Promise<{ filePath: string }>;
+  /** Ceiling above which a voice note is dropped rather than sent for transcription. */
+  maxAudioBytes: number;
+}
+
 export interface InboxBatcherDeps {
   db: DB;
   queue: PerPhoneQueue;
@@ -127,6 +152,12 @@ export interface InboxBatcherDeps {
    * still produce SOMETHING for the agent to answer.
    */
   transcribeAudio?: (filePath: string) => Promise<string | null>;
+  /**
+   * Fetches the files the webhook only made a note of. Optional so a caller with
+   * no media concern (and every test that has none) needs nothing; rows carrying
+   * a media_ref simply keep it, and the agent answers without the attachment.
+   */
+  media?: InboundMediaStore;
   /**
    * Invoked after a batch attempt fails, on EVERY attempt. `final` is true when
    * the batch just settled as 'failed' (retry budget exhausted) — user-facing
@@ -257,6 +288,114 @@ export class InboxBatcher {
 
   private armCap(phone: string, ms: number): ReturnType<typeof setTimeout> {
     return setTimeout(() => this.flush(phone), ms);
+  }
+
+  /**
+   * Fetch the files the webhook deliberately did not, and retire their refs.
+   *
+   * This is the whole point of media_ref. Downloading inside the request handler
+   * put one or two network round trips per message between Meta and its 200 —
+   * and one Cloud API POST can carry a whole photo burst, so an owner's listing
+   * could hold the response open for minutes. Meta retries a slow webhook and
+   * eventually disables the subscription; the bridge, whose outbox is strictly
+   * sequential, simply stalls every message queued behind it. Here, on the
+   * worker, the same fetch costs a burst nothing but the debounce window it was
+   * already waiting out.
+   *
+   * Runs BEFORE resolveAudio: a voice note cannot be transcribed until its bytes
+   * are on disk.
+   *
+   * Sequential, and that is load-bearing for photos. Arrival order is listing
+   * order and the first photo becomes the product's cover, so a concurrent map
+   * would upload the same set in a silently shuffled gallery — the same reason
+   * uploadProductPhotos is sequential on the Shopify side.
+   *
+   * Never throws: a message still deserves an answer without its attachment,
+   * which is exactly what the webhook did when it owned this work.
+   */
+  private async resolveMedia(rows: InboxRow[]): Promise<void> {
+    const { db, log, media } = this.deps;
+    if (!media) return;
+
+    for (const row of rows) {
+      if (!row.media_ref) continue;
+      const ref = row.media_ref;
+      try {
+        const buffer = await media.download(ref);
+
+        if (row.media_kind === "audio") {
+          if (buffer.byteLength > media.maxAudioBytes) {
+            log.error(
+              { phone: row.phone, inboxId: row.id, bytes: buffer.byteLength },
+              "inbound audio too large to transcribe; dropping the audio",
+            );
+            this.giveUpOnAudio(row);
+            continue;
+          }
+          const saved = await media.saveAudio(buffer, {
+            suggestedName: row.media_name ?? undefined,
+          });
+          // One statement: the bytes are ours now, so the transport reference is
+          // spent. A retried batch must not fetch this file a second time.
+          setInboxAudioPath(db, row.id, saved.filePath);
+          // Mutated in place because resolveAudio reads these same row objects.
+          row.audio_path = saved.filePath;
+          row.media_ref = null;
+          continue;
+        }
+
+        const saved = await media.savePhoto(buffer, {
+          mimeType: row.media_mime ?? undefined,
+          suggestedName: row.media_name ?? undefined,
+        });
+        addPendingMedia(db, {
+          phone: row.phone,
+          file_path: saved.filePath,
+          public_path: saved.publicPath,
+          // Only what the owner actually wrote about this photo, or nothing.
+          caption: row.agent_text.trim() || null,
+          // What orders the gallery when the transport does not order delivery.
+          sent_at: row.media_sent_at,
+        });
+        clearInboxMedia(db, row.id);
+        row.media_ref = null;
+      } catch (err) {
+        // The message still reaches the agent — it just arrives without its file.
+        // The ref is cleared rather than left for the next attempt: the webhook
+        // never retried a lost photo either, and a dead fetch re-attempted on
+        // every remaining attempt only makes the person wait longer for an
+        // answer the attachment was never required for.
+        log.error({ err, phone: row.phone, inboxId: row.id }, "inbound media not stored");
+        if (row.media_kind === "audio") this.giveUpOnAudio(row);
+        else {
+          clearInboxMedia(db, row.id);
+          row.media_ref = null;
+        }
+      }
+    }
+  }
+
+  /**
+   * Settle a voice note whose words we are never going to get.
+   *
+   * The fallback LINE is the point, not the cleared reference. A voice note that
+   * yields no audio and no transcript leaves a row with empty text, and
+   * buildBatchText renders nothing for it — so a batch of one settles `done`
+   * WITHOUT an agent turn and the person gets the exact silence AUDIO_FALLBACK
+   * exists to prevent. An uncaptioned PHOTO has no such problem: it is kind
+   * 'media', which buildBatchText always renders as a photo line.
+   *
+   * Written through setInboxTranscript because this IS the transcript as far as
+   * the rest of the pipeline is concerned: the words we settled for. Clearing
+   * media_ref in the same breath keeps a retried batch from re-fetching it.
+   */
+  private giveUpOnAudio(row: InboxRow): void {
+    setInboxTranscript(this.deps.db, row.id, AUDIO_FALLBACK);
+    clearInboxMedia(this.deps.db, row.id);
+    // Mutated in place because buildBatchText reads these same row objects.
+    row.agent_text = AUDIO_FALLBACK;
+    row.audio_path = null;
+    row.media_ref = null;
   }
 
   /**
@@ -401,6 +540,11 @@ export class InboxBatcher {
       });
       return;
     }
+
+    // Inbound files are fetched HERE, on the worker, not in the webhook — the
+    // handler only recorded a reference to them. Before resolveAudio, which
+    // needs the bytes on disk to transcribe.
+    await this.resolveMedia(rows);
 
     // Voice notes become words HERE, on the worker, not in the webhook: this is
     // a network call, and the bridge's outbox is strictly sequential.

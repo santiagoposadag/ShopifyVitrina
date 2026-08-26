@@ -7,12 +7,13 @@ import {
   MAX_BATCH_ATTEMPTS,
   RETRY_DELAY_MS,
   type BatchRow,
+  type InboundMediaStore,
   type InboxBatcherDeps,
   type MessageKind,
 } from "../src/inbox/batcher.js";
 import { openDb, type DB } from "../src/data/db.js";
 import { PerPhoneQueue } from "../src/inbox/queue.js";
-import { getInboxRow, insertInboxMessage } from "../src/data/repo.js";
+import { getInboxRow, insertInboxMessage, listPendingMedia } from "../src/data/repo.js";
 import type { TurnContext } from "../src/types.js";
 
 const DEBOUNCE_MS = 8000;
@@ -770,5 +771,231 @@ describe("voice notes", () => {
     expect(buildBatchText([pic(), txt("busco algo en Laureles"), pic()])).toBe(
       "(El usuario envió una foto)\nbusco algo en Laureles\n(El usuario envió una foto)",
     );
+  });
+});
+
+/**
+ * Inbound files are fetched on the WORKER, not in the webhook.
+ *
+ * The webhook records a reference and ACKs. It used to download the file first,
+ * which put one or two network round trips per message between the transport
+ * and its 200 — and one Cloud API POST can carry an entire photo burst. Meta
+ * retries a slow webhook and eventually disables the subscription; the bridge's
+ * outbox is strictly sequential and stalls every message queued behind it.
+ */
+describe("deferred inbound media", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function drain(h: Harness): Promise<void> {
+    for (let i = 0; i < 500 && h.queue.activePhones > 0; i++) {
+      await realEventLoopTurn();
+      await vi.advanceTimersByTimeAsync(0);
+    }
+  }
+
+  async function settle(h: Harness, ms = DEBOUNCE_MS): Promise<void> {
+    await vi.advanceTimersByTimeAsync(ms);
+    await drain(h);
+  }
+
+  /** A store that records what it was asked for and hands back plausible bytes. */
+  function storeSpy(
+    overrides: Partial<InboundMediaStore> = {},
+  ): InboundMediaStore & { downloaded: string[] } {
+    const downloaded: string[] = [];
+    return {
+      downloaded,
+      download: async (ref: string) => {
+        downloaded.push(ref);
+        return Buffer.from("bytes");
+      },
+      savePhoto: async () => ({ filePath: `/tmp/${Math.random()}.jpg`, publicPath: "http://x/p" }),
+      saveAudio: async () => ({ filePath: `/tmp/${Math.random()}.ogg` }),
+      maxAudioBytes: 25 * 1024 * 1024,
+      ...overrides,
+    };
+  }
+
+  /** Persist a photo the way the webhook does now: a reference, never a file. */
+  function receivePhoto(
+    h: Harness,
+    phone: string,
+    caption: string,
+    opts: { ref: string; sentAt?: number },
+  ): number {
+    const row = insertInboxMessage(h.db, {
+      dedupe_key: `msg:${phone}:${opts.ref}`,
+      phone,
+      agent_text: caption,
+      kind: "media",
+      media_ref: opts.ref,
+      media_kind: "photo",
+      media_mime: "image/jpeg",
+      media_sent_at: opts.sentAt ?? null,
+    });
+    if (!row) throw new Error("insert failed");
+    h.batcher.schedule(phone, "media");
+    return row.id;
+  }
+
+  it("fetches an owner's photo and files it for attach_pending_photos", async () => {
+    const media = storeSpy();
+    const h = harness({ media, roleFor: () => "owner" });
+    const id = receivePhoto(h, "573001", "vestier alcoba", { ref: "MEDIA_1" });
+
+    await settle(h, MEDIA_DEBOUNCE_MS);
+
+    expect(media.downloaded).toEqual(["MEDIA_1"]);
+    const pending = listPendingMedia(h.db, "573001");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.caption).toBe("vestier alcoba");
+    // The reference is spent. A retried batch must not fetch it again.
+    expect(getInboxRow(h.db, id)!.media_ref).toBeNull();
+  });
+
+  it("orders a photo burst by WHEN IT WAS SENT, not by when it arrived", async () => {
+    // The other half of the Cloud API's missing ordering guarantee. The webhook
+    // pins that the stamp reaches the row (webhook.test.ts); this pins that the
+    // gallery it produces comes out in send order — the first photo becomes the
+    // product's cover, so this is the listing's order, not a nicety.
+    const media = storeSpy();
+    const h = harness({ media, roleFor: () => "owner" });
+    receivePhoto(h, "573001", "tercera", { ref: "MEDIA_C", sentAt: 1756200002 });
+    receivePhoto(h, "573001", "primera", { ref: "MEDIA_A", sentAt: 1756200000 });
+    receivePhoto(h, "573001", "segunda", { ref: "MEDIA_B", sentAt: 1756200001 });
+
+    await settle(h, MEDIA_DEBOUNCE_MS);
+
+    expect(listPendingMedia(h.db, "573001").map((p) => p.caption)).toEqual([
+      "primera",
+      "segunda",
+      "tercera",
+    ]);
+  });
+
+  it("downloads a voice note and only then transcribes it", async () => {
+    // Ordering inside the worker: resolveMedia must run before resolveAudio, or
+    // there are no bytes on disk for the transcription to read.
+    const media = storeSpy({ saveAudio: async () => ({ filePath: "/tmp/note.ogg" }) });
+    const transcribed: string[] = [];
+    const h = harness({
+      media,
+      transcribeAudio: async (path: string) => {
+        transcribed.push(path);
+        return "busco un vestido rojo";
+      },
+    });
+    const row = insertInboxMessage(h.db, {
+      dedupe_key: "msg:audio",
+      phone: "573001",
+      agent_text: "",
+      kind: "text",
+      media_ref: "MEDIA_AUDIO",
+      media_kind: "audio",
+    })!;
+    h.batcher.schedule("573001", "text");
+
+    await settle(h);
+
+    expect(media.downloaded).toEqual(["MEDIA_AUDIO"]);
+    expect(transcribed).toEqual(["/tmp/note.ogg"]);
+    expect(h.turns[0]!.text).toBe("busco un vestido rojo");
+    expect(getInboxRow(h.db, row.id)!.media_ref).toBeNull();
+  });
+
+  it("drops a voice note too large to transcribe, without failing the batch", async () => {
+    const media = storeSpy({ maxAudioBytes: 2 });
+    const h = harness({ media, transcribeAudio: async () => "never reached" });
+    insertInboxMessage(h.db, {
+      dedupe_key: "msg:big",
+      phone: "573001",
+      agent_text: "",
+      kind: "text",
+      media_ref: "MEDIA_BIG",
+      media_kind: "audio",
+    });
+    h.batcher.schedule("573001", "text");
+
+    await settle(h);
+
+    // Still answered — with the fallback, not with silence.
+    expect(h.turns).toHaveLength(1);
+    expect(h.turns[0]!.text).toBe(AUDIO_FALLBACK);
+  });
+
+  it("still answers the message when the download fails", async () => {
+    // What the webhook did when it owned this work: log and carry on. A photo
+    // that never arrived is not a reason to leave the person without a reply.
+    const media = storeSpy({
+      download: async () => {
+        throw new Error("Meta said 404");
+      },
+    });
+    const h = harness({ media, roleFor: () => "owner" });
+    const id = receivePhoto(h, "573001", "mirá esto", { ref: "MEDIA_GONE" });
+
+    await settle(h, MEDIA_DEBOUNCE_MS);
+
+    expect(h.failures).toEqual([]);
+    expect(h.turns).toHaveLength(1);
+    expect(listPendingMedia(h.db, "573001")).toEqual([]);
+    // Cleared, so the batch's remaining attempts do not re-attempt a dead fetch.
+    expect(getInboxRow(h.db, id)!.media_ref).toBeNull();
+  });
+
+  it("does NOT download the same file twice when the batch is retried", async () => {
+    // The reason media_ref and audio_path are separate states. A batch that
+    // fails downstream is claimed again; without clearing the reference, every
+    // attempt would re-fetch a file already on our disk — on the Cloud API that
+    // is two more Graph round trips per retry.
+    const media = storeSpy();
+    let turns = 0;
+    const h = harness({
+      media,
+      roleFor: () => "owner",
+      onMessage: async () => {
+        turns += 1;
+        if (turns === 1) throw new Error("Shopify blipped");
+      },
+    });
+    receivePhoto(h, "573001", "foto", { ref: "MEDIA_ONCE" });
+
+    await settle(h, MEDIA_DEBOUNCE_MS); // attempt 1 — fails downstream
+    await settle(h, RETRY_DELAY_MS); // attempt 2 — succeeds
+
+    expect(turns).toBe(2);
+    expect(media.downloaded).toEqual(["MEDIA_ONCE"]);
+    expect(listPendingMedia(h.db, "573001")).toHaveLength(1);
+  });
+
+  it("fetches nothing for a batch that already blew its attempt cap", async () => {
+    // A poison batch should not be billed — the same reason it is not
+    // transcribed before being abandoned.
+    const media = storeSpy();
+    const h = harness({ media, roleFor: () => "owner" });
+    const id = receivePhoto(h, "573001", "foto", { ref: "MEDIA_POISON" });
+    h.db.prepare(`UPDATE inbox SET attempts = ? WHERE id = ?`).run(MAX_BATCH_ATTEMPTS, id);
+
+    await settle(h, MEDIA_DEBOUNCE_MS);
+
+    expect(media.downloaded).toEqual([]);
+    expect(h.failures.at(-1)!.final).toBe(true);
+  });
+
+  it("leaves rows alone when no media store is configured", async () => {
+    // The dep is optional so a caller with no media concern needs nothing; the
+    // message must still get its answer.
+    const h = harness({ roleFor: () => "owner" });
+    const id = receivePhoto(h, "573001", "foto", { ref: "MEDIA_X" });
+
+    await settle(h, MEDIA_DEBOUNCE_MS);
+
+    expect(h.turns).toHaveLength(1);
+    expect(getInboxRow(h.db, id)!.media_ref).toBe("MEDIA_X");
   });
 });

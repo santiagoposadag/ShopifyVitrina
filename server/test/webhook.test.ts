@@ -141,6 +141,8 @@ describe("inbound audio reaches the inbox", () => {
     const db = openDb(":memory:");
     const scheduled: { phone: string; kind: string }[] = [];
     const released: string[] = [];
+    // The whole point of the deferral: this must stay EMPTY for the request.
+    const downloaded: string[] = [];
 
     const app = Fastify();
     registerWebhook(app, {
@@ -154,7 +156,10 @@ describe("inbound audio reaches the inbox", () => {
       db,
       channel: {
         sendText: async () => undefined,
-        downloadMedia: async () => Buffer.from("fake-opus-bytes"),
+        downloadMedia: async (ref: string) => {
+          downloaded.push(ref);
+          return Buffer.from("fake-opus-bytes");
+        },
         releaseMedia: async (ref: string) => {
           released.push(ref);
         },
@@ -178,7 +183,7 @@ describe("inbound audio reaches the inbox", () => {
       });
     };
 
-    return { app, db, post, scheduled, released, dir };
+    return { app, db, post, scheduled, released, downloaded, dir };
   }
 
   it("persists a voice note instead of silently dropping it", async () => {
@@ -187,12 +192,37 @@ describe("inbound audio reaches the inbox", () => {
     const res = await h.post(AUDIO_EVENT);
 
     expect(res.statusCode).toBe(200);
-    const rows = h.db.prepare(`SELECT * FROM inbox`).all() as { audio_path: string | null }[];
+    const rows = h.db.prepare(`SELECT * FROM inbox`).all() as {
+      audio_path: string | null;
+      media_ref: string | null;
+      media_kind: string | null;
+      media_name: string | null;
+    }[];
     expect(rows).toHaveLength(1);
-    // The path is what the worker transcribes from. Without it the row is a
-    // message with no content at all.
-    expect(rows[0]!.audio_path).toBeTruthy();
+    // The REFERENCE is what survives the ACK. Without it the row is a message
+    // with no content at all — the bug this whole path exists to fix.
+    expect(rows[0]!.media_ref).toBe("note.bin");
+    expect(rows[0]!.media_kind).toBe("audio");
+    // The file name rides along because the transcription API reads the format
+    // off the extension; losing it here makes the transcript fail later.
+    expect(rows[0]!.media_name).toBe("audio.ogg");
+    // Still unfetched: audio_path is set by the worker, and the two states must
+    // stay distinguishable or a retried batch re-downloads what it already has.
+    expect(rows[0]!.audio_path).toBeNull();
     expect(h.scheduled).toHaveLength(1);
+    await h.app.close();
+  });
+
+  it("downloads NOTHING inside the request", async () => {
+    // The ACK is the contract. Fetching here cost one or two network round trips
+    // per message before the 200: Meta retries a slow webhook and eventually
+    // disables the subscription, and the bridge's outbox is strictly sequential,
+    // so every message queued behind this one waited too. The worker fetches.
+    const h = await harness();
+
+    await h.post(AUDIO_EVENT);
+
+    expect(h.downloaded).toEqual([]);
     await h.app.close();
   });
 
@@ -230,17 +260,23 @@ describe("inbound audio reaches the inbox", () => {
     }
   });
 
-  it("does not leave an orphan file when the bridge redelivers", async () => {
-    // The audio is stored BEFORE the insert, because the row must carry its
-    // path — so a redelivery that dedupes would otherwise strand the file.
+  it("does NOT release the first copy's file when the bridge redelivers", async () => {
+    // The reversal that came with deferring the fetch, and the easiest way to
+    // reintroduce silent data loss. While the handler downloaded the file
+    // itself, a redelivery's copy was spent and releasing it was tidy-up. Now
+    // the FIRST row still owns that reference and has not fetched it — so the
+    // same release would delete the file that row is waiting for, and the
+    // owner's photo or voice note would vanish between the ACK and the worker.
     const h = await harness();
 
     await h.post(AUDIO_EVENT);
     await h.post(AUDIO_EVENT);
 
     expect(h.db.prepare(`SELECT COUNT(*) n FROM inbox`).get()).toEqual({ n: 1 });
-    const stored = await readdir(join(h.dir, "audio"));
-    expect(stored).toHaveLength(1);
+    expect(h.released).toEqual([]);
+    // The surviving row still points at the file the worker will fetch.
+    const row = h.db.prepare(`SELECT media_ref FROM inbox`).get() as { media_ref: string };
+    expect(row.media_ref).toBe("note.bin");
     await h.app.close();
   });
 
@@ -425,20 +461,31 @@ describe("Meta Cloud API webhook", () => {
     await h.app.close();
   });
 
-  it("orders a photo burst by WHEN IT WAS SENT, not by when it arrived", async () => {
+  it("carries WhatsApp's send stamp onto the row, for a burst that arrives backwards", async () => {
     // The invariant this replaces: the bridge's outbox delivered a burst
     // strictly in order, so arrival order was listing order and the first photo
     // became the cover. Meta gives no such guarantee — these three arrive
-    // backwards, and the gallery must still come out right.
-    const { listPendingMedia } = await import("../src/data/repo.js");
+    // backwards, and the stamp is the only thing that can put them right.
+    //
+    // The gallery itself is assembled on the worker now; that half is pinned in
+    // batcher.test.ts ("orders a photo burst by WHEN IT WAS SENT").
     const h = await harness();
 
     await h.post(metaPayload([photo("wamid.C", "tercera", 1756200002)]));
     await h.post(metaPayload([photo("wamid.A", "primera", 1756200000)]));
     await h.post(metaPayload([photo("wamid.B", "segunda", 1756200001)]));
 
-    const pending = listPendingMedia(h.db, "573001112233");
-    expect(pending.map((p) => p.caption)).toEqual(["primera", "segunda", "tercera"]);
+    const rows = h.db
+      .prepare(`SELECT agent_text, media_ref, media_sent_at FROM inbox ORDER BY media_sent_at`)
+      .all() as { agent_text: string; media_ref: string; media_sent_at: number }[];
+    expect(rows.map((r) => r.agent_text)).toEqual(["primera", "segunda", "tercera"]);
+    // The media id, never the URL: what Meta hands back expires in ~5 minutes,
+    // so resolving it at download time is the only thing that works.
+    expect(rows.map((r) => r.media_ref)).toEqual([
+      "MEDIA_wamid.A",
+      "MEDIA_wamid.B",
+      "MEDIA_wamid.C",
+    ]);
     await h.app.close();
   });
 

@@ -68,7 +68,7 @@ phone stays offline too long. See `bridge/` and CLAUDE.md.
 - `src/whatsapp/bridge.ts` — the linked-device sidecar: posts replies to it, reads staged media off the shared volume (`isAllowedMediaPath` confines it), sweeps files orphaned by a crash.
 - `src/inbox/cloud.ts` — parses Meta's payload into `InboundMessage[]` (one POST can carry many), skips delivery statuses, and surfaces the failed ones.
 - `src/inbox/whatsmeow.ts` — parses the bridge's event shape into an `InboundMessage`.
-- `src/inbox/webhook.ts` — `POST /webhook`: HMAC verify (raw body), persisted inbox (dedupe + at-least-once: unfinished messages are replayed on boot), media handoff, fast ACK. Plus `GET /webhook`, Meta's verification handshake, registered only on the Cloud API.
+- `src/inbox/webhook.ts` — `POST /webhook`: HMAC verify (raw body), persisted inbox (dedupe + at-least-once: unfinished messages are replayed on boot), and a fast ACK. It records a *reference* to any inbound file and downloads nothing — the fetch happens on the worker (`batcher.resolveMedia`), because both transports punish a slow handler. Plus `GET /webhook`, Meta's verification handshake, registered only on the Cloud API.
 - `src/inbox/batcher.ts` — coalesces each phone's message burst into ONE agent turn (`BATCH_DEBOUNCE_MS` of silence, `BATCH_MAX_WAIT_MS` ceiling) and settles its inbox rows. Also mints the turn key that makes a stock adjustment safe to retry.
 - `src/inbox/queue.ts` — in-process FIFO with per-phone serialization.
 - `src/agent/agent.ts` — Claude Agent SDK integration: resume per-phone session (idle sessions expire after `SESSION_MAX_AGE_DAYS`; an unresumable session falls back once to a fresh one), run tools, reply in Spanish. `systemPrompt` holds both personas.

@@ -118,6 +118,13 @@ export function setSessionId(db: DB, phone: string, sessionId: string): void {
 
 export type InboxStatus = "pending" | "processing" | "done" | "failed";
 
+/**
+ * What the worker must do with a row's media_ref. Explicit rather than derived
+ * from `kind`: a voice note is persisted as kind='text' (see db.ts), so reading
+ * intent off `kind` would couple this to a rule stated in another file.
+ */
+export type InboxMediaKind = "photo" | "audio";
+
 export interface InboxRow {
   id: number;
   dedupe_key: string;
@@ -127,6 +134,21 @@ export interface InboxRow {
   kind: MessageKind;
   /** Set while a voice note still needs transcribing; null once agent_text holds it. */
   audio_path: string | null;
+  /**
+   * The transport's reference to a file this message carried, while it is still
+   * UNFETCHED. Null once the worker has downloaded it (or given up on it).
+   *
+   * Not the same state as audio_path, which means the bytes are already on our
+   * disk. Collapsing the two would make a retried batch re-download a file it
+   * already holds.
+   */
+  media_ref: string | null;
+  /** 'photo' | 'audio' — what resolveMedia should do with media_ref. */
+  media_kind: InboxMediaKind | null;
+  media_mime: string | null;
+  media_name: string | null;
+  /** WhatsApp's send stamp (unix seconds), on its way to pending_media.sent_at. */
+  media_sent_at: number | null;
   status: InboxStatus;
   attempts: number;
   received_at: string;
@@ -148,14 +170,33 @@ export function insertInboxMessage(
     agent_text: string;
     kind?: MessageKind;
     audio_path?: string | null;
+    /** An unfetched file reference; the worker resolves it (see batcher.resolveMedia). */
+    media_ref?: string | null;
+    media_kind?: InboxMediaKind | null;
+    media_mime?: string | null;
+    media_name?: string | null;
+    media_sent_at?: number | null;
   },
 ): InboxRow | null {
   const info = db
     .prepare(
-      `INSERT OR IGNORE INTO inbox (dedupe_key, phone, agent_text, kind, audio_path)
-       VALUES (@dedupe_key, @phone, @agent_text, @kind, @audio_path)`,
+      `INSERT OR IGNORE INTO inbox
+         (dedupe_key, phone, agent_text, kind, audio_path,
+          media_ref, media_kind, media_mime, media_name, media_sent_at)
+       VALUES
+         (@dedupe_key, @phone, @agent_text, @kind, @audio_path,
+          @media_ref, @media_kind, @media_mime, @media_name, @media_sent_at)`,
     )
-    .run({ kind: "text", audio_path: null, ...input });
+    .run({
+      kind: "text",
+      audio_path: null,
+      media_ref: null,
+      media_kind: null,
+      media_mime: null,
+      media_name: null,
+      media_sent_at: null,
+      ...input,
+    });
   if (info.changes === 0) return null;
   return getInboxRow(db, Number(info.lastInsertRowid));
 }
@@ -173,6 +214,35 @@ export function setInboxTranscript(db: DB, id: number, transcript: string): void
     id,
     transcript,
   });
+}
+
+/**
+ * Record where a downloaded voice note landed, and retire its media reference.
+ *
+ * Both fields move in one statement because they are the same fact: the bytes
+ * are now on our disk, so the reference that pointed at the transport is spent.
+ * A batch that fails downstream is claimed again, and a lingering media_ref
+ * would make the retry download the same file a second time — on the Cloud API
+ * that is two more Graph round trips for a file we already have.
+ */
+export function setInboxAudioPath(db: DB, id: number, audioPath: string): void {
+  db.prepare(`UPDATE inbox SET audio_path = @audioPath, media_ref = NULL WHERE id = @id`).run({
+    id,
+    audioPath,
+  });
+}
+
+/**
+ * Mark a row's media reference as spent without producing a file.
+ *
+ * Used for a photo that reached pending_media (the row itself needs no path)
+ * and for a download that failed. Failure clears it too, deliberately: the
+ * webhook never retried a lost photo either, and leaving the ref set would make
+ * every one of the batch's remaining attempts re-attempt the same dead fetch
+ * while the person waits for an answer the photo is not required for.
+ */
+export function clearInboxMedia(db: DB, id: number): void {
+  db.prepare(`UPDATE inbox SET media_ref = NULL WHERE id = ?`).run(id);
 }
 
 export function getInboxRow(db: DB, id: number): InboxRow | null {
