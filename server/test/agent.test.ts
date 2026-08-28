@@ -423,6 +423,64 @@ describe("runAgentTurn session reset after publish", () => {
  * It is the silence AUDIO_FALLBACK prevents on the voice-note path, reached
  * from the other end.
  */
+/**
+ * The built-in Claude Code tools must not exist for this agent.
+ *
+ * allowedTools only auto-approves; it leaves Bash, Read and Edit in the model's
+ * CONTEXT, where a model that cannot find what it needs will reach for them.
+ * Denying at execution is too late — the turn is already spent. Observed
+ * against a real store: twelve turns, every one a refused Bash call, no answer.
+ */
+describe("runAgentTurn tool surface", () => {
+  let db: DB;
+
+  beforeEach(() => {
+    queryMock.mockReset();
+    db = openDb(":memory:");
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("removes every built-in tool from the model's context", async () => {
+    queryMock.mockReturnValueOnce(successStream("s1", "Hola"));
+    const deps = {
+      db,
+      config: CONFIG,
+      log: { warn: () => undefined, info: () => undefined, error: () => undefined },
+      channel: fakeChannel([]),
+      shopify: SHOPIFY,
+      cache: CACHE,
+    } as never as Parameters<typeof runAgentTurn>[0];
+
+    await runAgentTurn(deps, { phone: PHONE, role: "owner", turnKey: "msg:1" }, "hola");
+
+    const [{ options }] = queryMock.mock.calls[0] as [{ options: { tools?: unknown } }];
+    expect(options.tools).toEqual([]);
+  });
+
+  it("still auto-approves our OWN tools, or each would wait on a prompt", async () => {
+    // Nothing in this process can answer a permission prompt, so an MCP tool
+    // that is merely available and not allowed would hang the turn.
+    queryMock.mockReturnValueOnce(successStream("s1", "Hola"));
+    const deps = {
+      db,
+      config: CONFIG,
+      log: { warn: () => undefined, info: () => undefined, error: () => undefined },
+      channel: fakeChannel([]),
+      shopify: SHOPIFY,
+      cache: CACHE,
+    } as never as Parameters<typeof runAgentTurn>[0];
+
+    await runAgentTurn(deps, { phone: PHONE, role: "owner", turnKey: "msg:1" }, "hola");
+
+    const [{ options }] = queryMock.mock.calls[0] as [{ options: { allowedTools?: string[] } }];
+    expect(options.allowedTools?.length).toBeGreaterThan(0);
+    expect(options.allowedTools?.every((t) => t.startsWith("mcp__vitrina__"))).toBe(true);
+  });
+});
+
 describe("runAgentTurn never answers with silence", () => {
   let db: DB;
   let sent: string[];

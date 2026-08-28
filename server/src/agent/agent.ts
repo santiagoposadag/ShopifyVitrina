@@ -326,8 +326,23 @@ async function runQuery(
       ...(config.maxThinkingTokens > 0 ? { maxThinkingTokens: config.maxThinkingTokens } : {}),
       systemPrompt: systemPrompt(ctx.role),
       mcpServers: { [MCP_SERVER_NAME]: server },
+      // REMOVE every built-in tool from the model's context. This is the option
+      // that actually restricts what exists; allowedTools only auto-approves,
+      // and the SDK says so: "To restrict which tools are available, use the
+      // `tools` option instead."
+      //
+      // Denying a built-in at execution time is far too late. The model still
+      // SEES Bash, Read and Edit, picks one, and burns a whole turn discovering
+      // it is refused — then picks it again. Observed against a real store:
+      // twelve turns, every one of them a denied Bash call, no answer produced,
+      // and 52 seconds of the owner's time spent on it.
+      tools: [],
+      // Our own tools still need auto-approval, or each one would wait on a
+      // permission prompt that nothing in this process can answer.
       allowedTools: toolNames,
-      // Deny every built-in tool: this agent must act ONLY through our tools.
+      // Defence in depth, and the only place every call is logged. Nothing
+      // should reach the deny branch now — if something does, that is worth
+      // seeing.
       canUseTool: async (toolName, input) => {
         if (toolName.startsWith(`mcp__${MCP_SERVER_NAME}__`)) {
           // Every tool call, as it is authorised. This is the only place the
