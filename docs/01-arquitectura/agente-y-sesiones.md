@@ -40,8 +40,22 @@ sequenceDiagram
 > ℹ️ Giving the customer's tool a `status` parameter instead would move that boundary
 > out of the tool set — where it is structural — into a value the model decides.
 
-Every built-in SDK tool is denied: the agent may act **only** through our MCP server.
+## The built-ins are REMOVED, not denied
+
+| Option | What it actually does |
+|---|---|
+| `tools: []` | **Removes** every built-in from the model's context. The only real restriction |
+| `allowedTools` | Auto-approves ours. Does NOT restrict — the SDK says use `tools` for that |
+| `canUseTool` | Denies at EXECUTION, when a turn is already spent. Defence in depth, and the tool log |
+
 `server/src/agent/agent.ts:301`
+
+> ⚠️ Denying from `canUseTool` alone is too late. The model still SEES `Bash`, picks it,
+> and burns a turn discovering it is refused — then picks it again. Observed against a real
+> store: **twelve turns, every one a denied `Bash` call, no answer, 52 seconds.**
+
+> ℹ️ `allowedTools` still carries our own tools, or each would wait on a prompt that
+> nothing in this process can answer.
 
 ## Session lifetime
 
@@ -94,4 +108,4 @@ undefined keys. `server/src/agent/agent.ts:138`
 
 **[← Shopify layer](capa-shopify.md)** · **[WhatsApp transport →](bridge-whatsapp.md)**
 
-<sub>Verified against `6f9211b` — 2026-08-24</sub>
+<sub>Verified against `cda9ea9` — 2026-08-28</sub>

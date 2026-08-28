@@ -66,6 +66,26 @@ graph TB
 | Photos never attach | Uid mismatch on the staging volume | Both containers must be uid 1000 |
 | "Publicado" but invisible | `publishablePublish` failed | The tool's own WARNING text; publish from the admin |
 | Prices look wrong after an admin edit | Cache TTL on the ranking corpus | Only affects *findability*; quoted facts are re-read live |
+| A turn takes ~a minute and nothing arrives | The turn cap was spent without producing an answer | `numTurns=12` and `resultSubtype` ≠ `success` on the turn line |
+| `WARN denied a tool outside this assistant's set` | A built-in reached the model's context | Should be impossible: `tools: []` removes them. If it fires, that option regressed |
+| The reply is `NO_ANSWER_FALLBACK` | Same as above — the turn ended with no words | The ERROR line names the subtype and the tools it got stuck on |
+
+## What one turn records
+
+`logTurn` writes a single line per turn, and these are the fields that answer the questions
+people actually ask. `server/src/agent/agent.ts:357`
+
+| Field | Answers |
+|---|---|
+| `tools` | Which tools ran, in order — or none, meaning it answered from the prompt |
+| `numTurns` | Hitting `maxTurns` (12) means the turn ended without an answer |
+| `resultSubtype` | Only `success` carries a reply; anything else produced none |
+| `servedModel` | Compare against `configuredModel`: DeepSeek substitutes SILENTLY |
+| `durationMs` / `inputTokens` / `outputTokens` | Where the minute and the spend went |
+
+> ⚠️ A turn that ends with no words still sends `NO_ANSWER_FALLBACK`, logged at ERROR.
+> Sending nothing settles the batch as `done` and leaves the person waiting forever.
+> `server/src/agent/agent.ts:483`
 
 ## Errors the agent is allowed to see
 
@@ -86,4 +106,4 @@ explained away to the owner. `server/src/agent/tools.ts:47`
 
 **[← Customer's path](venta-cliente.md)** · **[Registered debt →](../DEUDA.md)**
 
-<sub>Verified against `6f9211b` — 2026-08-24</sub>
+<sub>Verified against `cda9ea9` — 2026-08-28</sub>
