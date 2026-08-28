@@ -357,6 +357,18 @@ describe("ShopifyClient token minting", () => {
     expect(calls).toEqual([GRAPHQL_URL]);
   });
 
+  it("names app_not_installed, which arrives as an HTML PAGE", async () => {
+    // Shopify answers this one with a full HTML error page, so without the name
+    // the message is 500 characters of markup — which is exactly what it did the
+    // first time this was hit against a real store.
+    const html = "<!DOCTYPE html><html><head><title>400 - Oauth error app_not_installed</title>";
+    const fetchImpl = (async () => new Response(html, { status: 400 })) as unknown as typeof fetch;
+    const c = new ShopifyClient(CREDS, fetchImpl, async () => undefined);
+
+    await expect(c.request("q")).rejects.toThrow(/not installed on this store/);
+    await expect(c.request("q")).rejects.not.toThrow(/DOCTYPE/);
+  });
+
   it("names shop_not_permitted for what it is", async () => {
     // The error a first-time setup actually hits, and nothing in Shopify's own
     // text says the cause is the app and store being in different organizations.

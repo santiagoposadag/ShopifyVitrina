@@ -66,6 +66,8 @@ const TOKEN_EXPIRY_MARGIN_MS = 5 * 60 * 1000;
  * same Shopify organization, and nothing in the error text says so.
  */
 const NAMED_OAUTH_ERRORS: Record<string, string> = {
+  app_not_installed:
+    "the app is not installed on this store — install it from the Dev Dashboard, and check the store appears under Dev stores (a store created from the Shopify admin is not in your organization)",
   shop_not_permitted:
     "the app and the store are not in the same Shopify organization — the client credentials grant cannot reach this store",
   invalid_client: "SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET is wrong",

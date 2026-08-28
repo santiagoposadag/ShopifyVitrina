@@ -21,7 +21,7 @@ password.
 
 | Step | Where |
 |---|---|
-| Open | `https://dev.shopify.com` → your organization |
+| Open | `https://dev.shopify.com/dashboard/` → your organization |
 | Navigate | **Apps** → **Create app** (top right) |
 | Choose | **Start from Dev Dashboard** |
 | Create | Name it `Vitrina` → **Create** |
@@ -32,7 +32,8 @@ password.
 
 ## 2 · Grant exactly these scopes
 
-In the app's **Configuration**, under Admin API access scopes, tick:
+Scopes belong to an app VERSION, not to the app. Open the **Versions** tab and create one,
+declaring exactly these:
 
 | Scope | Needed for |
 |---|---|
@@ -52,9 +53,13 @@ In the app's **Configuration**, under Admin API access scopes, tick:
 > ℹ️ Grant nothing else. No `read_orders`, no `read_customers`, no `write_price_rules`.
 > Milestone 1 has no checkout, so the token has no business touching money or people.
 
-Save, and **release a version** — scopes only take effect on a released app version, and
-the token endpoint hands out whatever the released version declares. Do **not** touch the
-Storefront API section; Vitrina uses the Admin API only.
+Then **Release** the version. This is not optional bookkeeping: the token endpoint hands out
+whatever the RELEASED version declares, so a saved-but-unreleased scope change simply does not
+exist as far as the credentials are concerned. Do **not** touch the Storefront API section;
+Vitrina uses the Admin API only.
+
+> ⚠️ Changing scopes later means creating and releasing a NEW version. Shopify does not apply
+> a scope change to an existing release.
 
 ## 3 · Copy the client credentials
 
