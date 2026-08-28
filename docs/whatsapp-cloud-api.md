@@ -47,16 +47,39 @@ provider es `cloud`. Si devuelve 403, el token no coincide; si la URL no es acce
 internet, el panel se niega a guardarla — y **rehace el handshake cada vez que la editas**,
 por eso el verify token vive en la config y no en un papel.
 
-Tres cosas que fallan silenciosamente si faltan:
+### Suscribirse son TRES pasos, no uno
+
+Verificado en campo el 2026-08-28, y perder el tercero cuesta una tarde: **desde el servidor
+los tres fallos se ven idénticos** — cero POST, exactamente igual que un problema de red.
+
+| # | Paso | Dónde |
+| --- | --- | --- |
+| 1 | Guardar Callback URL + verify token | Webhooks → *Edit* (nivel **app**) |
+| 2 | Suscribirse al campo `messages` | Webhooks → **Manage** (nivel **app**) |
+| 3 | **Activar el toggle de webhooks del número** | La configuración del **número** |
+
+> ⚠️ **El botón *Test* pasa con solo 1 y 2.** Manda su payload de ejemplo desde
+> `16315551181`, todo se ve correcto, y los mensajes reales al número siguen sin generar
+> webhook. El Test prueba la plomería del webhook, **no** la suscripción del número.
+
+> ⚠️ **Meta no reenvía lo que ocurrió antes de la suscripción.** Un mensaje escrito mientras
+> el campo estaba sin tildar se pierde, no se encola. Después de tocar cualquier ajuste de
+> suscripción hay que volver a mandar el mensaje.
+
+Y tres cosas más que fallan silenciosamente:
 
 1. **La app tiene que estar en modo `Live`.** En *Development* los webhooks solo llegan para
    las personas con rol en la app. La conversación de un cliente real nunca aparece, y no hay
    ningún error que lo diga.
 2. **La app tiene que estar suscrita a la WABA.** El botón de *Subscribe* está en la misma
-   pantalla de Webhooks (equivale a `POST /{waba-id}/subscribed_apps`). Sin eso, la URL queda
-   verificada y no llega ni un mensaje.
+   pantalla de Webhooks (equivale a `POST /{waba-id}/subscribed_apps`).
 3. **El servidor tiene que ser HTTPS público y con certificado válido.** Meta no entrega a
    HTTP ni a un certificado autofirmado.
+
+> ℹ️ **Regla de diagnóstico:** nuestro log solo puede mostrar lo que LLEGÓ. Cero POST
+> significa que Meta nunca lo intentó — el lugar donde mirar es el panel de entregas de
+> Meta, no el log. Una versión desalineada o un parser roto **igual** dejarían el POST
+> registrado.
 
 ---
 
@@ -177,7 +200,29 @@ después sirve para reproducir un mensaje sin teléfono.
 
 Para el primer mensaje real, Meta regala un **número de prueba** (limitado a 5 destinatarios
 que registres) — sirve para verificar el webhook de punta a punta antes de migrar el número
-comercial.
+comercial. Ese límite de cinco es **solo del número de prueba**: un número real registrado
+recibe de cualquiera.
+
+### Probarlo contra Meta desde tu máquina
+
+`ECHO_MODE=true` contesta todo mensaje sin turno de agente, así que no hacen falta ni Shopify
+ni el modelo — que es exactamente lo que se quiere cuando lo único que se está probando es el
+transporte.
+
+```sh
+cloudflared tunnel --url http://localhost:3005 --no-autoupdate   # URL pública, sin cuenta
+ECHO_MODE=true WHATSAPP_PROVIDER=cloud PORT=3005 npx tsx src/index.ts
+# Callback URL en el panel = https://<lo-que-imprima>/webhook
+```
+
+Las variables del shell **ganan** sobre `.env`: `process.loadEnvFile` no pisa lo que ya está en
+`process.env`. Por eso el modo y el puerto se fuerzan en la línea de comandos sin editar nada.
+
+| Trampa | Síntoma | Qué hacer |
+| --- | --- | --- |
+| Otro proceso en el puerto | Un `/health` que responde pero **no es el nuestro** — el nuestro devuelve solo `{status,time}` | Elegir otro puerto; tunelear al equivocado apunta Meta a otra app |
+| El router no resuelve `*.trycloudflare.com` | `NXDOMAIN` local, aunque Meta llega sin problema | `curl --resolve <host>:443:<ip>` con la IP de `1.1.1.1` |
+| El servidor corre en segundo plano | "No veo nada en la consola" | No hay consola: `tail -f` sobre el archivo de log |
 
 ---
 
@@ -189,7 +234,8 @@ comercial.
 - **El contenedor `bridge` no tiene trabajo** con `cloud`: `docker compose stop bridge`.
 - **Cuando no llega un mensaje**, el sitio donde mirar cambia: ya no es el `/status` del
   bridge sino **WhatsApp → Configuration → Webhooks** en el panel, que muestra los intentos de
-  entrega fallidos. Meta reintenta con backoff; la tabla `inbox` absorbe el duplicado.
+  entrega fallidos. Meta reintenta con backoff; la tabla `inbox` absorbe el duplicado. Si el
+  panel no muestra **ningún** intento, el problema es de suscripción (§2), no de red.
 - **Límites:** con el negocio verificado el número escala por tiers (1K → 10K → 100K →
   ilimitado) y desde octubre de 2025 el límite es **compartido por portfolio**, no por número.
 
