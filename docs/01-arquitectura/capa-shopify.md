@@ -13,7 +13,7 @@ graph TB
 
 | Module | Owns | Anchor |
 |---|---|---|
-| `client.ts` | Transport, throttling, `userErrors`, money formatting | `server/src/shopify/client.ts:68` |
+| `client.ts` | Transport, the access token, throttling, `userErrors`, money | `server/src/shopify/client.ts:95` |
 | `catalog.ts` | Every read and write, flattened into our own types | `server/src/shopify/catalog.ts:27` |
 | `rank.ts` | Relevance, the `match=NN%`, the approximate-match warning | `server/src/shopify/rank.ts:231` |
 | `cache.ts` | A disposable corpus for ranking. Not a mirror | `server/src/shopify/cache.ts:27` |
@@ -30,16 +30,38 @@ graph LR
 
 > ⚠️ `userErrors` is a **response field**, not an HTTP status. A client that only checks
 > `res.ok` reports a rejected price change to the owner as success. It must be asserted on
-> **every** mutation payload. `server/src/shopify/client.ts:173`
+> **every** mutation payload. `server/src/shopify/client.ts:333`
 
 > ℹ️ Retries live in the client, not only at the batch level: the Admin API is a leaky
 > bucket of query cost, and letting a throttle bubble up would re-run the entire turn
 > 30 s later — including mutations that already succeeded.
 
+## The access token is minted, not configured
+
+```mermaid
+graph LR
+    C["client id + secret<br/>never expire"] -->|"POST /admin/oauth/<br/>access_token"| T["token<br/>expires_in 86399"]
+    T --> U["cached, reused"]
+    U -->|"5 min before expiry"| C
+    U -->|"401 — once"| C
+```
+
+Shopify stopped allowing new admin-created custom apps in January 2026, so there is no
+permanent token to configure. The client mints one and renews it. `server/src/shopify/client.ts:177`
+
+| Guard | Why |
+|---|---|
+| Renew 5 min early | Purely reactive refresh means one request a day is *guaranteed* to fail first |
+| Retry a 401 once, once only | Covers revocation and skew; a fresh token also refused is bad credentials |
+| Single-flight mint | One turn fans out; a cold cache would fire a dozen token requests at once |
+
+> ℹ️ `shop_not_permitted` means app and store are in different Shopify organizations —
+> named in the error because Shopify's own wording never says so. `server/src/shopify/client.ts:66`
+
 ## Money is a string
 
 `toMoneyString` is the only place a number becomes money, and it runs on **writes only**.
-Reads pass through the decimal string Shopify returned. `server/src/shopify/client.ts:196`
+Reads pass through the decimal string Shopify returned. `server/src/shopify/client.ts:356`
 
 > ⚠️ No stored price is ever rebuilt from a float. `rank.ts` parses a float exactly once,
 > to compare against a budget, and discards it. `server/src/shopify/rank.ts:200`

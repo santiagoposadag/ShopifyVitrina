@@ -158,6 +158,9 @@ describe("loadConfig Shopify block", () => {
   const OWNED = [
     "SHOPIFY_STORE_DOMAIN",
     "SHOPIFY_ADMIN_TOKEN",
+    "SHOPIFY_CLIENT_ID",
+    "SHOPIFY_CLIENT_SECRET",
+    "ECHO_MODE",
     "SHOPIFY_API_VERSION",
     "SHOPIFY_LOCATION_ID",
     "CATALOG_CACHE_TTL_MS",
@@ -190,13 +193,84 @@ describe("loadConfig Shopify block", () => {
     }
   });
 
-  it("refuses to boot without the store domain or the token", () => {
+  it("refuses to boot without the store domain", () => {
     delete process.env["SHOPIFY_STORE_DOMAIN"];
     expect(() => loadConfig()).toThrow(/SHOPIFY_STORE_DOMAIN/);
+  });
 
-    process.env["SHOPIFY_STORE_DOMAIN"] = "tienda.myshopify.com";
+  // Two ways to hold Shopify credentials and neither is individually required.
+  // Shopify stopped allowing new admin-created custom apps in January 2026, so a
+  // new store has a Dev Dashboard client id and secret and NO token to paste;
+  // a legacy custom app has only the token. Demanding either specifically makes
+  // one of the two real deployments impossible to boot.
+  it("boots on Dev Dashboard client credentials with no admin token", () => {
     delete process.env["SHOPIFY_ADMIN_TOKEN"];
-    expect(() => loadConfig()).toThrow(/SHOPIFY_ADMIN_TOKEN/);
+    process.env["SHOPIFY_CLIENT_ID"] = "cid";
+    process.env["SHOPIFY_CLIENT_SECRET"] = "csecret";
+
+    const config = loadConfig();
+    expect(config.shopifyAdminToken).toBe("");
+    expect(config.shopifyClientId).toBe("cid");
+    expect(config.shopifyClientSecret).toBe("csecret");
+  });
+
+  it("boots on a ready-made admin token with no client credentials", () => {
+    const config = loadConfig();
+    expect(config.shopifyAdminToken).toBe("shpat_x");
+    expect(config.shopifyClientId).toBe("");
+  });
+
+  it("refuses to boot with NO Shopify credential at all", () => {
+    // Fail here, not on the owner's first "¿qué tengo?".
+    delete process.env["SHOPIFY_ADMIN_TOKEN"];
+    expect(() => loadConfig()).toThrow(/Missing Shopify credential/);
+  });
+
+  // ECHO_MODE exists to prove the WhatsApp transport before a store and a model
+  // are wired in. Requiring their credentials to boot into it would defeat the
+  // entire point — the failure it diagnoses is the one where all three are new.
+  it("boots with NO Shopify credential at all in echo mode", () => {
+    delete process.env["SHOPIFY_ADMIN_TOKEN"];
+    delete process.env["SHOPIFY_STORE_DOMAIN"];
+    process.env["ECHO_MODE"] = "true";
+
+    const config = loadConfig();
+    expect(config.echoMode).toBe(true);
+    expect(config.shopifyStoreDomain).toBe("");
+  });
+
+  it("boots with no AGENT credential either in echo mode", () => {
+    // No turn ever runs, so there is nothing for a model key to authorise.
+    delete process.env["ANTHROPIC_API_KEY"];
+    delete process.env["SHOPIFY_ADMIN_TOKEN"];
+    process.env["ECHO_MODE"] = "true";
+
+    expect(() => loadConfig()).not.toThrow();
+  });
+
+  it("still demands both credentials when echo mode is OFF", () => {
+    // The relaxation must be scoped to the flag: a real deployment keeps its
+    // fail-fast boot.
+    process.env["ECHO_MODE"] = "false";
+    delete process.env["SHOPIFY_ADMIN_TOKEN"];
+    expect(() => loadConfig()).toThrow(/Missing Shopify credential/);
+  });
+
+  it("defaults echo mode OFF", () => {
+    expect(loadConfig().echoMode).toBe(false);
+  });
+
+  it("refuses HALF a client credential pair", () => {
+    // An id without a secret buys nothing, and the token request would fail on
+    // the first catalog call instead of at boot — which is the whole point of
+    // checking here.
+    delete process.env["SHOPIFY_ADMIN_TOKEN"];
+    process.env["SHOPIFY_CLIENT_ID"] = "cid";
+    expect(() => loadConfig()).toThrow(/Missing Shopify credential/);
+
+    delete process.env["SHOPIFY_CLIENT_ID"];
+    process.env["SHOPIFY_CLIENT_SECRET"] = "csecret";
+    expect(() => loadConfig()).toThrow(/Missing Shopify credential/);
   });
 
   // Everyone copies the domain out of a browser address bar, and the client

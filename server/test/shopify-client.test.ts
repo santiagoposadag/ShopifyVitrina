@@ -11,6 +11,8 @@ import {
 const CONFIG: ShopifyConfig = {
   shopifyStoreDomain: "tienda.myshopify.com",
   shopifyAdminToken: "shpat_secret",
+  shopifyClientId: "",
+  shopifyClientSecret: "",
   shopifyApiVersion: "2026-01",
 };
 
@@ -177,5 +179,226 @@ describe("gidSuffix", () => {
 
   it("returns the input unchanged when it is not a gid", () => {
     expect(gidSuffix("camiseta-negra")).toBe("camiseta-negra");
+  });
+});
+
+/**
+ * Minting the access token.
+ *
+ * Shopify stopped allowing new admin-created custom apps in January 2026, so a
+ * new store's credentials are a Dev Dashboard client id and secret — and the
+ * token they buy expires in 24 hours (expires_in: 86399). Those two do not
+ * expire, which is why they are what lives in the environment and the token is
+ * minted here.
+ */
+describe("ShopifyClient token minting", () => {
+  const CREDS: ShopifyConfig = {
+    ...CONFIG,
+    // No ready-made token: this deployment mints its own.
+    shopifyAdminToken: "",
+    shopifyClientId: "client-id",
+    shopifyClientSecret: "client-secret",
+  };
+
+  const TOKEN_URL = "https://tienda.myshopify.com/admin/oauth/access_token";
+  const GRAPHQL_URL = "https://tienda.myshopify.com/admin/api/2026-01/graphql.json";
+
+  /** A token-endpoint response. 86399 is what Shopify actually returns. */
+  function tokenBody(token: string, expiresIn = 86399): Response {
+    return json({ access_token: token, scope: "read_products", expires_in: expiresIn });
+  }
+
+  /**
+   * A fake Shopify that answers both endpoints, with a movable clock.
+   *
+   * `mints` counts token requests, which is the number most of these tests are
+   * really about: a token that is minted twice when once would do is a wasted
+   * round trip on every agent turn.
+   */
+  function harness(opts: { graphql?: (token: string, n: number) => Response } = {}) {
+    let clockMs = 1_000_000;
+    const mints: string[] = [];
+    const sent: string[] = [];
+    let issued = 0;
+    let graphqlCalls = 0;
+
+    const fetchImpl = (async (url: string, init: RequestInit) => {
+      if (url === TOKEN_URL) {
+        mints.push(init.body as string);
+        issued += 1;
+        return tokenBody(`minted-${issued}`);
+      }
+      const token = (init.headers as Record<string, string>)["X-Shopify-Access-Token"]!;
+      sent.push(token);
+      graphqlCalls += 1;
+      return opts.graphql?.(token, graphqlCalls) ?? json({ data: { ok: true } });
+    }) as unknown as typeof fetch;
+
+    const c = new ShopifyClient(
+      CREDS,
+      fetchImpl,
+      async () => undefined,
+      () => clockMs,
+    );
+    return {
+      client: c,
+      mints,
+      sent,
+      advance: (ms: number) => {
+        clockMs += ms;
+      },
+    };
+  }
+
+  it("exchanges the client credentials and uses the token it gets back", async () => {
+    const h = harness();
+
+    await h.client.request("query { ok }");
+
+    expect(h.mints).toHaveLength(1);
+    // Form-encoded OAuth, not the GraphQL shape — a different endpoint entirely.
+    const body = new URLSearchParams(h.mints[0]!);
+    expect(body.get("grant_type")).toBe("client_credentials");
+    expect(body.get("client_id")).toBe("client-id");
+    expect(body.get("client_secret")).toBe("client-secret");
+    expect(h.sent).toEqual(["minted-1"]);
+  });
+
+  it("NEVER sends the client secret to the GraphQL endpoint", async () => {
+    // The secret buys tokens for the whole catalog. It belongs in exactly one
+    // request, and this pins that it does not leak into the other one.
+    const h = harness();
+    await h.client.request("query { ok }");
+    expect(h.sent.some((t) => t.includes("client-secret"))).toBe(false);
+  });
+
+  it("reuses the cached token instead of minting per request", async () => {
+    const h = harness();
+
+    await h.client.request("q1");
+    await h.client.request("q2");
+    await h.client.request("q3");
+
+    expect(h.mints).toHaveLength(1);
+    expect(h.sent).toEqual(["minted-1", "minted-1", "minted-1"]);
+  });
+
+  it("mints ONCE for a burst of concurrent calls", async () => {
+    // One agent turn fans out into many Shopify calls — a photo burst is a
+    // dozen. Without single-flighting, a cold cache fires a dozen token
+    // requests at once and keeps whichever happens to land last.
+    const h = harness();
+
+    await Promise.all([h.client.request("q1"), h.client.request("q2"), h.client.request("q3")]);
+
+    expect(h.mints).toHaveLength(1);
+    expect(new Set(h.sent)).toEqual(new Set(["minted-1"]));
+  });
+
+  it("renews BEFORE the token expires, not after it fails", async () => {
+    // The whole reason expires_in is read. A purely reactive refresh means one
+    // request every 24 hours is guaranteed to fail before it is retried.
+    const h = harness();
+    await h.client.request("q1");
+
+    // Past the 5-minute safety margin, but still inside Shopify's own 86399s.
+    h.advance((86399 - 60) * 1000);
+    await h.client.request("q2");
+
+    expect(h.mints).toHaveLength(2);
+    expect(h.sent).toEqual(["minted-1", "minted-2"]);
+  });
+
+  it("does not renew while the token is comfortably valid", async () => {
+    const h = harness();
+    await h.client.request("q1");
+
+    h.advance(60 * 60 * 1000); // an hour in
+    await h.client.request("q2");
+
+    expect(h.mints).toHaveLength(1);
+  });
+
+  it("refreshes and retries the SAME request when Shopify rejects the token", async () => {
+    // The safety net for everything expires_in cannot predict: a revoked token,
+    // clock skew, an early invalidation.
+    const h = harness({
+      graphql: (token) =>
+        token === "minted-1" ? json({ errors: [{ message: "unauthorized" }] }, 401) : json({ data: { ok: true } }),
+    });
+
+    const data = await h.client.request<{ ok: boolean }>("q");
+
+    expect(data.ok).toBe(true);
+    expect(h.mints).toHaveLength(2);
+    expect(h.sent).toEqual(["minted-1", "minted-2"]);
+  });
+
+  it("gives up after ONE refresh rather than burning the retry budget", async () => {
+    // A freshly minted token that is also rejected is not a transient failure —
+    // it is wrong credentials or missing scopes. Three more identical 401s only
+    // delay the real error reaching the owner.
+    const h = harness({ graphql: () => json({ errors: [{ message: "unauthorized" }] }, 401) });
+
+    await expect(h.client.request("q")).rejects.toThrow(ShopifyError);
+    expect(h.mints).toHaveLength(2);
+    expect(h.sent).toEqual(["minted-1", "minted-2"]);
+  });
+
+  it("does not try to refresh a token that was configured, not minted", async () => {
+    // A static token has nothing behind it to mint from; a 401 is simply final.
+    const calls: string[] = [];
+    const fetchImpl = (async (url: string) => {
+      calls.push(url);
+      return json({ errors: [{ message: "unauthorized" }] }, 401);
+    }) as unknown as typeof fetch;
+
+    await expect(client(fetchImpl).request("q")).rejects.toThrow(ShopifyError);
+    expect(calls).toEqual([GRAPHQL_URL]);
+  });
+
+  it("names shop_not_permitted for what it is", async () => {
+    // The error a first-time setup actually hits, and nothing in Shopify's own
+    // text says the cause is the app and store being in different organizations.
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ error: "shop_not_permitted" }), { status: 401 })) as unknown as typeof fetch;
+    const c = new ShopifyClient(CREDS, fetchImpl, async () => undefined);
+
+    await expect(c.request("q")).rejects.toThrow(/same Shopify organization/);
+  });
+
+  it("does not leak the client secret into the error when credentials are refused", async () => {
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ error: "invalid_client" }), { status: 401 })) as unknown as typeof fetch;
+    const c = new ShopifyClient(CREDS, fetchImpl, async () => undefined);
+
+    await expect(c.request("q")).rejects.toThrow(/SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET/);
+    await expect(c.request("q")).rejects.not.toThrow(/client-secret/);
+  });
+
+  it("falls back to a short lifetime when expires_in is missing", async () => {
+    // Neither immediately stale nor trusted forever: an hour self-corrects
+    // without minting per request.
+    let clockMs = 0;
+    let issued = 0;
+    const mints: string[] = [];
+    const fetchImpl = (async (url: string) => {
+      if (url === TOKEN_URL) {
+        mints.push(url);
+        issued += 1;
+        return json({ access_token: `minted-${issued}` }); // no expires_in
+      }
+      return json({ data: { ok: true } });
+    }) as unknown as typeof fetch;
+    const c = new ShopifyClient(CREDS, fetchImpl, async () => undefined, () => clockMs);
+
+    await c.request("q1");
+    clockMs += 50 * 60 * 1000; // 50 minutes: inside the fallback hour
+    await c.request("q2");
+    expect(mints).toHaveLength(1);
+
+    clockMs += 20 * 60 * 1000; // past it
+    await c.request("q3");
+    expect(mints).toHaveLength(2);
   });
 });

@@ -2,31 +2,37 @@
 
 ```mermaid
 graph LR
-    A["1 · Custom app<br/>in the store admin"] --> B["2 · Scopes"]
-    B --> C["3 · Install<br/>→ shpat_ token"]
+    A["1 · App in the<br/>Dev Dashboard"] --> B["2 · Scopes"]
+    B --> C["3 · Client ID<br/>+ Client Secret"]
     C --> D["4 · gopass +<br/>.env"]
     D --> E["5 · Verify<br/>read, then write"]
 ```
 
-You need the store owner's Shopify login and the **Store owner** role (or a staff account
-with the *Develop apps* permission). The token this produces can read and rewrite the
-whole catalog, so treat it like a database password.
+> ⚠️ **This page changed in August 2026.** Shopify no longer lets anyone create
+> admin-created custom apps: *"You can no longer create new admin-created custom apps.
+> Existing apps are unaffected and continue to work. For new apps, use Dev Dashboard or
+> Shopify CLI."* The old **Settings → Apps → Develop apps** path only appears for apps made
+> before January 2026, and it is the path this page used to describe.
 
-## 1 · Create the custom app
+Credentials here can read and rewrite the whole catalog. Treat them like a database
+password.
+
+## 1 · Create the app in the Dev Dashboard
 
 | Step | Where |
 |---|---|
-| Log in | `https://admin.shopify.com/store/<your-store>` |
-| Navigate | **Settings → Apps and sales channels → Develop apps** |
-| First time only | Click **Allow custom app development** and confirm |
-| Create | **Create an app** → name it `Vitrina` → **Create app** |
+| Open | `https://dev.shopify.com` → your organization |
+| Navigate | **Apps** → **Create app** (top right) |
+| Choose | **Start from Dev Dashboard** |
+| Create | Name it `Vitrina` → **Create** |
 
-> ℹ️ A custom app is per-store and never goes through the App Store. It exists only to
-> mint an Admin API token.
+> ⚠️ The app and the store must be in the **same Shopify organization**. This is what the
+> client credentials grant checks, and a store outside it answers `shop_not_permitted` —
+> a message that never mentions organizations. `server/src/shopify/client.ts:66`
 
 ## 2 · Grant exactly these scopes
 
-**Configuration → Admin API integration → Configure**, then tick:
+In the app's **Configuration**, under Admin API access scopes, tick:
 
 | Scope | Needed for |
 |---|---|
@@ -46,22 +52,25 @@ whole catalog, so treat it like a database password.
 > ℹ️ Grant nothing else. No `read_orders`, no `read_customers`, no `write_price_rules`.
 > Milestone 1 has no checkout, so the token has no business touching money or people.
 
-Save. Do **not** touch the Storefront API section — Vitrina uses the Admin API only.
+Save, and **release a version** — scopes only take effect on a released app version, and
+the token endpoint hands out whatever the released version declares. Do **not** touch the
+Storefront API section; Vitrina uses the Admin API only.
 
-## 3 · Install and copy the token
+## 3 · Copy the client credentials
 
-**API credentials → Install app → Install**. Shopify reveals the Admin API access token
-(`shpat_…`) **once**.
+**Settings** in your app → **Client ID** and **Client secret**.
 
-> ⚠️ Copy it straight into gopass. If you lose it you cannot re-read it — you have to
-> uninstall and reinstall the app, which mints a different token.
+> ℹ️ There is no `shpat_` token to copy any more. The server exchanges these two for an
+> access token at runtime and renews it before it expires — which is the whole reason these
+> are what lives in the environment: **the token lasts 24 hours, these do not expire.**
+> `server/src/shopify/client.ts:177`
 
 ```bash
-gopass insert -f vitrina/shopify_admin_token
+gopass insert -f vitrina/shopify_client_secret
 ```
 
-Changing scopes later means clicking **Save**, then reinstalling; the token survives a
-scope change, so nothing else has to move.
+The client id is not a secret and can sit in `.env`; the secret mints new tokens on demand,
+so it belongs in gopass with the rest.
 
 ## 4 · Wire it up
 
@@ -77,7 +86,9 @@ SHOPIFY_LOCATION_ID=
 | Variable | Source | Required |
 |---|---|---|
 | `SHOPIFY_STORE_DOMAIN` | `.env` | Yes — the server refuses to boot without it |
-| `SHOPIFY_ADMIN_TOKEN` | gopass `vitrina/shopify_admin_token` | Yes |
+| `SHOPIFY_CLIENT_ID` | `.env` | Yes, unless a legacy `SHOPIFY_ADMIN_TOKEN` is set |
+| `SHOPIFY_CLIENT_SECRET` | gopass `vitrina/shopify_client_secret` | Same |
+| `SHOPIFY_ADMIN_TOKEN` | gopass, legacy apps only | Only without the pair above |
 | `SHOPIFY_API_VERSION` | `.env`, defaults to `2026-01` | No |
 | `SHOPIFY_LOCATION_ID` | `.env` | Only with more than one location |
 
@@ -89,7 +100,15 @@ SHOPIFY_LOCATION_ID=
 
 ```bash
 export SHOPIFY_STORE_DOMAIN=your-store.myshopify.com
-export SHOPIFY_ADMIN_TOKEN="$(gopass show -o vitrina/shopify_admin_token)"
+
+# Mint a token the same way the server does: one POST, form-encoded, no OAuth
+# redirect. The reply carries expires_in: 86399 — that is where 24 hours comes from.
+export SHOPIFY_ADMIN_TOKEN="$(curl -s -X POST \
+  "https://$SHOPIFY_STORE_DOMAIN/admin/oauth/access_token" \
+  -d grant_type=client_credentials \
+  -d "client_id=$SHOPIFY_CLIENT_ID" \
+  -d "client_secret=$(gopass show -o vitrina/shopify_client_secret)" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
 
 curl -s "https://$SHOPIFY_STORE_DOMAIN/admin/api/2026-01/graphql.json" \
   -H "X-Shopify-Access-Token: $SHOPIFY_ADMIN_TOKEN" \
@@ -118,8 +137,9 @@ Then, and only then, boot the server and try it over WhatsApp — read first
 behaviour without a deploy. Each stable version is supported for at least 12 months, so
 `2026-01` needs a bump before January 2027.
 
-> ℹ️ Confirm the current stable version in the admin's API credentials page rather than
-> trusting a number written down anywhere, including here.
+> ℹ️ Confirm the current stable version on shopify.dev rather than trusting a number
+> written down anywhere, including here. As of August 2026 the latest stable is `2026-07`
+> and `2026-01` is served until 16 January 2027.
 
 > ⚠️ From **2026-04** the `@idempotent` key on `inventoryAdjustQuantities` stops being
 > optional and becomes **required**. `adjustInventory` already sends one on every call, so
@@ -129,7 +149,10 @@ behaviour without a deploy. Each stable version is supported for at least 12 mon
 
 | Symptom | Cause |
 |---|---|
-| Server exits at boot: `Missing required environment variable: SHOPIFY_ADMIN_TOKEN` | The command did not go through `with-secrets.sh` |
+| Server exits at boot: `Missing Shopify credential` | No `SHOPIFY_CLIENT_ID`+`SHOPIFY_CLIENT_SECRET` and no `SHOPIFY_ADMIN_TOKEN` — usually a command that skipped `with-secrets.sh` |
+| `the app and the store are not in the same Shopify organization` | `shop_not_permitted` from the token endpoint. Move the store into the org, or create it under **Dev stores** |
+| `SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET is wrong` | `invalid_client`. Re-copy both from the app's Settings |
+| Everything worked yesterday and fails today | Would be an unrenewed 24h token — but the client renews five minutes early and retries once on a 401, so this should be impossible. Check the logs for a token-mint failure |
 | "status is ACTIVE but it could not be published" | Missing `read_publications` / `write_publications` |
 | "N failed and are still pending" on every photo | Missing `write_files` |
 | "Shopify throttled the request" after 4 attempts | Real rate limiting; the client already backs off |

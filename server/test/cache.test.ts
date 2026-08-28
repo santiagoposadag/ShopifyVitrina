@@ -5,6 +5,8 @@ import { ShopifyClient, type ShopifyConfig } from "../src/shopify/client.js";
 const CONFIG: ShopifyConfig = {
   shopifyStoreDomain: "tienda.myshopify.com",
   shopifyAdminToken: "shpat_secret",
+  shopifyClientId: "",
+  shopifyClientSecret: "",
   shopifyApiVersion: "2026-01",
 };
 

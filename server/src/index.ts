@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import { runAgentTurn } from "./agent/agent.js";
+import { buildEchoReply } from "./agent/echo.js";
 import { checkAgentCredential } from "./agent/preflight.js";
 import { transcribe, transcriptionEnabled } from "./agent/transcribe.js";
 import { ConsecutiveFailureAlert } from "./inbox/alerts.js";
@@ -107,6 +108,13 @@ async function main(): Promise<void> {
       : "WhatsApp transport: whatsmeow bridge (linked device)",
   );
 
+  if (config.echoMode) {
+    app.log.warn(
+      "ECHO_MODE IS ON — every inbound message gets a canned test reply. No agent turn, " +
+        "no Claude call, no Shopify request. Unset ECHO_MODE before serving real customers.",
+    );
+  }
+
   // Never blocks startup: a credential problem must not stop the server from
   // accepting and PERSISTING inbound messages. The inbox is durable, so messages
   // that arrive during an outage are replayed once the key is fixed — refusing to
@@ -121,7 +129,10 @@ async function main(): Promise<void> {
   }
 
   const credentialName = config.agentAuthToken ? "ANTHROPIC_AUTH_TOKEN" : "ANTHROPIC_API_KEY";
-  void checkAgentCredential(config).then((result) => {
+  // Skipped in echo mode: no turn ever runs, and there may be no credential at
+  // all to check — reporting one as REJECTED would be noise about a thing that
+  // is not being used.
+  if (!config.echoMode) void checkAgentCredential(config).then((result) => {
     if (result.status === "invalid") {
       app.log.error(
         { detail: result.detail, endpoint: config.agentBaseUrl },
@@ -185,6 +196,18 @@ async function main(): Promise<void> {
     },
     onMessage: async (ctx: TurnContext, text: string) => {
       upsertContact(db, ctx.phone, ctx.role);
+
+      // Diagnostic mode, and deliberately the FIRST thing here. It sits ahead of
+      // both gates below because a mode whose only job is to show that a message
+      // came back must not be the mode that silently swallows the reply — and
+      // neither gate is protecting anything on this path: the kill switch exists
+      // to stop Claude calls, the rate limiter to bound their cost, and this
+      // makes none. Logged at every turn so a deployment left in it is obvious.
+      if (config.echoMode) {
+        app.log.warn({ phone: ctx.phone, role: ctx.role }, "ECHO_MODE: replying without an agent turn");
+        await channel.sendText(ctx.phone, buildEchoReply(text));
+        return; // Consumed; the inbox batch settles as done.
+      }
 
       // Kill switch: with the customer path disabled, non-owners get a static
       // notice and the agent never runs (no Claude call). One reply per

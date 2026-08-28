@@ -149,15 +149,48 @@ export interface Config {
   /** Same, for a burst containing photos: WhatsApp uploads them in slow waves. */
   batchMediaDebounceMs: number;
   batchMediaMaxWaitMs: number;
+  /**
+   * Diagnostic mode: answer every inbound message with a canned reply and run
+   * NOTHING else. No agent turn, no Claude call, no Shopify request.
+   *
+   * It exists to prove the transport end to end — webhook signature, inbox,
+   * debounce, worker, outbound send — before the store and the model are
+   * wired, because when all three are new at once a silent failure has three
+   * candidate causes. With this on, Shopify and agent credentials stop being
+   * required at boot: demanding them would defeat the entire point.
+   *
+   * OFF by default, and loud at boot when on. A deployment left in this mode
+   * answers real customers with a test message.
+   */
+  echoMode: boolean;
   /** The store's myshopify domain, e.g. mitienda.myshopify.com (no scheme). */
   shopifyStoreDomain: string;
   /**
-   * Admin API access token from a custom app installed in the store admin,
-   * sent as X-Shopify-Access-Token. The blast radius of this one string is the
-   * whole catalog — prices, stock and orders — so it is scoped in Shopify to
-   * exactly the operations the tools use and never leaves this process.
+   * A ready-made Admin API access token, sent as X-Shopify-Access-Token.
+   *
+   * EMPTY when this deployment mints its own (see shopifyClientId). Only two
+   * things still hand one out: a legacy admin-created custom app — Shopify
+   * stopped allowing new ones in January 2026 — and a client-credentials token
+   * pasted in by hand, which dies 24 hours later.
+   *
+   * The blast radius of this one string is the whole catalog — prices and stock
+   * on a store that takes money — so it is scoped in Shopify to exactly the
+   * operations the tools use and never leaves this process.
    */
   shopifyAdminToken: string;
+  /**
+   * Dev Dashboard app credentials, exchanged for an access token at runtime.
+   *
+   * This is the CURRENT path: admin-created custom apps can no longer be made,
+   * and a Dev Dashboard app hands out a client id and secret instead of a
+   * token. The token it mints expires in 24 hours; these two do not, which is
+   * the whole reason they are what lives in the environment.
+   *
+   * Requires the app and the store to be in the same Shopify organization —
+   * otherwise the token endpoint answers `shop_not_permitted`.
+   */
+  shopifyClientId: string;
+  shopifyClientSecret: string;
   /**
    * Pinned Admin API version. Shopify ships quarterly and deprecates on a
    * rolling schedule, so this is a deliberate value rather than "latest": a
@@ -278,9 +311,12 @@ export function loadConfig(): Config {
   // deploy. Requiring at least one keeps the old fail-fast guarantee — a
   // credential-less boot still dies here rather than on the first customer
   // message, which is the whole reason the check exists.
+  // Read before the credential checks below, both of which it relaxes.
+  const echoMode = optionalBool("ECHO_MODE", false);
+
   const anthropicApiKey = optional("ANTHROPIC_API_KEY", "");
   const agentAuthToken = optional("ANTHROPIC_AUTH_TOKEN", "");
-  if (anthropicApiKey === "" && agentAuthToken === "") {
+  if (!echoMode && anthropicApiKey === "" && agentAuthToken === "") {
     throw new Error(
       "Missing agent credential: set ANTHROPIC_API_KEY (x-api-key) or ANTHROPIC_AUTH_TOKEN (Bearer)",
     );
@@ -302,10 +338,31 @@ export function loadConfig(): Config {
   const requiredFor = (name: string, wanted: WhatsAppProvider): string =>
     whatsappProvider === wanted ? required(name) : optional(name, "");
 
+  // Two ways to hold Shopify credentials, and neither is individually required.
+  // A Dev Dashboard app has no token to paste — it has a client id and secret
+  // that the client exchanges for one — while a legacy admin-created custom app
+  // has only the token. Demanding either specifically would make one of the two
+  // real deployments impossible to boot.
+  //
+  // Requiring at least one keeps the fail-fast guarantee: a credential-less boot
+  // dies here rather than on the owner's first "¿qué tengo?".
+  const shopifyAdminToken = optional("SHOPIFY_ADMIN_TOKEN", "");
+  const shopifyClientId = optional("SHOPIFY_CLIENT_ID", "");
+  const shopifyClientSecret = optional("SHOPIFY_CLIENT_SECRET", "");
+  if (!echoMode && shopifyAdminToken === "" && (shopifyClientId === "" || shopifyClientSecret === "")) {
+    throw new Error(
+      "Missing Shopify credential: set SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET " +
+        "(Dev Dashboard app, token minted at runtime), or SHOPIFY_ADMIN_TOKEN " +
+        "(a legacy custom app's token, or a hand-minted one that expires in 24h)",
+    );
+  }
+
   // Accept a full URL and keep only the host: the token header goes to
   // https://<domain>/admin/api/<version>/graphql.json, and a domain that
   // already carries a scheme would build a URL with two of them.
-  const shopifyStoreDomain = required("SHOPIFY_STORE_DOMAIN")
+  // Optional in echo mode only. Nothing reads it there — ShopifyClient is still
+  // constructed, but constructing one makes no request.
+  const shopifyStoreDomain = (echoMode ? optional("SHOPIFY_STORE_DOMAIN", "") : required("SHOPIFY_STORE_DOMAIN"))
     .replace(/^https?:\/\//, "")
     .replace(/\/+$/, "");
 
@@ -358,8 +415,11 @@ export function loadConfig(): Config {
     batchMaxWaitMs: optionalInt("BATCH_MAX_WAIT_MS", 45000),
     batchMediaDebounceMs: optionalInt("BATCH_MEDIA_DEBOUNCE_MS", 45000),
     batchMediaMaxWaitMs: optionalInt("BATCH_MEDIA_MAX_WAIT_MS", 120000),
+    echoMode,
     shopifyStoreDomain,
-    shopifyAdminToken: required("SHOPIFY_ADMIN_TOKEN"),
+    shopifyAdminToken,
+    shopifyClientId,
+    shopifyClientSecret,
     shopifyApiVersion: optional("SHOPIFY_API_VERSION", "2026-01"),
     shopifyLocationId: optional("SHOPIFY_LOCATION_ID", ""),
     catalogCacheTtlMs: optionalCountOrZero("CATALOG_CACHE_TTL_MS", 60_000),
