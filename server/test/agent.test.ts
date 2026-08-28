@@ -15,7 +15,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importActual) => ({
   query: queryMock,
 }));
 
-const { runAgentTurn, systemPrompt } = await import("../src/agent/agent.js");
+const { runAgentTurn, systemPrompt, NO_ANSWER_FALLBACK } = await import("../src/agent/agent.js");
 
 const PHONE = "573001112233";
 const CTX: TurnContext = { phone: PHONE, role: "customer", turnKey: "msg:1" };
@@ -98,6 +98,19 @@ function fakeChannel(sent: string[]): WhatsAppChannel {
 async function* successStream(sessionId: string, reply: string): AsyncGenerator<unknown> {
   yield { type: "assistant", session_id: sessionId, message: { content: [{ type: "text", text: reply }] } };
   yield { type: "result", subtype: "success", session_id: sessionId, result: reply };
+}
+
+/**
+ * A turn that exhausts maxTurns: the SDK's terminal message is NOT "success",
+ * so it carries no `result` — and nothing here ever emitted an assistant text
+ * block either, because every step was a tool call.
+ *
+ * Observed against a real store: numTurns=12, 9253 output tokens, 52 seconds,
+ * and not one byte delivered to the person waiting.
+ */
+async function* turnCapStream(sessionId: string): AsyncGenerator<unknown> {
+  yield { type: "assistant", session_id: sessionId, message: { content: [{ type: "tool_use", name: "x" }] } };
+  yield { type: "result", subtype: "error_max_turns", session_id: sessionId, num_turns: 12 };
 }
 
 /**
@@ -397,5 +410,79 @@ describe("runAgentTurn session reset after publish", () => {
     await runAgentTurn(deps, ctx, "publícalo");
 
     expect(getSessionId(db, PHONE)).toBeUndefined();
+  });
+});
+
+/**
+ * A turn that ends without words still owes the person an answer.
+ *
+ * The failure this pins was found against a real store: the agent burned the
+ * whole turn cap on tool calls, the SDK's terminal message was not "success"
+ * so it carried no reply, and the code sent NOTHING. The inbox batch settled
+ * as done and the person waited forever for a message that existed nowhere.
+ * It is the silence AUDIO_FALLBACK prevents on the voice-note path, reached
+ * from the other end.
+ */
+describe("runAgentTurn never answers with silence", () => {
+  let db: DB;
+  let sent: string[];
+  let errors: { subtype?: string }[];
+  let deps: Parameters<typeof runAgentTurn>[0];
+
+  beforeEach(() => {
+    queryMock.mockReset();
+    db = openDb(":memory:");
+    sent = [];
+    errors = [];
+    deps = {
+      db,
+      config: CONFIG,
+      log: {
+        warn: () => undefined,
+        info: () => undefined,
+        error: (o: { subtype?: string }) => {
+          errors.push(o);
+        },
+      } as never,
+      channel: fakeChannel(sent),
+      shopify: SHOPIFY,
+      cache: CACHE,
+    };
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("sends the fallback when the turn cap leaves no reply", async () => {
+    const ctx: TurnContext = { phone: PHONE, role: "owner", turnKey: "msg:1" };
+    queryMock.mockReturnValueOnce(turnCapStream("session-abc"));
+
+    const reply = await runAgentTurn(deps, ctx, "¿qué productos tengo?");
+
+    expect(reply).toBe(NO_ANSWER_FALLBACK);
+    expect(sent).toEqual([NO_ANSWER_FALLBACK]); // exactly one message, never zero
+  });
+
+  it("logs the empty turn at ERROR with the subtype that caused it", async () => {
+    // Without this the line reads "agent turn complete" like any other, with
+    // the same duration and token counts as a turn that actually answered.
+    const ctx: TurnContext = { phone: PHONE, role: "owner", turnKey: "msg:1" };
+    queryMock.mockReturnValueOnce(turnCapStream("session-abc"));
+
+    await runAgentTurn(deps, ctx, "¿qué productos tengo?");
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.subtype).toBe("error_max_turns");
+  });
+
+  it("does NOT use the fallback when the turn produced a real reply", async () => {
+    const ctx: TurnContext = { phone: PHONE, role: "owner", turnKey: "msg:1" };
+    queryMock.mockReturnValueOnce(successStream("session-abc", "Tienes 3 productos"));
+
+    const reply = await runAgentTurn(deps, ctx, "¿qué productos tengo?");
+
+    expect(reply).toBe("Tienes 3 productos");
+    expect(errors).toEqual([]);
   });
 });

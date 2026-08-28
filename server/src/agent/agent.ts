@@ -17,6 +17,17 @@ import type { Role, TurnContext } from "../types.js";
  * Claiming "inventory" for everyone taught the customer persona to walk a
  * misclassified owner through a listing flow it could never complete.
  */
+/**
+ * What the person gets when a turn ends without words.
+ *
+ * The usual cause is the turn cap: the agent kept calling tools and never
+ * arrived at an answer. Saying so plainly beats both silence and a fake
+ * apology for an error that did not happen — and asking for a narrower request
+ * is the one thing that actually changes the outcome on a retry.
+ */
+export const NO_ANSWER_FALLBACK =
+  "Disculpa, me enredé buscando eso y no alcancé a terminar. ¿Puedes pedírmelo de nuevo, un poco más específico?";
+
 export function systemPrompt(role: Role): string {
   const shared = `You are the assistant for an online store on WhatsApp. The catalog lives in Shopify and the tools read and write it directly.
 Reply in neutral, professional Spanish (NOT Rioplatense, no voseo). Keep replies short and WhatsApp-friendly: a few short lines, no markdown headings, minimal emoji.
@@ -115,8 +126,12 @@ export interface AgentDeps {
    * for a full catalog fetch.
    */
   cache: CatalogCache;
-  /** Only the levels this module uses: a session fallback, and per-turn usage. */
-  log: Pick<FastifyBaseLogger, "warn" | "info">;
+  /**
+   * Only the levels this module uses: per-turn usage and each tool call (info),
+   * a session fallback and a denied tool (warn), and a turn that ended with no
+   * reply at all (error — the person got a fallback instead of an answer).
+   */
+  log: Pick<FastifyBaseLogger, "warn" | "info" | "error">;
 }
 
 /**
@@ -235,6 +250,18 @@ export interface TurnStats {
   durationMs?: number;
   durationApiMs?: number;
   numTurns?: number;
+  /**
+   * How the turn ENDED, straight from the SDK's terminal message: "success",
+   * or an error subtype such as the turn cap being exhausted.
+   *
+   * Recorded because only "success" carries a final answer. Without it, a turn
+   * that burned twelve tool calls and produced no reply is indistinguishable in
+   * the log from one that answered — same duration, same token counts, and the
+   * line still reads "agent turn complete".
+   */
+  resultSubtype?: string;
+  /** Tools the turn actually invoked, in order. Empty means it answered from the prompt. */
+  tools?: string;
 }
 
 interface TurnResult {
@@ -280,8 +307,11 @@ async function runQuery(
   incomingText: string,
   resumeId: string | undefined,
 ): Promise<TurnResult> {
-  const { db, config, shopify, cache } = deps;
+  const { db, config, shopify, cache, log } = deps;
   const { server, toolNames } = buildToolServer({ db, config, shopify, cache, ctx });
+  // Names in call order. The turn summary reports them, because "it took 52
+  // seconds" is not actionable and "it called search_catalog nine times" is.
+  const toolsUsed: string[] = [];
 
   let capturedSessionId: string | undefined;
   let resultText = "";
@@ -300,8 +330,20 @@ async function runQuery(
       // Deny every built-in tool: this agent must act ONLY through our tools.
       canUseTool: async (toolName, input) => {
         if (toolName.startsWith(`mcp__${MCP_SERVER_NAME}__`)) {
+          // Every tool call, as it is authorised. This is the only place the
+          // whole set passes through, and without it a turn is a black box
+          // between the inbound message and a duration.
+          const short = toolName.slice(`mcp__${MCP_SERVER_NAME}__`.length);
+          toolsUsed.push(short);
+          log.info(
+            { phone: ctx.phone, tool: short, input: compactInput(input) },
+            `tool ${toolsUsed.length}: ${short}`,
+          );
           return { behavior: "allow", updatedInput: input };
         }
+        // Was silent, and a denial is exactly what someone debugging an agent
+        // that "did nothing" needs to see.
+        log.warn({ phone: ctx.phone, tool: toolName }, "denied a tool outside this assistant's set");
         return { behavior: "deny", message: "This tool is not available to this assistant." };
       },
       maxTurns: 12,
@@ -322,6 +364,7 @@ async function runQuery(
       // turn cap or errored mid-execution still burned tokens and still tells
       // us which endpoint served it.
       stats = readStats(raw);
+      if (typeof raw.subtype === "string") stats.resultSubtype = raw.subtype;
       if (raw.subtype === "success" && typeof raw.result === "string") {
         resultText = raw.result;
       }
@@ -331,8 +374,24 @@ async function runQuery(
   return {
     reply: (resultText || assistantText.join("\n")).trim(),
     sessionId: capturedSessionId,
-    stats,
+    stats: { ...stats, tools: toolsUsed.join(",") },
   };
+}
+
+/**
+ * A tool's arguments, short enough to sit on a log line.
+ *
+ * The values here are product names, SKUs, prices and counts — nothing private
+ * — but a create_product payload is long enough to bury every other line.
+ */
+function compactInput(input: unknown): string {
+  let text: string;
+  try {
+    text = JSON.stringify(input) ?? String(input);
+  } catch {
+    return "(unserialisable)";
+  }
+  return text.length > 300 ? `${text.slice(0, 300)}…` : text;
 }
 
 /** Host of the configured endpoint, for logs. Never the credential. */
@@ -434,8 +493,24 @@ export async function runAgentTurn(
   } else if (result.sessionId) {
     setSessionId(db, ctx.phone, result.sessionId);
   }
-  if (result.reply.length > 0) {
-    await channel.sendText(ctx.phone, result.reply);
+  // A turn that produced no words STILL owes the person an answer.
+  //
+  // Only the "success" subtype carries a final reply, so a turn that exhausts
+  // maxTurns — twelve tool calls, a minute of latency, thousands of tokens —
+  // arrives here with an empty string. Sending nothing settles the inbox batch
+  // as done and leaves the person waiting forever for a message that no longer
+  // exists anywhere: the same silence AUDIO_FALLBACK exists to prevent on the
+  // voice-note path, reached from the other end.
+  //
+  // Observed in the field: numTurns=12, 9253 output tokens, 52 seconds, and not
+  // one byte delivered.
+  const reply = result.reply.length > 0 ? result.reply : NO_ANSWER_FALLBACK;
+  if (result.reply.length === 0) {
+    log.error(
+      { phone: ctx.phone, role: ctx.role, subtype: result.stats.resultSubtype, tools: result.stats.tools },
+      "agent turn produced NO reply; sending the fallback instead of silence",
+    );
   }
-  return result.reply;
+  await channel.sendText(ctx.phone, reply);
+  return reply;
 }
