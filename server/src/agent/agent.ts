@@ -351,17 +351,12 @@ async function runQuery(
       // Defence in depth, and the only place every call is logged. Nothing
       // should reach the deny branch now — if something does, that is worth
       // seeing.
+      // Reached ONLY by a tool that needs a permission decision. Our own tools
+      // are in allowedTools, so they are auto-approved and never arrive here —
+      // which is why the tool log is taken from the assistant stream above and
+      // not from this hook.
       canUseTool: async (toolName, input) => {
         if (toolName.startsWith(`mcp__${MCP_SERVER_NAME}__`)) {
-          // Every tool call, as it is authorised. This is the only place the
-          // whole set passes through, and without it a turn is a black box
-          // between the inbound message and a duration.
-          const short = toolName.slice(`mcp__${MCP_SERVER_NAME}__`.length);
-          toolsUsed.push(short);
-          log.info(
-            { phone: ctx.phone, tool: short, input: compactInput(input) },
-            `tool ${toolsUsed.length}: ${short}`,
-          );
           return { behavior: "allow", updatedInput: input };
         }
         // Was silent, and a denial is exactly what someone debugging an agent
@@ -380,6 +375,23 @@ async function runQuery(
     if (raw.type === "assistant" && raw.message?.content) {
       for (const block of raw.message.content) {
         if (block.type === "text" && typeof block.text === "string") assistantText.push(block.text);
+        // The AUTHORITATIVE record of what the model called.
+        //
+        // NOT canUseTool: that hook only fires for a tool that needs a
+        // permission DECISION, and allowedTools auto-approves ours — so it
+        // never sees them. Counting there reported `tools: (none)` for turns
+        // that had just searched the catalog, which reads as an agent
+        // inventing product facts rather than a broken counter.
+        if (block.type === "tool_use" && typeof block.name === "string") {
+          const short = block.name.startsWith(`mcp__${MCP_SERVER_NAME}__`)
+            ? block.name.slice(`mcp__${MCP_SERVER_NAME}__`.length)
+            : block.name;
+          toolsUsed.push(short);
+          log.info(
+            { phone: ctx.phone, tool: short, input: compactInput(block.input) },
+            `tool ${toolsUsed.length}: ${short}`,
+          );
+        }
       }
     }
     if (raw.type === "result") {

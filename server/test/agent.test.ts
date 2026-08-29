@@ -114,6 +114,27 @@ async function* turnCapStream(sessionId: string): AsyncGenerator<unknown> {
 }
 
 /**
+ * A turn that calls a tool and then answers.
+ *
+ * The tool_use block is what the MODEL emitted, and it is the only honest
+ * record of what ran: our tools are in allowedTools, so they are auto-approved
+ * and the canUseTool hook never sees them.
+ */
+async function* toolStream(sessionId: string, reply: string): AsyncGenerator<unknown> {
+  yield {
+    type: "assistant",
+    session_id: sessionId,
+    message: {
+      content: [
+        { type: "tool_use", name: "mcp__vitrina__search_catalog", input: { query: "citronela" } },
+      ],
+    },
+  };
+  yield { type: "assistant", session_id: sessionId, message: { content: [{ type: "text", text: reply }] } };
+  yield { type: "result", subtype: "success", session_id: sessionId, result: reply, num_turns: 2 };
+}
+
+/**
  * How the SDK actually fails on a dead session: the subprocess exits while the
  * caller is iterating, so the error surfaces from the stream, not from query().
  */
@@ -453,6 +474,64 @@ describe("runAgentTurn session reset after publish", () => {
  * Denying at execution is too late — the turn is already spent. Observed
  * against a real store: twelve turns, every one a refused Bash call, no answer.
  */
+/**
+ * The per-turn tool list must come from the assistant STREAM.
+ *
+ * It was originally taken from canUseTool, which only fires for a tool that
+ * needs a permission DECISION — and allowedTools auto-approves ours, so the
+ * hook never saw them. Every turn that searched the catalog was reported as
+ * `tools: (none)`, which reads as an agent inventing product facts rather than
+ * as a broken counter. Verified against DeepSeek: canUseTool empty, stream
+ * carrying mcp__vitrina__search_catalog.
+ */
+describe("runAgentTurn tool accounting", () => {
+  let db: DB;
+  let logged: { tools?: string; tool?: string }[];
+  let deps: Parameters<typeof runAgentTurn>[0];
+
+  beforeEach(() => {
+    queryMock.mockReset();
+    db = openDb(":memory:");
+    logged = [];
+    deps = {
+      db,
+      config: CONFIG,
+      log: {
+        info: (o: { tools?: string; tool?: string }) => logged.push(o),
+        warn: () => undefined,
+        error: () => undefined,
+      },
+      channel: fakeChannel([]),
+      shopify: SHOPIFY,
+      cache: CACHE,
+    } as never;
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("reports a tool the model called, WITHOUT canUseTool ever firing", async () => {
+    queryMock.mockReturnValueOnce(toolStream("s1", "Tenemos citronela desde $13.800"));
+
+    await runAgentTurn(deps, { phone: PHONE, role: "customer", turnKey: "msg:1" }, "¿citronela?");
+
+    // The turn summary carries it, stripped of the mcp__vitrina__ prefix.
+    const summary = logged.find((o) => o.tools !== undefined);
+    expect(summary?.tools).toBe("search_catalog");
+    // And each call is logged as it happens.
+    expect(logged.some((o) => o.tool === "search_catalog")).toBe(true);
+  });
+
+  it("reports (empty) only when the model really called nothing", async () => {
+    queryMock.mockReturnValueOnce(successStream("s1", "Hola"));
+
+    await runAgentTurn(deps, { phone: PHONE, role: "customer", turnKey: "msg:1" }, "hola");
+
+    expect(logged.find((o) => o.tools !== undefined)?.tools).toBe("");
+  });
+});
+
 describe("runAgentTurn tool surface", () => {
   let db: DB;
 
