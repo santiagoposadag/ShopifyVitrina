@@ -10,6 +10,8 @@ import {
   renderSearchHits,
   whyVariantsCannotBeAdded,
   newOptionValues,
+  storefrontHost,
+  cartPermalink,
 } from "../src/agent/tools.js";
 import { CatalogCache } from "../src/shopify/cache.js";
 import { ShopifyClient } from "../src/shopify/client.js";
@@ -17,7 +19,7 @@ import type { SearchHit } from "../src/shopify/rank.js";
 import type { ShopifyProduct } from "../src/shopify/types.js";
 import type { Role } from "../src/types.js";
 
-const CUSTOMER_TOOLS = ["search_catalog", "get_product", "save_lead"];
+const CUSTOMER_TOOLS = ["search_catalog", "get_product", "save_lead", "build_cart"];
 const OWNER_ONLY_TOOLS = [
   "list_products",
   "create_product",
@@ -361,5 +363,52 @@ describe("newOptionValues", () => {
       { price: 2, option_values: ["9 cm", "8 cm"] },
     ];
     expect(newOptionValues(candle(), drafts)).toEqual(['Diámetro="9 cm"']);
+  });
+});
+
+/**
+ * The cart link is a URL, not an API call — which is exactly why the parts that
+ * can be wrong are wrong SILENTLY. A gid where a numeric id belongs, or the
+ * wrong host, both produce a page that loads and simply is not the cart the
+ * customer was promised.
+ */
+describe("cartPermalink", () => {
+  it("uses the NUMERIC variant id, never the gid", () => {
+    // Shopify's /cart route does not accept a gid. It does not error either —
+    // it shows an empty cart, which reads as "the shop lost my order".
+    const url = cartPermalink("luminiere.co", [
+      { variantId: "gid://shopify/ProductVariant/51237367841067", quantity: 1 },
+    ]);
+    expect(url).toBe("https://luminiere.co/cart/51237367841067:1");
+    expect(url).not.toContain("gid");
+  });
+
+  it("joins several lines with commas, keeping quantities", () => {
+    const url = cartPermalink("luminiere.co", [
+      { variantId: "gid://shopify/ProductVariant/1", quantity: 2 },
+      { variantId: "gid://shopify/ProductVariant/2", quantity: 1 },
+    ]);
+    expect(url).toBe("https://luminiere.co/cart/1:2,2:1");
+  });
+});
+
+describe("storefrontHost", () => {
+  it("prefers the host the store actually answers on", () => {
+    // The config holds awyk1i-b4.myshopify.com while the store serves
+    // luminiere.co. Both reach checkout, but sending a customer the myshopify
+    // one looks like a phishing link.
+    const p = product({ onlineStoreUrl: "https://luminiere.co/products/vela-citronela" });
+    expect(storefrontHost([p], "awyk1i-b4.myshopify.com")).toBe("luminiere.co");
+  });
+
+  it("falls back to the configured domain when nothing is published", () => {
+    const p = product({ onlineStoreUrl: null });
+    expect(storefrontHost([p], "awyk1i-b4.myshopify.com")).toBe("awyk1i-b4.myshopify.com");
+  });
+
+  it("skips a product whose url is unusable rather than failing the cart", () => {
+    const broken = product({ onlineStoreUrl: "not a url" });
+    const good = product({ onlineStoreUrl: "https://luminiere.co/products/x" });
+    expect(storefrontHost([broken, good], "fallback.myshopify.com")).toBe("luminiere.co");
   });
 });

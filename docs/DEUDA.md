@@ -74,7 +74,7 @@ graph TB
 
 | Decision | Why it stays |
 |---|---|
-| No checkout | Milestone 1 is inventory. The customer path captures a lead instead |
+| No checkout **of our own** | `build_cart` hands over a Shopify cart permalink. We never take payment, quote shipping or reserve stock — Shopify is the merchant of record |
 | Rate-limit counters in memory | Single-process pilot; resetting on restart is acceptable |
 | No backoff escalation on batch retries | Two retries ever — escalation buys nothing |
 | `RETRY_DELAY_MS` is a constant, not config | Not worth an env var's surface for a pilot |

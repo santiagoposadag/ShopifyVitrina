@@ -27,7 +27,7 @@ sequenceDiagram
 | `search_catalog` | `status:ACTIVE` only — never a draft, never archived |
 | `get_product` | Returns "no product found" for anything not `ACTIVE` |
 | `save_lead` | `inquiry`, `back_in_stock`, `follow_up`. Phone comes from context |
-
+| `build_cart` | SKUs + quantities → one Shopify cart permalink, `server/src/agent/tools.ts:344` |
 > ⚠️ The customer's `get_product` answers a hidden product exactly like a genuine miss.
 > Confirming that a draft exists is itself a leak. `server/src/agent/tools.ts:244`
 
@@ -63,7 +63,20 @@ flowchart LR
 > true for the specific variant asked about. `hasStock` treats an untracked variant as
 > always sellable. `server/src/shopify/rank.ts:208`
 
-## Leads instead of checkout
+## Closing: a cart link, not an order
+
+```mermaid
+graph LR
+    B["build_cart"] -->|"refuses"| X["unpublished · sold out<br/>→ offer a lead"]
+    B -->|"builds"| U["/cart/id:qty"] -->|"302"| C["Shopify checkout"]
+```
+> ⚠️ Every way this breaks is **silent**: a gid where the numeric variant id belongs
+> gives an empty cart with no error, the myshopify host works but reads as phishing,
+> and an unpublished or sold-out variant is dropped from the checkout without a word.
+
+> ℹ️ No total is quoted: the checkout settles shipping, taxes and discounts, and a number
+> computed here would eventually disagree with the page the customer is looking at.
+## Leads for what the checkout cannot settle
 
 | Situation | Lead type |
 |---|---|
@@ -82,7 +95,7 @@ flowchart LR
 | ONE question per message | WhatsApp is a chat, not an intake form |
 | Answer first, ask second | Every reply gives something before it asks for anything |
 | Search once you have enough | A product they can react to teaches more than another question |
-| Never promise to hold or reserve | The system cannot, and there is no checkout |
+| Never promise to hold or reserve | A cart permalink reserves nothing; stock is whatever it is when they open it |
 | Never offer to send an image | Outbound is text-only |
 | Only send a `url` the tool returned | Never build, guess or edit one |
 
@@ -104,4 +117,4 @@ flowchart LR
 
 **[← Owner's inventory](inventario-dueno.md)** · **[Failures & retries →](fallos-y-reintentos.md)**
 
-<sub>Verified against `6f9211b` — 2026-08-24</sub>
+<sub>Verified against `9190ae5` — 2026-08-29</sub>

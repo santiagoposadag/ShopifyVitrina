@@ -1,4 +1,4 @@
-import type { ShopifyProduct } from "./types.js";
+import type { ShopifyProduct, ShopifyVariant } from "./types.js";
 
 /**
  * Relevance ranking for the catalog.
@@ -204,13 +204,19 @@ function lowestPrice(product: ShopifyProduct): number | null {
   return prices.length > 0 ? Math.min(...prices) : null;
 }
 
+/**
+ * True when THIS variant can be sold right now.
+ *
+ * An untracked variant always sells: Shopify is not counting it, so a quantity
+ * of 0 on it means "unknown", not "sold out".
+ */
+export function variantSellable(variant: ShopifyVariant): boolean {
+  return !variant.inventoryTracked || (variant.inventoryQuantity ?? 0) > 0;
+}
+
 /** True when at least one variant can actually be sold right now. */
 export function hasStock(product: ShopifyProduct): boolean {
-  return product.variants.some(
-    // An untracked variant always sells: Shopify is not counting it, so a
-    // quantity of 0 on it means "unknown", not "sold out".
-    (v) => !v.inventoryTracked || (v.inventoryQuantity ?? 0) > 0,
-  );
+  return product.variants.some(variantSellable);
 }
 
 /**

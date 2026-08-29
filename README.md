@@ -14,7 +14,7 @@ on their way to a product.
 > All code, identifiers, comments and docs are in English.
 
 > **Milestone 1** is inventory: full CRUD over products, variants, stock and
-> photos. There is no checkout — the customer path answers questions and captures
+> photos. The customer path answers questions and hands over a Shopify cart link; anything the checkout cannot settle still captures
 > leads. See `docs/shopify-adaptation.md` for what comes after.
 
 ---

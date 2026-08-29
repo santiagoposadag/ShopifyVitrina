@@ -5,12 +5,13 @@ import type { DB } from "../data/db.js";
 import * as repo from "../data/repo.js";
 import * as catalog from "../shopify/catalog.js";
 import type { CatalogCache } from "../shopify/cache.js";
-import { ShopifyError, type ShopifyClient } from "../shopify/client.js";
+import { gidSuffix, ShopifyError, type ShopifyClient } from "../shopify/client.js";
 import {
   CONFIDENT_MATCH_SCORE,
   hasStock,
   MAX_SEARCH_RESULTS,
   rankProducts,
+  variantSellable,
   type SearchHit,
 } from "../shopify/rank.js";
 import { PRODUCT_STATUSES, type ShopifyProduct, type ShopifyVariant } from "../shopify/types.js";
@@ -228,6 +229,44 @@ export function newOptionValues(product: ShopifyProduct, variants: VariantDraft[
   return introduced;
 }
 
+/**
+ * The storefront host a cart link must point at.
+ *
+ * Taken from a product's own onlineStoreUrl rather than SHOPIFY_STORE_DOMAIN,
+ * because those differ: the config holds awyk1i-b4.myshopify.com while the
+ * store actually answers on luminiere.co. Both reach the same checkout, but
+ * sending a customer the myshopify one looks like a phishing link.
+ *
+ * Exported for tests.
+ */
+export function storefrontHost(products: ShopifyProduct[], fallback: string): string {
+  for (const product of products) {
+    if (!product.onlineStoreUrl) continue;
+    try {
+      return new URL(product.onlineStoreUrl).host;
+    } catch {
+      // Keep looking; a malformed url is not worth failing a cart over.
+    }
+  }
+  return fallback;
+}
+
+/**
+ * A Shopify cart permalink: /cart/<variantId>:<qty>,<variantId>:<qty>
+ *
+ * The NUMERIC variant id, not the gid — Shopify's cart route does not accept a
+ * gid, and it fails by showing an empty cart rather than by erroring.
+ *
+ * Exported for tests.
+ */
+export function cartPermalink(
+  host: string,
+  lines: { variantId: string; quantity: number }[],
+): string {
+  const path = lines.map((l) => `${gidSuffix(l.variantId)}:${l.quantity}`).join(",");
+  return `https://${host}/cart/${path}`;
+}
+
 export function buildToolServer(deps: ToolDeps) {
   const { db, config, shopify, cache, ctx } = deps;
 
@@ -341,7 +380,79 @@ export function buildToolServer(deps: ToolDeps) {
     },
   );
 
-  const customerTools = [searchCatalog, getProduct, saveLead];
+  const buildCart = tool(
+    "build_cart",
+    "Build a checkout link with specific products already in the cart. Give it the SKUs the customer chose and how many of each; it returns ONE link that opens Shopify's checkout with exactly those items. Use it once the customer has decided what they want — it is the fastest way to hand them a purchase without leaving WhatsApp. Send the link back EXACTLY as returned and never edit or rebuild it. Every SKU must come from a tool result in this conversation. This does NOT create an order, take payment or reserve stock: the customer completes the purchase on Shopify, and the cart reflects prices and availability at the moment they open it. Do not quote a total of your own — the checkout page is the authority on what they will pay.",
+    {
+      items_json: z
+        .string()
+        .describe('JSON array of what they chose: [{"sku":"062AC-MZ","quantity":1}]'),
+    },
+    async ({ items_json }) => {
+      let items: { sku?: string; quantity?: number }[];
+      try {
+        const parsed: unknown = JSON.parse(items_json);
+        if (!Array.isArray(parsed) || parsed.length === 0) {
+          return text("items_json must be a non-empty JSON array of {sku, quantity}.");
+        }
+        items = parsed as typeof items;
+      } catch {
+        return text("items_json was not valid JSON. Send it again as a JSON array.");
+      }
+
+      try {
+        const lines: { variantId: string; quantity: number }[] = [];
+        const products: ShopifyProduct[] = [];
+        const summary: string[] = [];
+
+        for (const item of items) {
+          const sku = (item.sku ?? "").trim();
+          if (!sku) return text("Every item needs a sku. Ask the customer which variant they want.");
+          const quantity = Math.trunc(item.quantity ?? 1);
+          if (!Number.isFinite(quantity) || quantity < 1) {
+            return text(`Quantity for ${sku} must be a whole number of 1 or more.`);
+          }
+
+          const resolved = await catalog.resolveProduct(shopify, sku);
+          // A cart link is built from ONE variant, and only a SKU names one.
+          if (!resolved?.variant) {
+            return text(
+              `No variant found for SKU "${sku}". Nothing was built — search again and use a SKU from the result.`,
+            );
+          }
+          const { product, variant } = resolved;
+
+          // An unpublished product's variant produces a checkout that silently
+          // drops the line, so the customer opens a link missing what they asked
+          // for. Refuse here instead, where the reason can be said out loud.
+          if (!product.onlineStoreUrl) {
+            return text(
+              `"${product.title}" is not published to the store, so it cannot go in a cart. Nothing was built.`,
+            );
+          }
+          if (!variantSellable(variant)) {
+            return text(
+              `${describeVariant(variant)} of "${product.title}" is SOLD OUT, so it cannot go in a cart. Nothing was built — tell the customer and offer save_lead type 'back_in_stock'.`,
+            );
+          }
+
+          lines.push({ variantId: variant.id, quantity });
+          products.push(product);
+          summary.push(`${quantity} x ${product.title} — ${describeVariant(variant)}`);
+        }
+
+        const url = cartPermalink(storefrontHost(products, config.shopifyStoreDomain), lines);
+        // Prices are shown per line, exactly as Shopify returned them, and no
+        // total is computed: shipping, taxes and discounts are settled at
+        // checkout, and a total quoted here would eventually disagree with it.
+        return text(`Cart link ready:\n${summary.join("\n")}\n\nurl=${url}`);
+      } catch (err) {
+        return failure("Building the cart", err);
+      }
+    },
+  );
+
+  const customerTools = [searchCatalog, getProduct, saveLead, buildCart];
 
   if (ctx.role !== "owner") {
     return {

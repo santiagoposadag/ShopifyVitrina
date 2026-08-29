@@ -374,10 +374,25 @@ describe("systemPrompt customer conversation style", () => {
   });
 
   // Milestone 1 has no checkout. The agent must not invent one.
-  it("refuses to take an order or a payment", () => {
+  // The boundary MOVED when build_cart landed; it did not disappear. Handing
+  // someone a prefilled checkout is not taking their money, and the prompt has
+  // to keep saying which of the two this is.
+  it("still refuses to take payment, even though it can now build a cart", () => {
     const prompt = systemPrompt("customer");
-    expect(prompt).toContain("YOU CANNOT TAKE AN ORDER OR A PAYMENT");
+    expect(prompt).toMatch(/cannot take payment/i);
+    expect(prompt).toMatch(/reserve stock/i);
+    // A total quoted here would eventually disagree with the checkout page,
+    // which settles shipping, taxes and discounts.
+    expect(prompt).toMatch(/do NOT quote a total of your own/i);
     expect(prompt).toContain("back_in_stock");
+  });
+
+  it("tells the agent to send the cart link verbatim", () => {
+    // A rebuilt or shortened permalink is a broken checkout, and the customer
+    // cannot tell the difference until it fails.
+    const prompt = systemPrompt("customer");
+    expect(prompt).toContain("build_cart");
+    expect(prompt).toMatch(/never edit, shorten or rebuild it/i);
   });
 
   // The conversational half of the no-images boundary. tools.test.ts pins the
