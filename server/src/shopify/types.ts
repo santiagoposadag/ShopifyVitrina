@@ -52,6 +52,16 @@ export interface ShopifyProduct {
   /** Present only once the product is published to the Online Store. */
   onlineStoreUrl: string | null;
   mediaCount: number;
+  /**
+   * The product's option axes, in Shopify's own order, with the values that
+   * already exist on each.
+   *
+   * Order is load-bearing: a variant's optionValues are matched positionally
+   * against these, so sending them shuffled silently creates a variant whose
+   * diameter is its height. The existing values matter too — Shopify does not
+   * normalise, so "7,5 cm" and "7.5 cm" become two different options.
+   */
+  options: { name: string; values: string[] }[];
   variants: ShopifyVariant[];
   updatedAt: string;
 }

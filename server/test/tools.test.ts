@@ -8,6 +8,8 @@ import {
   MCP_SERVER_NAME,
   renderProductList,
   renderSearchHits,
+  whyVariantsCannotBeAdded,
+  newOptionValues,
 } from "../src/agent/tools.js";
 import { CatalogCache } from "../src/shopify/cache.js";
 import { ShopifyClient } from "../src/shopify/client.js";
@@ -20,6 +22,7 @@ const OWNER_ONLY_TOOLS = [
   "list_products",
   "create_product",
   "update_product",
+  "add_variant",
   "delete_product",
   "get_inventory",
   "adjust_inventory",
@@ -99,6 +102,7 @@ function product(overrides: Partial<ShopifyProduct> = {}): ShopifyProduct {
     totalInventory: 5,
     onlineStoreUrl: "https://tienda.example.com/products/camiseta-negra",
     mediaCount: 2,
+    options: [],
     updatedAt: "2026-08-01T00:00:00Z",
     variants: [
       {
@@ -243,5 +247,119 @@ describe("isPublishTransition", () => {
     expect(isPublishTransition("DRAFT", "DRAFT")).toBe(false);
     expect(isPublishTransition(undefined, "DRAFT")).toBe(false);
     expect(isPublishTransition("ACTIVE", "ARCHIVED")).toBe(false);
+  });
+});
+
+/**
+ * Adding a variant to an existing product.
+ *
+ * A variant is ONE combination of the product's option axes, and Shopify
+ * matches the values POSITIONALLY. Every guard here exists because the wrong
+ * answer does not error — it silently creates a variant that is wrong.
+ */
+describe("whyVariantsCannotBeAdded", () => {
+  /** The real shape: two axes, and only SOME combinations sold. */
+  function candle(): ShopifyProduct {
+    return product({
+      handle: "vela-aromatica-manzanilla",
+      options: [
+        { name: "Diámetro", values: ["5 cm", "7,5 cm"] },
+        { name: "Altura", values: ["8 cm", "10 cm"] },
+      ],
+      variants: [
+        {
+          id: "gid://shopify/ProductVariant/1",
+          sku: "062AC-MZ",
+          title: "5 cm / 8 cm",
+          price: "13800.00",
+          compareAtPrice: null,
+          inventoryQuantity: 4,
+          inventoryItemId: "gid://shopify/InventoryItem/1",
+          inventoryTracked: true,
+          selectedOptions: [
+            { name: "Diámetro", value: "5 cm" },
+            { name: "Altura", value: "8 cm" },
+          ],
+        },
+      ],
+    });
+  }
+
+  it("accepts a combination that does not exist yet", () => {
+    const draft = [{ price: 17900, option_values: ["5 cm", "10 cm"] }];
+    expect(whyVariantsCannotBeAdded(candle(), draft)).toBeNull();
+  });
+
+  it("refuses a variant that gives the wrong NUMBER of option values", () => {
+    // The dangerous case: Shopify matches positionally and does not error, so
+    // one value on a two-axis product creates a variant whose height landed in
+    // the diameter axis.
+    const draft = [{ price: 17900, option_values: ["5 cm"] }];
+    expect(whyVariantsCannotBeAdded(candle(), draft)).toMatch(/exactly 2 option_values/);
+  });
+
+  it("refuses a combination the product already sells", () => {
+    // Not an update. The owner almost certainly meant update_product.
+    const draft = [{ price: 15000, option_values: ["5 cm", "8 cm"] }];
+    expect(whyVariantsCannotBeAdded(candle(), draft)).toMatch(/already has the combination/);
+  });
+
+  it("refuses a product with no option axes at all", () => {
+    // One anonymous default variant; Shopify cannot attach a second to it.
+    const plain = product({ handle: "vela-simple", options: [] });
+    expect(whyVariantsCannotBeAdded(plain, [{ price: 100, option_values: [] }])).toMatch(
+      /no option axes/,
+    );
+  });
+
+  it("matches an existing combination by axis NAME, not by position", () => {
+    // selectedOptions come back in Shopify's order, which need not be the
+    // product's option order. Comparing positionally would miss the duplicate.
+    const p = candle();
+    p.variants[0]!.selectedOptions = [
+      { name: "Altura", value: "8 cm" },
+      { name: "Diámetro", value: "5 cm" },
+    ];
+    expect(whyVariantsCannotBeAdded(p, [{ price: 1, option_values: ["5 cm", "8 cm"] }])).toMatch(
+      /already has the combination/,
+    );
+  });
+});
+
+describe("newOptionValues", () => {
+  function candle(): ShopifyProduct {
+    return product({
+      options: [
+        { name: "Diámetro", values: ["5 cm", "7,5 cm"] },
+        { name: "Altura", values: ["8 cm"] },
+      ],
+      variants: [],
+    });
+  }
+
+  it("says nothing when every value already exists", () => {
+    expect(newOptionValues(candle(), [{ price: 1, option_values: ["7,5 cm", "8 cm"] }])).toEqual([]);
+  });
+
+  it("reports a value the product has never used", () => {
+    expect(newOptionValues(candle(), [{ price: 1, option_values: ["9 cm", "8 cm"] }])).toEqual([
+      'Diámetro="9 cm"',
+    ]);
+  });
+
+  it("catches the decimal-separator typo, which Shopify does NOT normalise", () => {
+    // "7.5 cm" and "7,5 cm" become two different axis values, permanently.
+    // Only the owner can tell a new size from a typo, so this reports it.
+    expect(newOptionValues(candle(), [{ price: 1, option_values: ["7.5 cm", "8 cm"] }])).toEqual([
+      'Diámetro="7.5 cm"',
+    ]);
+  });
+
+  it("does not repeat the same new value across several variants", () => {
+    const drafts = [
+      { price: 1, option_values: ["9 cm", "8 cm"] },
+      { price: 2, option_values: ["9 cm", "8 cm"] },
+    ];
+    expect(newOptionValues(candle(), drafts)).toEqual(['Diámetro="9 cm"']);
   });
 });

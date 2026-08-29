@@ -32,6 +32,7 @@ function product(overrides: Partial<ShopifyProduct> = {}): ShopifyProduct {
     totalInventory: 5,
     onlineStoreUrl: null,
     mediaCount: 0,
+    options: [],
     updatedAt: "2026-08-01T00:00:00Z",
     variants: [variant()],
     ...overrides,

@@ -6,7 +6,7 @@ Findings verified against the code that this wiki does not resolve, but somebody
 graph TB
     subgraph PROD["Product"]
         L["never run against<br/>a real Shopify store"]
-        V["no way to add a variant<br/>to an existing product"]
+        V["no way to REMOVE a variant<br/>from a product"]
         W["Cloud API never run<br/>against a real Meta number"]
     end
     subgraph SEC["Exposure & diagnosis"]
@@ -32,7 +32,7 @@ graph TB
 |---|---|---|---|
 | 1 | **The Shopify integration has never touched a real store.** Every Shopify test drives a fake `fetch` and asserts on recorded calls. The `test/live/` suite is LLM-provider parity — it says nothing about Shopify | `grep -rl SHOPIFY server/test/` returns only `agent.test.ts` and `config.test.ts`, neither of them live; `server/vitest.live.config.ts:16` | **High** |
 | 1b | **The Cloud API transport has never carried a real message.** Every test drives a fake `fetch` and asserts on recorded calls, and `scripts/simulate-cloud-inbound.sh` fires locally signed payloads — neither reaches Meta. Untested for real: the panel handshake, the app-secret signature over Meta's exact bytes, media-id resolution, and the 24h window | `server/test/cloud-*.test.ts` inject `fetchImpl`; `WHATSAPP_PROVIDER` still defaults to `bridge`, `server/src/config.ts:296` | **High** |
-| 2 | **An owner cannot add or remove a variant on an existing product.** `addVariants` exists but is only reachable from `createProduct`; no owner tool exposes it. Stocking a new size means opening the Shopify admin | `server/src/shopify/catalog.ts:572`, and the tool list at `server/src/agent/tools.ts:665` | **High** |
+| 2 | **An owner cannot REMOVE a variant from an existing product.** Adding is solved — `add_variant` exposes `addVariants` with guards for axis count, duplicate combinations and new option values. Removing one still means opening the Shopify admin | `server/src/shopify/catalog.ts:572`; no delete path below the product level | Medium |
 
 > ⚠️ #1b is rehearsable and #1 is not: the simulate script exercises the whole inbound path
 > without the number being registered, which is what makes the irreversible step — a number
@@ -83,4 +83,4 @@ graph TB
 | A failed media download is not retried | The message still gets its answer; a dead fetch re-attempted per attempt only makes the person wait longer |
 | `env.anthropic` / `env.deepseek` tracked | Routing config only, no secrets — checked |
 
-<sub>Verified against `36e95b2` — 2026-08-25</sub>
+<sub>Verified against `196fd9b` — 2026-08-28</sub>

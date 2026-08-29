@@ -155,6 +155,79 @@ export function renderProductList(
  * tools are always present; owner tools are added only for the owner role. The
  * acting phone number and role are taken from context, never from the model.
  */
+/**
+ * A variant is ONE combination of the product's option axes, and the three
+ * things that can go wrong when adding one are all decidable before any
+ * mutation is sent. Exported and pure so they are tested directly.
+ */
+export interface VariantDraft {
+  sku?: string;
+  price: number;
+  option_values?: string[];
+  quantity?: number;
+}
+
+/** The combination key a variant occupies, e.g. `Diámetro=5 cm|Altura=8 cm`. */
+function combinationKey(axes: string[], values: (string | undefined)[]): string {
+  return axes.map((name, i) => `${name}=${values[i] ?? ""}`).join("|");
+}
+
+/**
+ * Why these variants cannot be added to this product, or null when they can.
+ *
+ * A wrong option_values count is the dangerous one: Shopify matches them
+ * POSITIONALLY, so a variant that sends one value for a two-axis product does
+ * not error — it produces a variant whose height landed in the diameter axis.
+ */
+export function whyVariantsCannotBeAdded(
+  product: ShopifyProduct,
+  variants: VariantDraft[],
+): string | null {
+  const axes = product.options.map((o) => o.name);
+  if (axes.length === 0) {
+    return `${product.handle} has no option axes (no sizes or colours), so a variant cannot be added to it. Adding one means recreating the product with its axes — do that in the Shopify admin.`;
+  }
+  const wrong = variants.find((v) => (v.option_values ?? []).length !== axes.length);
+  if (wrong) {
+    return `${product.handle} has ${axes.length} option axes (${axes.join(", ")}), so every variant needs exactly ${axes.length} option_values in that order. One variant sent ${(wrong.option_values ?? []).length}.`;
+  }
+  const existing = new Set(
+    product.variants.map((v) =>
+      combinationKey(
+        axes,
+        axes.map((name) => v.selectedOptions.find((o) => o.name === name)?.value),
+      ),
+    ),
+  );
+  const duplicate = variants.find((v) => existing.has(combinationKey(axes, v.option_values ?? [])));
+  if (duplicate) {
+    return `${product.handle} already has the combination ${(duplicate.option_values ?? []).join(" / ")}. Nothing was added — use update_product to change the one that exists.`;
+  }
+  return null;
+}
+
+/**
+ * Option values these variants would introduce that the product has never used.
+ *
+ * A legitimate new size and a typo are indistinguishable here — "7,5 cm" and
+ * "7.5 cm" are simply two different values to Shopify — so this reports the
+ * fact and leaves the judgement to the owner, who is the only one who can make
+ * it. Silence would let a typo become a permanent axis value.
+ */
+export function newOptionValues(product: ShopifyProduct, variants: VariantDraft[]): string[] {
+  const introduced: string[] = [];
+  for (const [i, axis] of product.options.entries()) {
+    for (const v of variants) {
+      const value = v.option_values?.[i];
+      const label = `${axis.name}="${value}"`;
+      if (value && !axis.values.includes(value) && !introduced.includes(label)) {
+        introduced.push(label);
+      }
+    }
+  }
+  return introduced;
+}
+
 export function buildToolServer(deps: ToolDeps) {
   const { db, config, shopify, cache, ctx } = deps;
 
@@ -485,6 +558,77 @@ export function buildToolServer(deps: ToolDeps) {
     },
   );
 
+  const addVariantTool = tool(
+    "add_variant",
+    "Add one or more NEW variants (size, colour, dimension…) to a product that ALREADY exists. This is the only way to extend a product's range: update_product changes a variant that is already there, and create_product would make a second product. variants_json is a JSON ARRAY, e.g. [{\"sku\":\"062AC-LV\",\"price\":13800,\"option_values\":[\"5 cm\",\"8 cm\"],\"quantity\":10}]. A variant is ONE combination of the product's option axes, and every variant must give exactly one value per axis, IN THE PRODUCT\'S OWN ORDER — call get_product first to read the axes and the values they already use. Reuse an existing value EXACTLY as written (\"7,5 cm\" is not \"7.5 cm\"); a new value is allowed and the result says which ones were new. Only include facts the owner explicitly stated — never invent a price.",
+    {
+      ref: z.string().describe("The product's SKU, handle, or Shopify id"),
+      variants_json: z
+        .string()
+        .describe('JSON array: [{"sku","price","option_values":[],"quantity"}]'),
+      location: z.string().optional().describe("Location name or id for the opening stock"),
+    },
+    async ({ ref, variants_json, location }) => {
+      let variants: { sku?: string; price: number; option_values?: string[]; quantity?: number }[];
+      try {
+        const parsed: unknown = JSON.parse(variants_json);
+        if (!Array.isArray(parsed) || parsed.length === 0) {
+          return text("variants_json must be a non-empty JSON array.");
+        }
+        variants = parsed as typeof variants;
+      } catch {
+        return text("variants_json was not valid JSON. Send it again as a JSON array.");
+      }
+      if (variants.some((v) => typeof v.price !== "number")) {
+        return text("Every variant needs a numeric price. Ask the owner for the missing one.");
+      }
+
+      try {
+        const resolved = await catalog.resolveProduct(shopify, ref);
+        if (!resolved) return text(`No product found for "${ref}". Nothing was added.`);
+        const product = resolved.product;
+
+        // A product with no option axes has one anonymous default variant, and
+        // Shopify cannot attach a second one to it. Saying so beats a mutation
+        // that fails with a message about optionValues nobody asked for.
+        const refusal = whyVariantsCannotBeAdded(product, variants);
+        if (refusal) return text(refusal);
+        const axes = product.options.map((o) => o.name);
+
+        const resolvedLocation = await catalog.resolveLocation(
+          shopify,
+          config.shopifyLocationId,
+          location,
+        );
+        const updated = await catalog.addVariants(shopify, {
+          productId: product.id,
+          optionNames: axes,
+          variants: variants.map((v) => ({
+            sku: v.sku,
+            price: v.price,
+            optionValues: v.option_values,
+            quantity: v.quantity,
+          })),
+          locationId: resolvedLocation.id,
+        });
+        cache.invalidate();
+
+        // A legitimate new size and a typo look identical here, so this states
+        // the fact rather than guessing which it was.
+        const introduced = newOptionValues(product, variants);
+        const note =
+          introduced.length > 0
+            ? ` NEW option values were created: ${introduced.join(", ")} — tell the owner, in case one is a typo.`
+            : "";
+        return text(
+          `Added ${variants.length} variant(s) to ${updated.handle} ("${updated.title}"). It now has ${updated.variants.length} variants.${note}`,
+        );
+      } catch (err) {
+        return failure("Adding the variant", err);
+      }
+    },
+  );
+
   const getInventory = tool(
     "get_inventory",
     "Live stock for one product or one variant, broken down by location. Pass a SKU to ask about a single variant, or a handle to get every variant of a product. Always check here before telling the owner a number.",
@@ -667,6 +811,7 @@ export function buildToolServer(deps: ToolDeps) {
     listProducts,
     createProduct,
     updateProduct,
+    addVariantTool,
     deleteProductTool,
     getInventory,
     adjustInventory,

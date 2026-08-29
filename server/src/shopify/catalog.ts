@@ -38,6 +38,7 @@ fragment ProductFields on Product {
   onlineStoreUrl
   updatedAt
   mediaCount { count }
+  options { name position values }
   variants(first: 100) {
     nodes {
       id
@@ -76,6 +77,7 @@ interface RawProduct {
   onlineStoreUrl: string | null;
   updatedAt: string;
   mediaCount: { count: number } | null;
+  options: { name: string; position: number; values: string[] }[] | null;
   variants: { nodes: RawVariant[] };
 }
 
@@ -106,6 +108,11 @@ function toProduct(raw: RawProduct): ShopifyProduct {
     totalInventory: raw.totalInventory,
     onlineStoreUrl: raw.onlineStoreUrl,
     mediaCount: raw.mediaCount?.count ?? 0,
+    // Sorted by position, because addVariants must send optionValues in the
+    // product's OWN axis order and Shopify does not promise the query order.
+    options: [...(raw.options ?? [])]
+      .sort((a, b) => a.position - b.position)
+      .map((o) => ({ name: o.name, values: o.values })),
     variants: raw.variants.nodes.map(toVariant),
     updatedAt: raw.updatedAt,
   };

@@ -305,8 +305,30 @@ describe("systemPrompt owner safety rules", () => {
   // wrong-but-plausible failure in this integration.
   it("makes the agent report what publishing actually did", () => {
     const prompt = systemPrompt("owner");
-    expect(prompt).toContain("published to the online store");
-    expect(prompt).toContain("report what it says, not what you asked for");
+    expect(prompt).toMatch(/report what it says, not what you asked for/i);
+  });
+
+  // The single most expensive silent failure in the system: a product that is
+  // ACTIVE and invisible, confirmed to the owner as done. The prompt has to
+  // carry the CONCEPT — two operations, on two permissions — not just the verb.
+  it("teaches that ACTIVE is not published, and names the proof", () => {
+    const prompt = systemPrompt("owner");
+    expect(prompt).toMatch(/ACTIVE does NOT put a product in the store/i);
+    expect(prompt).toMatch(/sales channel/i);
+    // The owner-checkable proof, which is what makes the rule actionable.
+    expect(prompt).toMatch(/No url means it is not on the storefront/i);
+  });
+
+  // `option` appeared NOWHERE in this prompt, so the agent could not reason
+  // about a product's shape before choosing a tool — and the most likely wrong
+  // move is inventing the combinations the owner never said they sell.
+  it("teaches that variants are explicit combinations, not a generated grid", () => {
+    const prompt = systemPrompt("owner");
+    expect(prompt).toMatch(/OPTION AXES/);
+    expect(prompt).toMatch(/never generate the missing ones/i);
+    expect(prompt).toContain("add_variant");
+    // The typo that becomes a permanent axis value.
+    expect(prompt).toMatch(/Shopify does not normalise/i);
   });
 });
 

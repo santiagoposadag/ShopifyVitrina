@@ -31,7 +31,7 @@ sequenceDiagram
 | Role | Tools |
 |---|---|
 | Customer | `search_catalog`, `get_product`, `save_lead` |
-| Owner | those three **plus** `list_products`, `create_product`, `update_product`, `delete_product`, `get_inventory`, `adjust_inventory`, `attach_pending_photos`, `list_locations`, `list_leads` |
+| Owner | those three **plus** `list_products`, `create_product`, `update_product`, `add_variant`, `delete_product`, `get_inventory`, `adjust_inventory`, `attach_pending_photos`, `list_locations`, `list_leads` |
 
 > ⚠️ `get_product` is **one tool name with two closures**, chosen by `ctx.role`. The
 > customer's returns "no product found" for a non-`ACTIVE` product: confirming that a
