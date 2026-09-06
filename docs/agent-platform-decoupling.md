@@ -1,12 +1,14 @@
 # Decoupling the Agent into a Platform
 
-**Goal:** one runtime that can host N agents. Each agent is **data** (a definition: behaviour, knowledge, tool set), the runtime is **code**, and a request reaches an agent through one inbox whether it comes from a WhatsApp user or from another agent. Planning only — nothing here is implemented.
+**Goal:** one runtime that can host N agents. Each agent is **data** (a definition: behaviour, knowledge, tool set), the runtime is **code**, and a request reaches an agent through one inbox whether it comes from a WhatsApp user or from another agent. **Phases 1, 2, 3 are landed; Phases 4, 5, 6 are planned.**
 
 **Supersedes** [agent-catalog-decoupling.md](agent-catalog-decoupling.md), which was written ten days before the Shopify migration and describes a `repo.ts` catalog that no longer exists. **Complements** [agent-roles-routing.md](agent-roles-routing.md), which decides *who* reaches *which* agent; this page decides what an agent *is* and how a message gets in and out.
 
 ---
 
 ## 1. AS IS — one process, one agent, two personas
+
+**This section records the state before Phase 1 and is deliberately not updated as phases land. It shows what the plan argues from.**
 
 ### 1.1 What depends on what
 
@@ -72,13 +74,13 @@ flowchart TB
 
 | Arrow | Anchor | Why it is coupling |
 |---|---|---|
-| runtime → prompt | `server/src/agent/agent.ts:340` | Prompt is a function in the same file, selected by a two-value `Role` |
-| runtime → tools | `server/src/agent/agent.ts:324` | Runtime knows the Shopify client and cache only to hand them to tools |
-| runtime → WhatsApp | `server/src/agent/agent.ts:554` | The turn **sends** the reply itself; the caller cannot route it elsewhere |
-| tools → Shopify | `server/src/agent/tools.ts:5` | Direct imports; the tool set *is* the Shopify adapter |
-| prompt ↔ tools | `server/src/agent/agent.ts:47` | Eleven tool names as string literals; nothing checks they exist |
-| identity | `server/src/types.ts:74` | `TurnContext.phone` is the session key, the reply address and the role source |
-| role | `server/src/config.ts:430` | `isOwner(phone)` — one env allowlist, two roles, no third |
+| runtime → prompt | `server/src/agent/agent.ts` line 340, before Phase 1 | Prompt is a function in the same file, selected by a two-value `Role` |
+| runtime → tools | `server/src/agent/agent.ts` line 324, before Phase 1 | Runtime knows the Shopify client and cache only to hand them to tools |
+| runtime → WhatsApp | `server/src/agent/agent.ts` line 554, before Phase 1 | The turn **sends** the reply itself; the caller cannot route it elsewhere |
+| tools → Shopify | `server/src/agent/tools.ts` line 5, before Phase 1 | Direct imports; the tool set *is* the Shopify adapter |
+| prompt ↔ tools | `server/src/agent/agent.ts` line 47, before Phase 1 | Eleven tool names as string literals; nothing checks they exist |
+| identity | `server/src/types.ts` line 74, before Phase 1 | `TurnContext.phone` is the session key, the reply address and the role source |
+| role | `server/src/config.ts` line 430, before Phase 1 | `isOwner(phone)` — one env allowlist, two roles, no third |
 
 ### 1.2 One message today
 
@@ -125,7 +127,7 @@ quadrantChart
   "Knowledge base": [0.05, 0.05]
 ```
 
-> ⚠️ There is **no knowledge base** today. Business facts the model needs (an example SKU, the option axes, what "publicar" means) live inside tool descriptions and the prompt. `server/src/agent/tools.ts:499`, `server/src/agent/agent.ts:89`
+> ⚠️ There is **no knowledge base** today. Business facts the model needs (an example SKU, the option axes, what "publicar" means) live inside tool descriptions and the prompt. (`server/src/agent/tools.ts` line 499, `server/src/agent/agent.ts` line 89, before Phase 1)
 
 ---
 
@@ -275,12 +277,12 @@ classDiagram
 
 | Today | Becomes | Today's anchor |
 |---|---|---|
-| `systemPrompt(role)` switch | `agents/vitrina-ventas/prompt.md` + `agents/vitrina-inventario/prompt.md` | `server/src/agent/agent.ts:31` |
-| `customerTools` / `ownerTools` arrays | `tools: [...]` list in each `agent.yaml` | `server/src/agent/tools.ts:455` |
-| `get_product` with two closures by role | Two tools: `catalog.get_product` and `catalog.get_product_any_status`; the definition picks one | `server/src/agent/tools.ts:348` |
-| Example SKUs, axes, confirmation phrasing inside descriptions | `knowledge/` docs + `slots` rendered into generic descriptions | `server/src/agent/tools.ts:499` |
-| `sessionAfterTurn = "reset"` set inside a tool | `session.resetOn` declared; runtime watches the tool stream it already reads | `server/src/agent/agent.ts:531` |
-| `isOwner(phone)` | `router.ts`: assignment table `phone → role`, definition `roles` says which agent | `server/src/config.ts:430` |
+| `systemPrompt(role)` switch | `agents/vitrina-ventas/prompt.md` + `agents/vitrina-inventario/prompt.md` | `server/src/agent/agent.ts` line 31, before Phase 1 |
+| `customerTools` / `ownerTools` arrays | `tools: [...]` list in each `agent.yaml` | `server/src/agent/tools.ts` line 455, before Phase 1 |
+| `get_product` with two closures by role | Two tools: `catalog.get_product` and `catalog.get_product_any_status`; the definition picks one | `server/src/agent/tools.ts` line 348, before Phase 1 |
+| Example SKUs, axes, confirmation phrasing inside descriptions | `knowledge/` docs + `slots` rendered into generic descriptions | `server/src/agent/tools.ts` line 499, before Phase 1 |
+| `sessionAfterTurn = "reset"` set inside a tool | `session.resetOn` declared; runtime watches the tool stream it already reads | `server/src/agent/agent.ts` line 531, before Phase 1 |
+| `isOwner(phone)` | `router.ts`: assignment table `phone → role`, definition `roles` says which agent | `server/src/config.ts` line 430, before Phase 1 |
 
 > ℹ️ The boot validator is the piece that closes today's silent hole: every tool name the prompt mentions must be in `definition.tools`, and every name in `definition.tools` must exist in the registry. A typo fails startup instead of producing an agent that asks for a tool it does not have.
 
@@ -316,7 +318,7 @@ flowchart LR
 | Rule | Keeps |
 |---|---|
 | A factory receives `(ctx, ports)` and returns one SDK tool | `tools.test.ts` prefix pin becomes "the served set equals `definition.tools`" |
-| `turnKey` + per-turn counter travel in `ctx` into the port | Stock idempotency, unchanged `server/src/agent/tools.ts:282` |
+| `turnKey` + per-turn counter travel in `ctx` into the port | Stock idempotency, unchanged (`server/src/agent/tools.ts` line 282, before Phase 1) |
 | Descriptions are English templates with `{{slots}}`; business literals come from the definition | Same prompt quality, no SKU baked into code |
 | `shopify/` stays as it is and gains one `implements CatalogPort` file | Zero rewrite of the layer that already works |
 
@@ -511,14 +513,14 @@ flowchart LR
   class P3 domain;
 ```
 
-| Phase | Behaviour change for today's users | Tests that pin it |
-|---|---|---|
-| 1 | None. Owner and customer map to two definitions with today's exact prompts | `agent.test.ts` persona pins move to the two `prompt.md` files; new: `runAgentTurn` returns and does not send |
-| 2 | None | New: boot fails on a prompt naming a tool outside `definition.tools` |
-| 3 | None | `tools.test.ts` prefix pin becomes a set-equality pin per definition; Shopify call recordings unchanged |
-| 4 | Owner answers "¿qué significa publicar?" from knowledge instead of the prompt | New: inline budget respected; `search_knowledge` returns chunks only from its agent |
-| 5 | New endpoint, off by default until a registry row exists | New: unknown token 401 · reach violation 403 · hop 4 refused · role never read from text |
-| 6 | `OWNER_PHONE_NUMBERS` still honoured as seed rows | `config.test.ts` empty-allowlist refusal in the purge tool stays |
+| Phase | Behaviour change for today's users | Tests that pin it | Status |
+|---|---|---|---|
+| 1 | None. Owner and customer map to two definitions with today's exact prompts | `agent.test.ts` persona pins move to the two `prompt.md` files; new: `runAgentTurn` returns and does not send | ✅ Landed |
+| 2 | None | New: boot fails on a prompt naming a tool outside `definition.tools` | ✅ Landed |
+| 3 | None | `tools.test.ts` prefix pin becomes a set-equality pin per definition; Shopify call recordings unchanged | ✅ Landed |
+| 4 | Owner answers "¿qué significa publicar?" from knowledge instead of the prompt | New: inline budget respected; `search_knowledge` returns chunks only from its agent | Planned |
+| 5 | New endpoint, off by default until a registry row exists | New: unknown token 401 · reach violation 403 · hop 4 refused · role never read from text | Planned |
+| 6 | `OWNER_PHONE_NUMBERS` still honoured as seed rows | `config.test.ts` empty-allowlist refusal in the purge tool stays | Planned |
 
 ### 3.1 Invariants that survive every phase
 
@@ -526,10 +528,10 @@ flowchart LR
 |---|---|
 | `turnKey` from the FIRST inbox row · per-turn counter | `Envelope.turnKey`, minted in the batcher as today `server/src/types.ts:88` |
 | Role from the transport, never from the text | `router.ts` for phones; `a2a.ts` token for agents |
-| `tools: []` removes built-ins; `allowedTools` only approves | `runtime.ts`, verbatim `server/src/agent/agent.ts:352` |
+| `tools: []` removes built-ins; `allowedTools` only approves | `runtime.ts`, verbatim (`server/src/agent/agent.ts` line 352, before Phase 1) |
 | One turn at a time per conversation | `PerPhoneQueue` renamed to per-conversation, same class `server/src/inbox/queue.ts:9` |
 | A turn without words still answers | `NO_ANSWER_FALLBACK` in `runtime.ts`; the responder sends it |
-| Reset session on publish | `session.resetOn` in the definition; runtime reads the tool stream it already parses `server/src/agent/agent.ts:390` |
+| Reset session on publish | Tool sets `ctx.sessionAfterTurn = "reset"` on publish transition; `session.resetOn` is declared in definition but not read by the runtime |
 | ECHO_MODE ahead of both gates | Unchanged in `index.ts` |
 | At-least-once with capped attempts | `inbox.attempts`, unchanged; agent-door rows follow the same path |
 

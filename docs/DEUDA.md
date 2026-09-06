@@ -55,14 +55,14 @@ graph TB
 |---|---|---|---|
 | 4 | `getVariantInventory` has zero callers and zero tests. Its return type `VariantInventory` exists only to serve it | `server/src/shopify/catalog.ts:345`, `server/src/shopify/types.ts:72` | Low |
 | 5 | `gidSuffix` is used only by its own test — no production caller | `server/src/shopify/client.ts:182` | Low |
-| 6 | `pending_media.public_path` is written on insert and selected by `listPendingMedia`, then never read. Pairs with #3 | `server/src/data/repo.ts:351`, consumer at `server/src/agent/tools.ts:608` | Low |
+| 6 | `pending_media.public_path` is written on insert and selected by `listPendingMedia`, then never read. Pairs with #3 | `server/src/data/repo.ts:351`, `server/src/data/repo.ts:467`, mapped but not used in `server/src/data/tool-ports.ts:40` | Low |
 
 ## Documentation
 
 | # | Debt | Evidence | Impact |
 |---|---|---|---|
 | 7 | **`PROPOSAL.md` still describes the real-estate product** — a generated storefront, visit scheduling, "First vertical: real estate" — with no marker saying it is historical. It sits next to `README.md`, so it is among the first files a newcomer opens | `PROPOSAL.md:1-6` | Medium |
-| 8 | **`docs/agent-roles-routing.md` and `docs/agent-catalog-decoupling.md` read as descriptions of the system.** Neither is built: there is no router and no agent registry anywhere in `server/src` | No match for a router or registry in `server/src`; this wiki's `README.md` is currently the only place that says so | Medium |
+| 8 | **`docs/agent-roles-routing.md` and `docs/agent-catalog-decoupling.md` read as descriptions of the system.** The tool registry is built (`server/src/tools/registry.ts`), but the agent router for routing between agents is not yet built (Phase 6 and beyond) | `server/src/tools/registry.ts` exists; no agent-to-agent router in `server/src` | Medium |
 | 9 | `cryptography_concepts.md` (scratch notes) and `preview-0195.png` (855 KB storefront screenshot) are tracked at the repo root and belong to neither the product nor the docs | `git ls-files` | Low |
 | 10 | **12 Mermaid `classDef` lines hardcode `fill:`/`stroke:`/`color:` in the two proposal docs.** GitHub renders in light *and* dark; a fixed palette breaks one of them. They are exempted from the style checks, not fixed | `bash scripts/check-docs.sh` with `is_wiki` removed; `docs/agent-roles-routing.md:43`, `docs/agent-catalog-decoupling.md:27` | Low |
 

@@ -73,7 +73,7 @@ graph TB
 ## What one turn records
 
 `logTurn` writes a single line per turn, and these are the fields that answer the questions
-people actually ask. `server/src/agent/agent.ts:357`
+people actually ask. `server/src/agent/runtime.ts:149-188`
 
 | Field | Answers |
 |---|---|
@@ -85,13 +85,13 @@ people actually ask. `server/src/agent/agent.ts:357`
 
 > ⚠️ A turn that ends with no words still sends `NO_ANSWER_FALLBACK`, logged at ERROR.
 > Sending nothing settles the batch as `done` and leaves the person waiting forever.
-> `server/src/agent/agent.ts:483`
+> `server/src/agent/runtime.ts:20` — NO_ANSWER_FALLBACK constant
 
 ## Errors the agent is allowed to see
 
 `failure()` renders a `ShopifyError` as a sentence the model can act on, and **rethrows
 anything else** — an unexpected error must fail the batch and get retried, not be
-explained away to the owner. `server/src/agent/tools.ts:47`
+explained away to the owner. `server/src/tools/packs/catalog.ts` — error handling
 
 | Error | Reaches the agent as |
 |---|---|

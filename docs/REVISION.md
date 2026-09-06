@@ -61,18 +61,18 @@ The only level that tests whether this is **true**. Do not read to confirm; read
 
 ```bash
 grep -cE 'CREATE TABLE IF NOT EXISTS [a-z_]+ \(' server/src/data/db.ts
-grep -c '= tool($' server/src/agent/tools.ts
+grep -cE '^\s+\["' server/src/tools/registry.ts
 grep -c '^export \(async \)\?function' server/src/shopify/catalog.ts
 grep -oE '(query|mutation) [A-Z][A-Za-z]*' server/src/shopify/catalog.ts | sort -u | wc -l
 ```
 
-| Claim | Value at `6f9211b` |
+| Claim | Current value |
 |---|---|
 | SQLite tables | 5 |
-| Tools registered | 12 — 3 customer, 9 owner-only |
+| Tools registered | 15 — 4 customer (vitrina-ventas), 13 owner (vitrina-inventario), get_product split into two registry entries |
 | Exported functions in `catalog.ts` | 17 |
 | Named GraphQL operations | 19 — 10 mutations, 9 queries |
-| Server tests | 294 across 20 files |
+| Server tests | 483 across 24 files |
 
 > ⚠️ The table count needs the trailing ` \(`. Without it the regex also matches the
 > sentence "CREATE TABLE IF NOT EXISTS never alters…" in the migration comment and reports

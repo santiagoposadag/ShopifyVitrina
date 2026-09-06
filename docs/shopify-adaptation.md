@@ -13,11 +13,11 @@ code, so the expensive surprises are on paper rather than in a branch.
 
 The short answer: **the pipeline transfers almost entirely, the catalog does
 not.** Everything between "a WhatsApp message arrives" and "the agent decides
-what to do" — bridge, HMAC webhook, inbox durability, batching, per-phone
+what to do" — bridge, HMAC webhook, inbox durability, batching, per-conversation
 serialization, rate limits, sessions, transcription — is domain-free and moves
 across unchanged. What has to be rebuilt is the layer underneath the agent's
-tools: `server/src/data/repo.ts`, the tool schemas in `server/src/agent/tools.ts`,
-and the two system prompts in `server/src/agent/agent.ts`.
+tools: `server/src/data/repo.ts`, the tool implementations in `server/src/tools/packs/`,
+and the personas in `agents/<id>/prompt.md`.
 
 ---
 
@@ -68,11 +68,12 @@ beyond imports*.
 
 ### Rewritten
 
-| File | What changes |
+| File | What changed |
 |---|---|
-| `server/src/agent/tools.ts` | Every tool's schema and body. Role boundary logic is kept verbatim. |
-| `server/src/agent/agent.ts` | Only `systemPrompt()` — both branches. The rest is untouched. |
-| `shared/index.d.ts` | `ProductAttributes` → a retail shape (or dropped in favour of metafields) |
+| `server/src/tools/registry.ts` (new) | Tool registry; all fourteen tools registered by key, served by definition. |
+| `server/src/tools/packs/*.ts` (new) | Tool implementations distributed across four packs: catalog, cart, leads, media. |
+| `server/src/agent/runtime.ts` | Renamed from `agent.ts`; `systemPrompt()` removed to agent definitions. |
+| `agents/<id>/prompt.md` (new) | Personas read from disk per agent; two agents, two prompts. |
 | `server/src/config.ts` | New Shopify block; `STOREFRONT_BASE_URL` / `ANON_*` removed |
 | `server/src/data/db.ts` | Product tables dropped; `inbox`, `sessions`, `leads`, `contacts`, `pending_media` stay |
 
@@ -384,7 +385,7 @@ catalog size before building either.
 | **Partial failure** | `productSet` can succeed while `productCreateMedia` fails, leaving a product with no photos. `userErrors` is a *response field*, not an HTTP error: a 200 OK with a populated `userErrors` array is a failure, and a client that only checks `res.ok` will report success on it. |
 | **API versioning** | Shopify versions quarterly and deprecates on a rolling schedule. Pin the version in the client (`2026-01`) and treat a bump as a change with its own test run. |
 | **Credentials** | A custom app installed from the store admin yields an Admin API access token, sent as `X-Shopify-Access-Token`. It goes in gopass alongside the others and flows through `scripts/with-secrets.sh` — same path as `ANTHROPIC_API_KEY` today. Scope it to exactly what the tools use. |
-| **Blast radius** | Real estate's worst case was a wrong listing on a storefront. Retail's worst case is a wrong *price* or a wrong *stock count* on a live store that takes money. The owner-only tool boundary in `buildToolServer` — and its pinning test in `tools.test.ts` — matters more here than it did before, not less. |
+| **Blast radius** | Real estate's worst case was a wrong listing on a storefront. Retail's worst case is a wrong *price* or a wrong *stock count* on a live store that takes money. The owner-only tool boundary is declared in the agent definition (`agents/vitrina-inventario/agent.yaml`) — and its pinning test in `tools.test.ts` — matters more here than it did before, not less. |
 
 ---
 
@@ -432,10 +433,10 @@ this migration is more than a lateral move:
 One option worth *evaluating* rather than assuming: Shopify publishes its own
 MCP tooling. Since the agent already speaks MCP, pointing it at an external
 Shopify MCP server is conceivable — but it would hand the model a tool surface
-nobody in this repo controls, and the owner/customer boundary in
-`buildToolServer` is enforced precisely by controlling which tools exist per
-role. Verify what is actually offered before treating it as a shortcut; the
-in-process tool server is the safer default.
+nobody in this repo controls, and the owner/customer boundary is enforced
+by the agent definition `tools:` array — each agent declares exactly what the
+registry serves to it. Verify what is actually offered before treating it as a
+shortcut; the in-process tool server is the safer default.
 
 ---
 

@@ -66,7 +66,7 @@ graph LR
 | `config.ts` stays at `src/` root | It computes `REPO_ROOT` with a hardcoded `../../`, `server/src/config.ts:7` |
 | Only `index.ts` names a channel implementation | Everything else takes `WhatsAppChannel`, `server/src/whatsapp/channel.ts:15` |
 | The webhook never downloads a file | It stores a reference; the worker fetches, `server/src/inbox/batcher.ts:316` |
-| Tools never send a message | The turn's single reply is `runAgentTurn`'s, `server/src/agent/tools.ts:34` |
+| Tools never send a message | `runAgentTurn` returns the reply; responder sends it, `server/src/egress/responder.ts` |
 
 > ℹ️ `WhatsAppChannel` earned its place twice over. It is what lets the whole pipeline be
 > tested with a plain object — no HTTP client, no paired device, no casts — and it is why

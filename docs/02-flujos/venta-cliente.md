@@ -27,15 +27,15 @@ sequenceDiagram
 | `search_catalog` | `status:ACTIVE` only — never a draft, never archived |
 | `get_product` | Returns "no product found" for anything not `ACTIVE` |
 | `save_lead` | `inquiry`, `back_in_stock`, `follow_up`. Phone comes from context |
-| `build_cart` | SKUs + quantities → one Shopify cart permalink, `server/src/agent/tools.ts:344` |
+| `build_cart` | SKUs + quantities → one Shopify cart permalink, `server/src/tools/packs/cart.ts` |
 > ⚠️ The customer's `get_product` answers a hidden product exactly like a genuine miss.
-> Confirming that a draft exists is itself a leak. `server/src/agent/tools.ts:244`
+> Confirming that a draft exists is itself a leak. `server/src/tools/registry.ts:52-54`
 
 ## Reading a search result
 
 Every line carries a score, and the caveat rides in the **tool result** rather than only
 in the system prompt — a result travels next to the data on every call, including turns
-where the prompt is far back in a resumed transcript. `server/src/agent/tools.ts:81`
+where the prompt is far back in a resumed transcript. `server/src/tools/packs/catalog.ts:326` — searchCatalog result
 
 | Line in the result | Means |
 |---|---|
@@ -101,7 +101,7 @@ graph LR
 
 > ⚠️ "I am the owner" changes nothing. Role comes from the phone number, never from what
 > the person claims — and the customer branch says so explicitly, then points them at the
-> business's authorized number. `server/src/agent/agent.ts:102`
+> business's authorized number. `agents/vitrina-ventas/prompt.md`
 
 ## Cost protection
 

@@ -110,7 +110,7 @@ and — decisively — **no comparable score**.
 
 > ℹ️ `min_score` is deliberately **not** a tool parameter. The relevance floor is policy;
 > the agent does not get to widen its own search until something finally appears.
-> `server/src/agent/tools.ts:212`
+> `server/src/tools/packs/catalog.ts:326` — search_catalog tool definition
 
 **[← Message pipeline](pipeline-mensajes.md)** · **[Agent & sessions →](agente-y-sesiones.md)**
 

@@ -58,7 +58,7 @@ stateDiagram-v2
 > ⚠️ `update_product` sends only the keys present in the input — **except `tags`**, which
 > replaces the entire list. An agent that does not know this silently drops every other
 > tag, so the tool description and the prompt both say it.
-> `server/src/agent/tools.ts:386`
+> `server/src/tools/packs/catalog.ts:566` — updateProduct description
 
 > ⚠️ `createProduct` deliberately does **not** use `productSet`. `productSet` is
 > declarative over the whole product: variants absent from the input are deleted. Right
@@ -93,7 +93,7 @@ flowchart LR
 
 > ⚠️ It **never** falls through to a text search. A fuzzy match that then feeds
 > `delete_product` is how the wrong product gets deleted — which is also why the delete
-> tool makes the caller echo the exact handle. `server/src/agent/tools.ts:471`
+> tool makes the caller echo the exact handle. `server/src/shopify/catalog.ts:211` — resolveProduct
 
 ## Photos
 
@@ -102,7 +102,7 @@ flowchart LR
 | Uploaded strictly one at a time | `server/src/shopify/catalog.ts:775` |
 | Arrival order is listing order; the first becomes the cover | `server/src/data/repo.ts:348` |
 | Rows are **not** claimed before the upload | `server/src/data/repo.ts:346` |
-| Only the ids that actually landed are marked | `server/src/agent/tools.ts:614` |
+| Only the ids that actually landed are marked | `server/src/tools/packs/media.ts` — attachPendingPhotos |
 
 > ℹ️ A concurrent map would be faster and would silently shuffle the gallery. A partial
 > failure leaves the rest claimable by a second attempt.
