@@ -278,7 +278,10 @@ async function runQuery(
         log.warn({ phone: ctx.phone, tool: toolName }, "denied a tool outside this assistant's set");
         return { behavior: "deny", message: "This tool is not available to this assistant." };
       },
-      maxTurns: 12,
+      // Was a bare literal before agent.yaml existed; both shipped definitions
+      // still say 12, so there is no behaviour change — the point is that
+      // there is now exactly one copy of the number, not two that can drift.
+      maxTurns: definition.model.maxTurns,
       ...(resumeId ? { resume: resumeId } : {}),
     },
   });
@@ -417,13 +420,27 @@ export async function runAgentTurn(
   ctx: TurnContext,
   incomingText: string,
 ): Promise<string> {
-  const { db, config, log } = deps;
-  const resumeId = getSessionId(db, ctx.agentId, ctx.conversationKey, config.sessionMaxAgeDays);
+  const { db, config, definitions, log } = deps;
+  const definition = definitions[ctx.agentId];
+  if (!definition) {
+    // Would mean a definition failed to load at boot and the process kept
+    // running anyway, or the router produced an agentId nothing declared. Both
+    // are configuration bugs; surfacing here beats sending a person a reply
+    // composed from nothing.
+    throw new Error(`No agent definition loaded for agentId "${ctx.agentId}"`);
+  }
+  // The definition's own value wins when it declares one; otherwise this
+  // agent falls back to the deployment-wide knob. Neither shipped definition
+  // sets one TODAY, on purpose — see session.maxAgeDays' comment in
+  // definition.ts for why hard-coding the current default would be a
+  // behaviour change disguised as a data move.
+  const sessionMaxAgeDays = definition.session.maxAgeDays ?? config.sessionMaxAgeDays;
+  const resumeId = getSessionId(db, ctx.agentId, ctx.conversationKey, sessionMaxAgeDays);
   const startedAt = new Date();
 
   let result: TurnResult;
   try {
-    result = await runQuery(deps, ctx, incomingText, resumeId);
+    result = await runQuery(deps, ctx, definition, incomingText, resumeId);
   } catch (err) {
     if (!resumeId) throw err;
     // Drop the id BEFORE retrying: if the retry also fails, a replayed inbox
@@ -433,7 +450,7 @@ export async function runAgentTurn(
       { err, phone: ctx.phone, sessionId: resumeId },
       "agent session could not be resumed; starting a fresh session",
     );
-    result = await runQuery(deps, ctx, incomingText, undefined);
+    result = await runQuery(deps, ctx, definition, incomingText, undefined);
   }
 
   logTurn(log, config, ctx, result.stats, startedAt);

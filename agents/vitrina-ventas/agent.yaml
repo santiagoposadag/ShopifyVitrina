@@ -6,8 +6,7 @@ id: vitrina-ventas
 roles:
   - customer
 model:
-  # Matches the `maxTurns: 12` literal runtime.ts has hardcoded since before
-  # this file existed. Not yet read by the runtime — see the Phase 2 report.
+  # Read by runtime.ts as the SDK's own maxTurns option.
   maxTurns: 12
 tools:
   - search_catalog
@@ -23,10 +22,9 @@ knowledge:
   searchable: []
   maxInlineTokens: 0
 session:
-  # Matches SESSION_MAX_AGE_DAYS's default in config.ts. Not yet read by the
-  # runtime, which still applies config.sessionMaxAgeDays to every agent — see
-  # the Phase 2 report.
-  maxAgeDays: 7
+  # Deliberately UNSET: SESSION_MAX_AGE_DAYS (config.ts) stays authoritative
+  # for this agent — see the matching comment in vitrina-inventario/agent.yaml
+  # for why hard-coding today's default here would be a behaviour change.
   # The customer path has no publish transition — nothing resets its session.
   resetOn: []
   keyedBy: principal

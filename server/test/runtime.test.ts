@@ -515,6 +515,60 @@ describe("runAgentTurn tool surface", () => {
     expect(options.allowedTools?.length).toBeGreaterThan(0);
     expect(options.allowedTools?.every((t) => t.startsWith("mcp__vitrina__"))).toBe(true);
   });
+
+  // maxTurns used to be a bare literal in this file; it now comes from the
+  // agent's own definition, so a divergence between the two shipped
+  // agent.yaml files and the runtime cannot happen silently.
+  it("takes maxTurns from the agent's own definition, not a runtime literal", async () => {
+    // The shipped definition also says 12, which is exactly what a runtime
+    // literal would say — asserting against it cannot distinguish "read from
+    // the definition" from "compiled in and coincidentally equal". A value no
+    // literal in the source could coincide with is what actually pins the
+    // wiring: this only passes if runQuery reads it off the definition it was
+    // handed.
+    const DISTINCT_MAX_TURNS = 3;
+    const overridden: Record<string, AgentDefinition> = {
+      ...DEFINITIONS,
+      [agentIdForRole("owner")]: {
+        ...DEFINITIONS[agentIdForRole("owner")]!,
+        model: { ...DEFINITIONS[agentIdForRole("owner")]!.model, maxTurns: DISTINCT_MAX_TURNS },
+      },
+    };
+    queryMock.mockReturnValueOnce(successStream("s1", "Hola"));
+    const deps = {
+      db,
+      config: CONFIG,
+      log: { warn: () => undefined, info: () => undefined, error: () => undefined },
+      shopify: SHOPIFY,
+      cache: CACHE,
+      definitions: overridden,
+    } as never as Parameters<typeof runAgentTurn>[0];
+
+    await runAgentTurn(deps, ctxFor("owner"), "hola");
+
+    const [{ options }] = queryMock.mock.calls[0] as [{ options: { maxTurns?: number } }];
+    expect(options.maxTurns).toBe(DISTINCT_MAX_TURNS);
+  });
+
+  // The shipped-definition path, kept as a second, complementary assertion —
+  // it would not catch a literal on its own (see the test above), but it does
+  // pin that the value actually deployed today still reaches the SDK call.
+  it("passes the shipped definition's maxTurns through unchanged", async () => {
+    queryMock.mockReturnValueOnce(successStream("s1", "Hola"));
+    const deps = {
+      db,
+      config: CONFIG,
+      log: { warn: () => undefined, info: () => undefined, error: () => undefined },
+      shopify: SHOPIFY,
+      cache: CACHE,
+      definitions: DEFINITIONS,
+    } as never as Parameters<typeof runAgentTurn>[0];
+
+    await runAgentTurn(deps, ctxFor("owner"), "hola");
+
+    const [{ options }] = queryMock.mock.calls[0] as [{ options: { maxTurns?: number } }];
+    expect(options.maxTurns).toBe(DEFINITIONS[agentIdForRole("owner")]!.model.maxTurns);
+  });
 });
 
 describe("runAgentTurn never answers with silence", () => {
@@ -694,6 +748,72 @@ describe("runAgentTurn session key", () => {
 
     expect(getSessionId(db, agentIdForRole("customer"), PHONE)).toBe("session-ventas");
     expect(getSessionId(db, agentIdForRole("owner"), PHONE)).toBe("session-inventario");
+  });
+});
+
+/**
+ * `session.maxAgeDays` in the YAML overrides `config.sessionMaxAgeDays` when
+ * an agent declares one; neither shipped definition does, so this exercises
+ * the seam with a definition built in memory rather than one on disk.
+ */
+describe("runAgentTurn session.maxAgeDays override", () => {
+  let db: DB;
+  let deps: Parameters<typeof runAgentTurn>[0];
+
+  beforeEach(() => {
+    queryMock.mockReset();
+    db = openDb(":memory:");
+    deps = {
+      db,
+      config: CONFIG, // sessionMaxAgeDays: 7
+      log: { warn: () => undefined, info: () => undefined, error: () => undefined } as never,
+      shopify: SHOPIFY,
+      cache: CACHE,
+      definitions: DEFINITIONS,
+    };
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("falls back to config.sessionMaxAgeDays when the definition sets none", async () => {
+    // Both shipped definitions leave maxAgeDays unset — pins that the fallback
+    // is actually reached, not merely present in the type.
+    setSessionId(db, agentIdForRole("owner"), PHONE, "session-old");
+    db.prepare(
+      "UPDATE sessions SET updated_at = datetime('now', '-3 days') WHERE agent_id = ?",
+    ).run(agentIdForRole("owner"));
+    queryMock.mockReturnValueOnce(successStream("session-new", "Hola"));
+
+    await runAgentTurn(deps, ctxFor("owner"), "hola");
+
+    // 3 days old, under CONFIG.sessionMaxAgeDays (7): still resumable.
+    expect(resumeArg(0)).toBe("session-old");
+  });
+
+  it("uses the definition's own window instead of config's when one is declared", async () => {
+    const overridden: Record<string, AgentDefinition> = {
+      ...DEFINITIONS,
+      [agentIdForRole("owner")]: {
+        ...DEFINITIONS[agentIdForRole("owner")]!,
+        session: { ...DEFINITIONS[agentIdForRole("owner")]!.session, maxAgeDays: 1 },
+      },
+    };
+    const overriddenDeps = { ...deps, definitions: overridden };
+
+    setSessionId(db, agentIdForRole("owner"), PHONE, "session-old");
+    db.prepare(
+      "UPDATE sessions SET updated_at = datetime('now', '-3 days') WHERE agent_id = ?",
+    ).run(agentIdForRole("owner"));
+    queryMock.mockReturnValueOnce(successStream("session-new", "Hola"));
+
+    await runAgentTurn(overriddenDeps, ctxFor("owner"), "hola");
+
+    // 3 days old, past the definition's own 1-day window — CONFIG's 7 days
+    // would have kept this resumable, so this only passes if the definition's
+    // value actually won.
+    expect(resumeArg(0)).toBeUndefined();
   });
 });
 

@@ -14,12 +14,7 @@ const PROMPT_BASES = ["grounding", "none"] as const;
 
 const RoleSchema = z.enum(["owner", "customer"]);
 
-/**
- * Not yet read by runtime.ts — `maxTurns: 12` there is still the literal it
- * was before definitions existed (see the Phase 2 report for why). Validated
- * anyway: an unvalidated field is a typo nobody catches, and this one is
- * exactly the shape it will need the day something DOES read it.
- */
+/** `runtime.ts` passes `maxTurns` straight through to the SDK's own option. */
 const ModelKnobsSchema = z
   .object({
     maxTurns: z.number().int().positive(),
@@ -47,8 +42,30 @@ const KnowledgeSpecSchema = z
 
 const SessionPolicySchema = z
   .object({
-    maxAgeDays: z.number().int().positive(),
-    /** Tool names whose call ends the conversation. Validated against `tools[]` below. */
+    /**
+     * Optional, and deliberately unset in both shipped definitions. Wiring
+     * the shipped default (matching SESSION_MAX_AGE_DAYS's own default) would
+     * make the YAML outrank the environment variable: a deployment that has
+     * actually SET that variable to something else would have its window
+     * silently shortened or lengthened by a data file nobody told it to read.
+     * `runtime.ts` reads `session.maxAgeDays ?? config.sessionMaxAgeDays`, so
+     * a definition that DOES need its own window can declare one without
+     * every other agent inheriting a value config no longer controls.
+     */
+    maxAgeDays: z.number().int().positive().optional(),
+    /**
+     * Tool names that MAY trigger a session reset — NOT a literal "this tool
+     * call resets the session" mapping. Today's actual condition is a STATE
+     * TRANSITION a tool evaluates for itself (`isPublishTransition` in
+     * tools.ts: a product becomes ACTIVE and was not before) and signals
+     * through `ctx.sessionAfterTurn = "reset"`; `update_product` appears here
+     * because it CAN cause that transition, not because every call to it
+     * resets anything. A future implementation that reads this field at
+     * tool-name granularity — "reset whenever one of these tools is called" —
+     * would reset the owner's session on an ordinary price edit, which is
+     * exactly the mid-listing data loss the transition check exists to avoid.
+     * Validated against `tools[]` below; not yet read by the runtime.
+     */
     resetOn: z.array(z.string()),
     keyedBy: z.enum(["principal", "correlation"]),
   })

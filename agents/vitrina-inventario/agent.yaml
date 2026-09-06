@@ -6,8 +6,7 @@ id: vitrina-inventario
 roles:
   - owner
 model:
-  # Matches the `maxTurns: 12` literal runtime.ts has hardcoded since before
-  # this file existed. Not yet read by the runtime — see the Phase 2 report.
+  # Read by runtime.ts as the SDK's own maxTurns option.
   maxTurns: 12
 tools:
   - search_catalog
@@ -33,14 +32,21 @@ knowledge:
   searchable: []
   maxInlineTokens: 0
 session:
-  # Matches SESSION_MAX_AGE_DAYS's default in config.ts. Not yet read by the
-  # runtime, which still applies config.sessionMaxAgeDays to every agent — see
-  # the Phase 2 report.
-  maxAgeDays: 7
-  # create_product and update_product both set ctx.sessionAfterTurn = "reset"
-  # on a publish transition (agent/tools.ts). Declared here as the seam Phase 3
-  # wires the runtime to instead of a tool reaching into ctx directly; not yet
-  # read.
+  # Deliberately UNSET: SESSION_MAX_AGE_DAYS (config.ts) stays authoritative
+  # for this agent. Setting this to today's default of 7 would make the YAML
+  # outrank the environment variable — a deployment that has actually changed
+  # SESSION_MAX_AGE_DAYS would have this agent's window silently overridden by
+  # a data file nobody told it to read. Set this only when this agent's window
+  # is meant to differ from the deployment's own default.
+  #
+  # create_product and update_product CAN trigger a reset, but only through the
+  # publish TRANSITION each evaluates for itself (isPublishTransition in
+  # agent/tools.ts) — a product becoming ACTIVE when it was not before, signalled
+  # through ctx.sessionAfterTurn. This list is NOT "reset whenever one of these
+  # tools is called": update_product changing a price resets nothing today, and
+  # a Phase 3 reading that treats tool names here as the trigger itself would
+  # reset the owner's session on an ordinary edit — the exact mid-listing data
+  # loss the transition check exists to prevent. Not yet read by the runtime.
   resetOn:
     - create_product
     - update_product
