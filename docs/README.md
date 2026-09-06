@@ -92,7 +92,7 @@ What lives elsewhere in this repo, and stays there:
 | [`coolify-deploy.md`](coolify-deploy.md) · [`secrets-management.md`](secrets-management.md) · [`gopass-setup.md`](gopass-setup.md) | Deployment and secrets runbooks |
 | [`provider-swap.md`](provider-swap.md) · [`provider-swap-findings.md`](provider-swap-findings.md) | Swapping the LLM provider, and what it measured |
 | [`voice-notes.md`](voice-notes.md) | How voice notes are transcribed and what they cost |
-| [`agent-roles-routing.md`](agent-roles-routing.md) · [`agent-catalog-decoupling.md`](agent-catalog-decoupling.md) | Forward-looking proposals, **not** built |
+| [`agent-roles-routing.md`](agent-roles-routing.md) · [`agent-platform-decoupling.md`](agent-platform-decoupling.md) · [~~`agent-catalog-decoupling.md`~~](agent-catalog-decoupling.md) | Forward-looking proposals, **not** built |
 
 > ℹ️ `CLAUDE.md` at the repo root is the operating manual for coding agents. This wiki
 > is the same system explained to a person; where they disagree, the code decides.

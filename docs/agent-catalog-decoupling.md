@@ -1,3 +1,5 @@
+> ⚠️ **Superseded.** This document describes a `repo.ts` local catalog that no longer exists — the catalog is Shopify. See [agent-platform-decoupling.md](agent-platform-decoupling.md) for the current proposal. Kept for history.
+
 # Decoupling the Agent from the Catalog
 
 **Why:** today the agent and the catalog are one process. We want them to grow apart — evolve the catalog independently, run **multiple agents**, and add a **super-agent** that orchestrates them.
