@@ -75,6 +75,26 @@ export interface TurnContext {
   phone: string;
   role: Role;
   /**
+   * Which agent answers this turn — the persona, and half of the session key.
+   *
+   * Derived from the role today (see router.ts) and from an agent definition
+   * later. Kept beside `role` rather than instead of it because the role still
+   * selects the prompt and the tool set; when those move into definitions, the
+   * agent id is what remains.
+   */
+  agentId: string;
+  /**
+   * Which conversation this turn belongs to: the other half of the session key,
+   * and what the work queue serializes on.
+   *
+   * For a WhatsApp principal this IS `phone`, and the duplication is
+   * deliberate — `phone` is an ADDRESS (where a reply goes, who the allowlist
+   * judges) and this is an IDENTITY of a running conversation. A door whose
+   * caller has no phone still has conversations, and collapsing the two fields
+   * is what forces such a door to invent a fake phone number.
+   */
+  conversationKey: string;
+  /**
    * A stable identifier for the batch of messages that triggered this turn,
    * derived from the inbox rows being processed.
    *

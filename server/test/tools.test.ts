@@ -18,6 +18,7 @@ import { ShopifyClient } from "../src/shopify/client.js";
 import type { SearchHit } from "../src/shopify/rank.js";
 import type { ShopifyProduct } from "../src/shopify/types.js";
 import type { Role } from "../src/types.js";
+import { agentIdForRole } from "../src/router.js";
 
 const CUSTOMER_TOOLS = ["search_catalog", "get_product", "save_lead", "build_cart"];
 const OWNER_ONLY_TOOLS = [
@@ -48,7 +49,13 @@ function toolNamesFor(role: Role): string[] {
     config: TEST_CONFIG,
     shopify,
     cache: new CatalogCache(shopify, 0),
-    ctx: { phone: "573000000000", role, turnKey: "msg:1" },
+    ctx: {
+      phone: "573000000000",
+      role,
+      agentId: agentIdForRole(role),
+      conversationKey: "573000000000",
+      turnKey: "msg:1",
+    },
   });
   db.close();
   return toolNames.map((n) => n.replace(`mcp__${MCP_SERVER_NAME}__`, ""));

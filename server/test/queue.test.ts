@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { PerPhoneQueue } from "../src/inbox/queue.js";
+import { PerConversationQueue } from "../src/inbox/queue.js";
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-describe("PerPhoneQueue", () => {
-  it("processes messages from the same phone in order", async () => {
-    const queue = new PerPhoneQueue();
+describe("PerConversationQueue", () => {
+  it("processes messages from the same conversation in order", async () => {
+    const queue = new PerConversationQueue();
     const order: number[] = [];
 
     // First job is slow; a strict FIFO must still keep 1 before 2 and 3.
@@ -25,8 +25,8 @@ describe("PerPhoneQueue", () => {
     expect(order).toEqual([1, 2, 3]);
   });
 
-  it("keeps ordering per phone even when one job rejects", async () => {
-    const queue = new PerPhoneQueue();
+  it("keeps ordering per conversation even when one job rejects", async () => {
+    const queue = new PerConversationQueue();
     const order: string[] = [];
 
     const p1 = queue.enqueue("A", async () => {
@@ -42,8 +42,8 @@ describe("PerPhoneQueue", () => {
     expect(order).toEqual(["a1", "a2"]);
   });
 
-  it("runs different phones concurrently", async () => {
-    const queue = new PerPhoneQueue();
+  it("runs different conversations concurrently", async () => {
+    const queue = new PerConversationQueue();
     const events: string[] = [];
 
     const a = queue.enqueue("A", async () => {
@@ -60,10 +60,10 @@ describe("PerPhoneQueue", () => {
   });
 
   it("clears its internal map once chains drain", async () => {
-    const queue = new PerPhoneQueue();
+    const queue = new PerConversationQueue();
     await queue.enqueue("A", async () => undefined);
     // Allow the cleanup microtask to run.
     await delay(1);
-    expect(queue.activePhones).toBe(0);
+    expect(queue.activeConversations).toBe(0);
   });
 });

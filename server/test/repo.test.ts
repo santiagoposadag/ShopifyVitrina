@@ -5,11 +5,15 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb, type DB } from "../src/data/db.js";
 import {
   addPendingMedia,
+  clearSessionId,
   deleteStalePendingMedia,
+  getSessionId,
   insertLead,
   listLeads,
   listPendingMedia,
+  listSessions,
   markPendingMediaAttached,
+  setSessionId,
   upsertContact,
 } from "../src/data/repo.js";
 
@@ -190,5 +194,73 @@ describe("pending media", () => {
 
       expect(deleteStalePendingMedia(db, 48)).toBe(1);
     });
+  });
+});
+
+/**
+ * Sessions are keyed by (agent_id, conversation_key), not by phone.
+ *
+ * The key IS the isolation: one phone reaching two agents holds two separate
+ * conversations, and sharing an id between them would resume the inventory
+ * assistant's transcript inside a sales turn — the customer would be answered
+ * out of the owner's half-finished listing.
+ */
+describe("agent sessions", () => {
+  let db: DB;
+
+  beforeEach(() => {
+    db = openDb(":memory:");
+  });
+  afterEach(() => {
+    db.close();
+  });
+
+  it("keeps one phone's sessions apart per agent", () => {
+    setSessionId(db, "vitrina-inventario", PHONE, "session-inventario");
+    setSessionId(db, "vitrina-ventas", PHONE, "session-ventas");
+
+    expect(getSessionId(db, "vitrina-inventario", PHONE)).toBe("session-inventario");
+    expect(getSessionId(db, "vitrina-ventas", PHONE)).toBe("session-ventas");
+  });
+
+  it("keeps one agent's sessions apart per conversation", () => {
+    setSessionId(db, "vitrina-ventas", PHONE, "session-a");
+    setSessionId(db, "vitrina-ventas", "573009998877", "session-b");
+
+    expect(getSessionId(db, "vitrina-ventas", PHONE)).toBe("session-a");
+    expect(getSessionId(db, "vitrina-ventas", "573009998877")).toBe("session-b");
+  });
+
+  it("replaces the id for the same pair rather than accumulating rows", () => {
+    setSessionId(db, "vitrina-ventas", PHONE, "session-a");
+    setSessionId(db, "vitrina-ventas", PHONE, "session-b");
+
+    expect(getSessionId(db, "vitrina-ventas", PHONE)).toBe("session-b");
+    expect(listSessions(db)).toHaveLength(1);
+  });
+
+  it("clears only the pair it was asked for", () => {
+    setSessionId(db, "vitrina-inventario", PHONE, "session-inventario");
+    setSessionId(db, "vitrina-ventas", PHONE, "session-ventas");
+
+    clearSessionId(db, "vitrina-ventas", PHONE);
+
+    expect(getSessionId(db, "vitrina-ventas", PHONE)).toBeUndefined();
+    expect(getSessionId(db, "vitrina-inventario", PHONE)).toBe("session-inventario");
+  });
+
+  // Housekeeping and the purge tool both read this, and both need the key back:
+  // one to decide whether a transcript on disk is still referenced, the other to
+  // delete the row it just judged.
+  it("lists every stored session with the key that identifies it", () => {
+    setSessionId(db, "vitrina-inventario", PHONE, "session-inventario");
+
+    expect(listSessions(db)).toEqual([
+      {
+        agent_id: "vitrina-inventario",
+        conversation_key: PHONE,
+        agent_session_id: "session-inventario",
+      },
+    ]);
   });
 });

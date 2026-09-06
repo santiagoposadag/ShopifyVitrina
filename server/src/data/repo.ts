@@ -62,21 +62,34 @@ export function upsertContact(
 }
 
 /**
- * Get the resumable agent session for a phone. When maxAgeDays is given,
- * sessions idle longer than that are treated as expired (returns undefined) so
- * long-lived contacts start a fresh conversation instead of dragging months of
- * history — and cost — into every turn.
+ * Get the resumable agent session for one agent's conversation. When maxAgeDays
+ * is given, sessions idle longer than that are treated as expired (returns
+ * undefined) so long-lived contacts start a fresh conversation instead of
+ * dragging months of history — and cost — into every turn.
+ *
+ * Keyed by BOTH parts. The same person talking to two assistants holds two
+ * conversations, and answering one of them from the other's transcript is not
+ * something either side can detect.
  */
-export function getSessionId(db: DB, phone: string, maxAgeDays?: number): string | undefined {
+export function getSessionId(
+  db: DB,
+  agentId: string,
+  conversationKey: string,
+  maxAgeDays?: number,
+): string | undefined {
   const row = (
     maxAgeDays !== undefined
       ? db
           .prepare(
             `SELECT agent_session_id FROM sessions
-             WHERE phone = ? AND updated_at >= datetime('now', ?)`,
+             WHERE agent_id = ? AND conversation_key = ? AND updated_at >= datetime('now', ?)`,
           )
-          .get(phone, `-${maxAgeDays} days`)
-      : db.prepare(`SELECT agent_session_id FROM sessions WHERE phone = ?`).get(phone)
+          .get(agentId, conversationKey, `-${maxAgeDays} days`)
+      : db
+          .prepare(
+            `SELECT agent_session_id FROM sessions WHERE agent_id = ? AND conversation_key = ?`,
+          )
+          .get(agentId, conversationKey)
   ) as { agent_session_id: string | null } | undefined;
   return row?.agent_session_id ?? undefined;
 }
@@ -87,31 +100,47 @@ export function getSessionId(db: DB, phone: string, maxAgeDays?: number): string
  * too old to RESUME still owns a transcript on disk that must not be swept as
  * an orphan until its row is actually gone.
  */
-export function listSessions(db: DB): { phone: string; agent_session_id: string }[] {
+export function listSessions(
+  db: DB,
+): { agent_id: string; conversation_key: string; agent_session_id: string }[] {
   return db
     .prepare(
-      `SELECT phone, agent_session_id FROM sessions WHERE agent_session_id IS NOT NULL`,
+      `SELECT agent_id, conversation_key, agent_session_id
+       FROM sessions WHERE agent_session_id IS NOT NULL`,
     )
-    .all() as { phone: string; agent_session_id: string }[];
+    .all() as { agent_id: string; conversation_key: string; agent_session_id: string }[];
 }
 
 /**
- * Forget a phone's stored session id. Used when the SDK cannot resume it — the
- * transcript is gone, so keeping the id only guarantees the next turn fails the
- * same way (a replayed inbox row would resume the same dead session).
+ * Forget one conversation's stored session id. Used when the SDK cannot resume
+ * it — the transcript is gone, so keeping the id only guarantees the next turn
+ * fails the same way (a replayed inbox row would resume the same dead session).
  */
-export function clearSessionId(db: DB, phone: string): void {
-  db.prepare(`DELETE FROM sessions WHERE phone = ?`).run(phone);
+export function clearSessionId(db: DB, agentId: string, conversationKey: string): void {
+  db.prepare(`DELETE FROM sessions WHERE agent_id = ? AND conversation_key = ?`).run(
+    agentId,
+    conversationKey,
+  );
 }
 
-export function setSessionId(db: DB, phone: string, sessionId: string): void {
+/**
+ * Store the session id this turn produced, and refresh updated_at — which is
+ * what makes the expiry window slide: a conversation expires after
+ * SESSION_MAX_AGE_DAYS of SILENCE, not after that long in existence.
+ */
+export function setSessionId(
+  db: DB,
+  agentId: string,
+  conversationKey: string,
+  sessionId: string,
+): void {
   db.prepare(
-    `INSERT INTO sessions (phone, agent_session_id, updated_at)
-     VALUES (?, ?, datetime('now'))
-     ON CONFLICT(phone) DO UPDATE SET
+    `INSERT INTO sessions (agent_id, conversation_key, agent_session_id, updated_at)
+     VALUES (?, ?, ?, datetime('now'))
+     ON CONFLICT(agent_id, conversation_key) DO UPDATE SET
        agent_session_id = excluded.agent_session_id,
        updated_at = excluded.updated_at`,
-  ).run(phone, sessionId);
+  ).run(agentId, conversationKey, sessionId);
 }
 
 // --- Inbox (at-least-once message processing) --------------------------------

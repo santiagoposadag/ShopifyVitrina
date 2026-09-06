@@ -11,7 +11,7 @@ import { BridgeChannel, sweepStagedMedia } from "./whatsapp/bridge.js";
 import type { WhatsAppChannel } from "./whatsapp/channel.js";
 import { CloudApiChannel } from "./whatsapp/cloud.js";
 import { registerMediaRoutes, saveAudio, saveMedia } from "./whatsapp/media.js";
-import { PerPhoneQueue } from "./inbox/queue.js";
+import { PerConversationQueue } from "./inbox/queue.js";
 import { RateLimiter } from "./inbox/rate-limit.js";
 import {
   deleteStaleInboxRows,
@@ -23,6 +23,9 @@ import { sweepOrphanedTranscripts, transcriptsDir } from "./data/transcripts.js"
 import { CatalogCache } from "./shopify/cache.js";
 import { ShopifyClient } from "./shopify/client.js";
 import { registerWebhook, type WebhookDeps } from "./inbox/webhook.js";
+import { Responders } from "./egress/responder.js";
+import { whatsappPrincipal } from "./inbox/envelope.js";
+import { agentIdForPhone } from "./router.js";
 import type { TurnContext } from "./types.js";
 
 const RATE_LIMIT_NOTICE =
@@ -37,7 +40,20 @@ const OWNER_FAILURE_ALERT =
 async function main(): Promise<void> {
   loadDotEnv();
   const config = loadConfig();
-  const db = openDb(config.dbPath);
+  const db = openDb(config.dbPath, {
+    // Sessions used to be keyed by phone alone. A row written by an older build
+    // therefore names a person and not an assistant, and only the composition
+    // root can tell which one they were talking to — data/db.ts cannot see the
+    // owner allowlist, and this is the one caller that can. Without it those
+    // rows are dropped (see SchemaOptions), which for a live deployment means
+    // every conversation restarting on the upgrade; with it, an owner's
+    // in-progress listing survives.
+    //
+    // Same rule the router applies to live traffic, deliberately: a session
+    // migrated under an id the router never produces is a row nothing will ever
+    // read again.
+    legacyAgentIdFor: (phone: string) => agentIdForPhone(config, phone),
+  });
   // The composition root is the only place that names the transport. Everything
   // below takes the WhatsAppChannel interface, which is what lets the pipeline
   // be tested without an HTTP client or a paired device anywhere in sight — and
@@ -50,12 +66,16 @@ async function main(): Promise<void> {
   // if every turn shares it.
   const shopify = new ShopifyClient(config);
   const cache = new CatalogCache(shopify, config.catalogCacheTtlMs);
-  const queue = new PerPhoneQueue();
+  const queue = new PerConversationQueue();
   const rateLimiter = new RateLimiter({
     perPhonePerHour: config.rateLimitPerPhonePerHour,
     globalPerDay: config.rateLimitGlobalPerDay,
   });
   const failureAlert = new ConsecutiveFailureAlert();
+  // Where a turn's reply goes. The runtime returns the reply and this decides
+  // who receives it, from the principal that asked — which is what lets a
+  // second kind of caller be answered without touching the agent loop.
+  const responders = new Responders(channel);
 
   const app = Fastify({ logger: true });
 
@@ -237,10 +257,20 @@ async function main(): Promise<void> {
         }
       }
 
-      // A throw here reaches the batcher, which retries the batch with backoff
-      // and settles it as failed once the attempt budget is spent — the
-      // user-facing side effects live in onBatchFailure below.
-      await runAgentTurn({ db, channel, config, shopify, cache, log: app.log }, ctx, text);
+      // A throw from EITHER of the two steps below reaches the batcher, which
+      // retries the batch with backoff and settles it as failed once the
+      // attempt budget is spent — the user-facing side effects live in
+      // onBatchFailure below. That includes a failed send: swallowing it would
+      // settle the batch as done with nothing delivered, and the person would
+      // wait forever for a reply that exists nowhere. The retry costs a second
+      // agent turn, which is the cheaper mistake and is what ctx.turnKey makes
+      // safe against on the Shopify side.
+      const reply = await runAgentTurn({ db, config, shopify, cache, log: app.log }, ctx, text);
+      // This door only ever produces WhatsApp principals: the phone is the one
+      // the webhook authenticated, carried through the inbox row. Once an
+      // envelope travels the whole pipeline (the agent door), the principal
+      // arrives with it instead of being rebuilt here.
+      await responders.for(whatsappPrincipal(ctx.phone)).deliver(reply);
       failureAlert.recordSuccess();
     },
     onBatchFailure: async (ctx, { final }) => {

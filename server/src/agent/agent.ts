@@ -2,7 +2,6 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { FastifyBaseLogger } from "fastify";
 import type { Config } from "../config.js";
 import type { DB } from "../data/db.js";
-import type { WhatsAppChannel } from "../whatsapp/channel.js";
 import { clearSessionId, getSessionId, setSessionId } from "../data/repo.js";
 import type { CatalogCache } from "../shopify/cache.js";
 import type { ShopifyClient } from "../shopify/client.js";
@@ -127,9 +126,14 @@ YOU DO NOT MANAGE INVENTORY (critical — this channel is for shopping only):
 Be warm, concise, and helpful.`;
 }
 
+/**
+ * What one turn needs. NO TRANSPORT: the turn returns its reply and the caller
+ * delivers it (see egress/responder.ts). A channel here is what made the reply
+ * address a property of the agent loop, so the only person it could ever answer
+ * was a WhatsApp phone.
+ */
 export interface AgentDeps {
   db: DB;
-  channel: WhatsAppChannel;
   config: Config;
   /** The catalog. Built once at the composition root and shared by every turn. */
   shopify: ShopifyClient;
@@ -464,6 +468,10 @@ function logTurn(
     {
       phone: ctx.phone,
       role: ctx.role,
+      // Which assistant answered. Two of them share this log, and "the owner's
+      // turn resumed nothing" is otherwise indistinguishable from a session
+      // filed under the other agent's id.
+      agentId: ctx.agentId,
       endpointHost: endpointHost(config.agentBaseUrl),
       configuredModel: config.model,
       smallFastModel: config.smallFastModel,
@@ -480,8 +488,10 @@ function logTurn(
 }
 
 /**
- * Run one agent turn for an inbound message and send the reply over WhatsApp.
- * Resumes the per-phone session when one exists and persists the new session id.
+ * Run one agent turn for an inbound message and RETURN the reply. Sending it is
+ * the caller's job — a turn does not know who is asking, only what to answer.
+ * Resumes the (agentId, conversationKey) session when one exists and persists
+ * the new session id.
  *
  * FALLBACK: the session id lives in SQLite (on a volume, survives a redeploy)
  * but the SDK's transcript lives under its home directory, so a container whose
@@ -502,8 +512,8 @@ export async function runAgentTurn(
   ctx: TurnContext,
   incomingText: string,
 ): Promise<string> {
-  const { db, channel, config, log } = deps;
-  const resumeId = getSessionId(db, ctx.phone, config.sessionMaxAgeDays);
+  const { db, config, log } = deps;
+  const resumeId = getSessionId(db, ctx.agentId, ctx.conversationKey, config.sessionMaxAgeDays);
   const startedAt = new Date();
 
   let result: TurnResult;
@@ -513,7 +523,7 @@ export async function runAgentTurn(
     if (!resumeId) throw err;
     // Drop the id BEFORE retrying: if the retry also fails, a replayed inbox
     // row must not resume the same dead session all over again.
-    clearSessionId(db, ctx.phone);
+    clearSessionId(db, ctx.agentId, ctx.conversationKey);
     log.warn(
       { err, phone: ctx.phone, sessionId: resumeId },
       "agent session could not be resumed; starting a fresh session",
@@ -529,28 +539,38 @@ export async function runAgentTurn(
   // reset between the resume-failure attempts above: if attempt 1 published
   // and then died, the publish still happened and the reset must stick.
   if (ctx.sessionAfterTurn === "reset") {
-    clearSessionId(db, ctx.phone);
+    clearSessionId(db, ctx.agentId, ctx.conversationKey);
   } else if (result.sessionId) {
-    setSessionId(db, ctx.phone, result.sessionId);
+    setSessionId(db, ctx.agentId, ctx.conversationKey, result.sessionId);
   }
   // A turn that produced no words STILL owes the person an answer.
   //
   // Only the "success" subtype carries a final reply, so a turn that exhausts
   // maxTurns — twelve tool calls, a minute of latency, thousands of tokens —
-  // arrives here with an empty string. Sending nothing settles the inbox batch
-  // as done and leaves the person waiting forever for a message that no longer
+  // arrives here with an empty string. Returning it settles the inbox batch as
+  // done and leaves the person waiting forever for a message that no longer
   // exists anywhere: the same silence AUDIO_FALLBACK exists to prevent on the
   // voice-note path, reached from the other end.
+  //
+  // The substitution happens HERE rather than in the caller because a caller
+  // that has to remember it is a caller that will not: the runtime is what
+  // knows the turn came back empty, and every door has the same debt to the
+  // person waiting.
   //
   // Observed in the field: numTurns=12, 9253 output tokens, 52 seconds, and not
   // one byte delivered.
   const reply = result.reply.length > 0 ? result.reply : NO_ANSWER_FALLBACK;
   if (result.reply.length === 0) {
     log.error(
-      { phone: ctx.phone, role: ctx.role, subtype: result.stats.resultSubtype, tools: result.stats.tools },
-      "agent turn produced NO reply; sending the fallback instead of silence",
+      {
+        phone: ctx.phone,
+        role: ctx.role,
+        agentId: ctx.agentId,
+        subtype: result.stats.resultSubtype,
+        tools: result.stats.tools,
+      },
+      "agent turn produced NO reply; answering with the fallback instead of silence",
     );
   }
-  await channel.sendText(ctx.phone, reply);
   return reply;
 }

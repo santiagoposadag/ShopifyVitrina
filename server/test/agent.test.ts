@@ -3,9 +3,12 @@ import type { Config } from "../src/config.js";
 import { openDb, type DB } from "../src/data/db.js";
 import type { WhatsAppChannel } from "../src/whatsapp/channel.js";
 import { getSessionId, setSessionId } from "../src/data/repo.js";
+import { Responders } from "../src/egress/responder.js";
+import { whatsappPrincipal } from "../src/inbox/envelope.js";
+import { agentIdForRole } from "../src/router.js";
 import { CatalogCache } from "../src/shopify/cache.js";
 import { ShopifyClient } from "../src/shopify/client.js";
-import type { TurnContext } from "../src/types.js";
+import type { Role, TurnContext } from "../src/types.js";
 
 // Only `query` is faked; tools.ts imports createSdkMcpServer/tool from the same
 // module and needs the real ones to build the MCP server.
@@ -18,7 +21,23 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importActual) => ({
 const { runAgentTurn, systemPrompt, NO_ANSWER_FALLBACK } = await import("../src/agent/agent.js");
 
 const PHONE = "573001112233";
-const CTX: TurnContext = { phone: PHONE, role: "customer", turnKey: "msg:1" };
+
+/**
+ * A turn context exactly as the batcher builds one for a WhatsApp burst: the
+ * conversation key IS the phone on this door, and the agent id comes from the
+ * role rather than from anything the person wrote.
+ */
+function ctxFor(role: Role): TurnContext {
+  return {
+    phone: PHONE,
+    role,
+    agentId: agentIdForRole(role),
+    conversationKey: PHONE,
+    turnKey: "msg:1",
+  };
+}
+
+const CTX: TurnContext = ctxFor("customer");
 
 const CONFIG: Config = {
   anthropicApiKey: "sk-test",
@@ -94,6 +113,26 @@ function fakeChannel(sent: string[]): WhatsAppChannel {
   };
 }
 
+/**
+ * What index.ts's onMessage does now: run the turn, then hand the reply to the
+ * responder for the principal that asked.
+ *
+ * Every "the person got exactly one message" assertion in this file goes through
+ * this helper on purpose. The runtime no longer sends — it returns — so pinning
+ * delivery inside the turn would pin nothing at all; the guarantee only exists
+ * end to end, and this is the smallest composition that has both halves.
+ */
+async function runAndRespond(
+  deps: Parameters<typeof runAgentTurn>[0],
+  ctx: TurnContext,
+  text: string,
+  channel: WhatsAppChannel,
+): Promise<string> {
+  const reply = await runAgentTurn(deps, ctx, text);
+  await new Responders(channel).for(whatsappPrincipal(ctx.phone)).deliver(reply);
+  return reply;
+}
+
 /** A successful SDK stream: an assistant block plus the final result message. */
 async function* successStream(sessionId: string, reply: string): AsyncGenerator<unknown> {
   yield { type: "assistant", session_id: sessionId, message: { content: [{ type: "text", text: reply }] } };
@@ -152,6 +191,7 @@ function resumeArg(call: number): string | undefined {
 describe("runAgentTurn session fallback", () => {
   let db: DB;
   let sent: string[];
+  let channel: WhatsAppChannel;
   let warnings: number;
   let deps: Parameters<typeof runAgentTurn>[0];
 
@@ -159,6 +199,7 @@ describe("runAgentTurn session fallback", () => {
     queryMock.mockReset();
     db = openDb(":memory:");
     sent = [];
+    channel = fakeChannel(sent);
     warnings = 0;
     deps = {
       db,
@@ -169,7 +210,6 @@ describe("runAgentTurn session fallback", () => {
         },
         info: () => undefined,
       } as never,
-      channel: fakeChannel(sent),
       shopify: SHOPIFY,
       cache: CACHE,
     };
@@ -180,10 +220,10 @@ describe("runAgentTurn session fallback", () => {
   });
 
   it("resumes the stored session and does not retry when it works", async () => {
-    setSessionId(db, PHONE, "session-abc");
+    setSessionId(db, CTX.agentId, PHONE, "session-abc");
     queryMock.mockReturnValueOnce(successStream("session-abc", "Hola"));
 
-    const reply = await runAgentTurn(deps, CTX, "hola");
+    const reply = await runAndRespond(deps, CTX, "hola", channel);
 
     expect(reply).toBe("Hola");
     expect(queryMock).toHaveBeenCalledTimes(1);
@@ -195,11 +235,11 @@ describe("runAgentTurn session fallback", () => {
   it("retries exactly once without resume when the stored session is gone", async () => {
     // The container was recreated: SQLite still has the id, but the SDK's
     // transcript for it died with the old overlay filesystem.
-    setSessionId(db, PHONE, "session-dead");
+    setSessionId(db, CTX.agentId, PHONE, "session-dead");
     queryMock.mockReturnValueOnce(exitingStream());
     queryMock.mockReturnValueOnce(successStream("session-fresh", "Hola de nuevo"));
 
-    const reply = await runAgentTurn(deps, CTX, "hola");
+    const reply = await runAndRespond(deps, CTX, "hola", channel);
 
     expect(reply).toBe("Hola de nuevo");
     expect(queryMock).toHaveBeenCalledTimes(2);
@@ -210,13 +250,13 @@ describe("runAgentTurn session fallback", () => {
   });
 
   it("persists the new session id from the successful fresh run", async () => {
-    setSessionId(db, PHONE, "session-dead");
+    setSessionId(db, CTX.agentId, PHONE, "session-dead");
     queryMock.mockReturnValueOnce(exitingStream());
     queryMock.mockReturnValueOnce(successStream("session-fresh", "Hola"));
 
     await runAgentTurn(deps, CTX, "hola");
 
-    expect(getSessionId(db, PHONE)).toBe("session-fresh");
+    expect(getSessionId(db, CTX.agentId, PHONE)).toBe("session-fresh");
   });
 
   it("does NOT retry when no resume id was in play — a real error must surface", async () => {
@@ -231,11 +271,11 @@ describe("runAgentTurn session fallback", () => {
   });
 
   it("propagates the error when the fresh retry also fails, without looping", async () => {
-    setSessionId(db, PHONE, "session-dead");
+    setSessionId(db, CTX.agentId, PHONE, "session-dead");
     queryMock.mockReturnValueOnce(exitingStream());
     queryMock.mockReturnValueOnce(exitingStream());
 
-    await expect(runAgentTurn(deps, CTX, "hola")).rejects.toThrow(
+    await expect(runAndRespond(deps, CTX, "hola", channel)).rejects.toThrow(
       "Claude Code process exited with code 1",
     );
     expect(queryMock).toHaveBeenCalledTimes(2); // one retry, never a loop
@@ -243,17 +283,17 @@ describe("runAgentTurn session fallback", () => {
   });
 
   it("clears the stale session id so a replayed message does not resume it again", async () => {
-    setSessionId(db, PHONE, "session-dead");
+    setSessionId(db, CTX.agentId, PHONE, "session-dead");
     queryMock.mockReturnValueOnce(exitingStream());
     queryMock.mockReturnValueOnce(exitingStream()); // retry fails too
 
     await expect(runAgentTurn(deps, CTX, "hola")).rejects.toThrow();
 
-    expect(getSessionId(db, PHONE)).toBeUndefined();
+    expect(getSessionId(db, CTX.agentId, PHONE)).toBeUndefined();
   });
 
   it("retries when query() throws synchronously rather than mid-stream", async () => {
-    setSessionId(db, PHONE, "session-dead");
+    setSessionId(db, CTX.agentId, PHONE, "session-dead");
     queryMock.mockImplementationOnce(() => {
       throw new Error("spawn failed");
     });
@@ -408,17 +448,18 @@ describe("systemPrompt customer conversation style", () => {
 describe("runAgentTurn session reset after publish", () => {
   let db: DB;
   let sent: string[];
+  let channel: WhatsAppChannel;
   let deps: Parameters<typeof runAgentTurn>[0];
 
   beforeEach(() => {
     queryMock.mockReset();
     db = openDb(":memory:");
     sent = [];
+    channel = fakeChannel(sent);
     deps = {
       db,
       config: CONFIG,
       log: { warn: () => undefined, info: () => undefined } as never,
-      channel: fakeChannel(sent),
       shopify: SHOPIFY,
       cache: CACHE,
     };
@@ -430,35 +471,35 @@ describe("runAgentTurn session reset after publish", () => {
 
   it("clears the stored session instead of persisting when a tool requested a reset", async () => {
     // Fresh ctx per test: the flag mutates it, exactly as the tool does.
-    const ctx: TurnContext = { phone: PHONE, role: "owner", turnKey: "msg:1" };
-    setSessionId(db, PHONE, "session-abc");
+    const ctx: TurnContext = ctxFor("owner");
+    setSessionId(db, ctx.agentId, PHONE, "session-abc");
     queryMock.mockImplementationOnce(() => {
       ctx.sessionAfterTurn = "reset"; // upsert_product on a publish transition
       return successStream("session-new", "Listo, publiqué el código 0195");
     });
 
-    const reply = await runAgentTurn(deps, ctx, "publícalo");
+    const reply = await runAndRespond(deps, ctx, "publícalo", channel);
 
     expect(reply).toBe("Listo, publiqué el código 0195");
     expect(sent).toEqual(["Listo, publiqué el código 0195"]); // the reply still goes out
-    expect(getSessionId(db, PHONE)).toBeUndefined(); // cleared, NOT replaced by session-new
+    expect(getSessionId(db, ctx.agentId, PHONE)).toBeUndefined(); // cleared, NOT replaced by session-new
   });
 
   it("without the flag, the new session id is persisted as before", async () => {
-    const ctx: TurnContext = { phone: PHONE, role: "owner", turnKey: "msg:1" };
+    const ctx: TurnContext = ctxFor("owner");
     queryMock.mockReturnValueOnce(successStream("session-new", "Hola"));
 
     await runAgentTurn(deps, ctx, "hola");
 
-    expect(getSessionId(db, PHONE)).toBe("session-new");
+    expect(getSessionId(db, ctx.agentId, PHONE)).toBe("session-new");
   });
 
   it("keeps the reset when the resume failed and the fresh retry published", async () => {
     // Attempt 1 resumes a dead session but its tools already committed the
     // publish before dying — the reset must stick regardless of which attempt
     // confirmed it.
-    const ctx: TurnContext = { phone: PHONE, role: "owner", turnKey: "msg:1" };
-    setSessionId(db, PHONE, "session-dead");
+    const ctx: TurnContext = ctxFor("owner");
+    setSessionId(db, ctx.agentId, PHONE, "session-dead");
     queryMock.mockReturnValueOnce(exitingStream());
     queryMock.mockImplementationOnce(() => {
       ctx.sessionAfterTurn = "reset";
@@ -467,7 +508,7 @@ describe("runAgentTurn session reset after publish", () => {
 
     await runAgentTurn(deps, ctx, "publícalo");
 
-    expect(getSessionId(db, PHONE)).toBeUndefined();
+    expect(getSessionId(db, ctx.agentId, PHONE)).toBeUndefined();
   });
 });
 
@@ -516,7 +557,6 @@ describe("runAgentTurn tool accounting", () => {
         warn: () => undefined,
         error: () => undefined,
       },
-      channel: fakeChannel([]),
       shopify: SHOPIFY,
       cache: CACHE,
     } as never;
@@ -529,7 +569,7 @@ describe("runAgentTurn tool accounting", () => {
   it("reports a tool the model called, WITHOUT canUseTool ever firing", async () => {
     queryMock.mockReturnValueOnce(toolStream("s1", "Tenemos citronela desde $13.800"));
 
-    await runAgentTurn(deps, { phone: PHONE, role: "customer", turnKey: "msg:1" }, "¿citronela?");
+    await runAgentTurn(deps, ctxFor("customer"), "¿citronela?");
 
     // The turn summary carries it, stripped of the mcp__vitrina__ prefix.
     const summary = logged.find((o) => o.tools !== undefined);
@@ -541,7 +581,7 @@ describe("runAgentTurn tool accounting", () => {
   it("reports (empty) only when the model really called nothing", async () => {
     queryMock.mockReturnValueOnce(successStream("s1", "Hola"));
 
-    await runAgentTurn(deps, { phone: PHONE, role: "customer", turnKey: "msg:1" }, "hola");
+    await runAgentTurn(deps, ctxFor("customer"), "hola");
 
     expect(logged.find((o) => o.tools !== undefined)?.tools).toBe("");
   });
@@ -565,12 +605,11 @@ describe("runAgentTurn tool surface", () => {
       db,
       config: CONFIG,
       log: { warn: () => undefined, info: () => undefined, error: () => undefined },
-      channel: fakeChannel([]),
       shopify: SHOPIFY,
       cache: CACHE,
     } as never as Parameters<typeof runAgentTurn>[0];
 
-    await runAgentTurn(deps, { phone: PHONE, role: "owner", turnKey: "msg:1" }, "hola");
+    await runAgentTurn(deps, ctxFor("owner"), "hola");
 
     const [{ options }] = queryMock.mock.calls[0] as [{ options: { tools?: unknown } }];
     expect(options.tools).toEqual([]);
@@ -584,12 +623,11 @@ describe("runAgentTurn tool surface", () => {
       db,
       config: CONFIG,
       log: { warn: () => undefined, info: () => undefined, error: () => undefined },
-      channel: fakeChannel([]),
       shopify: SHOPIFY,
       cache: CACHE,
     } as never as Parameters<typeof runAgentTurn>[0];
 
-    await runAgentTurn(deps, { phone: PHONE, role: "owner", turnKey: "msg:1" }, "hola");
+    await runAgentTurn(deps, ctxFor("owner"), "hola");
 
     const [{ options }] = queryMock.mock.calls[0] as [{ options: { allowedTools?: string[] } }];
     expect(options.allowedTools?.length).toBeGreaterThan(0);
@@ -600,6 +638,7 @@ describe("runAgentTurn tool surface", () => {
 describe("runAgentTurn never answers with silence", () => {
   let db: DB;
   let sent: string[];
+  let channel: WhatsAppChannel;
   let errors: { subtype?: string }[];
   let deps: Parameters<typeof runAgentTurn>[0];
 
@@ -607,6 +646,7 @@ describe("runAgentTurn never answers with silence", () => {
     queryMock.mockReset();
     db = openDb(":memory:");
     sent = [];
+    channel = fakeChannel(sent);
     errors = [];
     deps = {
       db,
@@ -618,7 +658,6 @@ describe("runAgentTurn never answers with silence", () => {
           errors.push(o);
         },
       } as never,
-      channel: fakeChannel(sent),
       shopify: SHOPIFY,
       cache: CACHE,
     };
@@ -629,10 +668,10 @@ describe("runAgentTurn never answers with silence", () => {
   });
 
   it("sends the fallback when the turn cap leaves no reply", async () => {
-    const ctx: TurnContext = { phone: PHONE, role: "owner", turnKey: "msg:1" };
+    const ctx: TurnContext = ctxFor("owner");
     queryMock.mockReturnValueOnce(turnCapStream("session-abc"));
 
-    const reply = await runAgentTurn(deps, ctx, "¿qué productos tengo?");
+    const reply = await runAndRespond(deps, ctx, "¿qué productos tengo?", channel);
 
     expect(reply).toBe(NO_ANSWER_FALLBACK);
     expect(sent).toEqual([NO_ANSWER_FALLBACK]); // exactly one message, never zero
@@ -641,7 +680,7 @@ describe("runAgentTurn never answers with silence", () => {
   it("logs the empty turn at ERROR with the subtype that caused it", async () => {
     // Without this the line reads "agent turn complete" like any other, with
     // the same duration and token counts as a turn that actually answered.
-    const ctx: TurnContext = { phone: PHONE, role: "owner", turnKey: "msg:1" };
+    const ctx: TurnContext = ctxFor("owner");
     queryMock.mockReturnValueOnce(turnCapStream("session-abc"));
 
     await runAgentTurn(deps, ctx, "¿qué productos tengo?");
@@ -651,12 +690,139 @@ describe("runAgentTurn never answers with silence", () => {
   });
 
   it("does NOT use the fallback when the turn produced a real reply", async () => {
-    const ctx: TurnContext = { phone: PHONE, role: "owner", turnKey: "msg:1" };
+    const ctx: TurnContext = ctxFor("owner");
     queryMock.mockReturnValueOnce(successStream("session-abc", "Tienes 3 productos"));
 
     const reply = await runAgentTurn(deps, ctx, "¿qué productos tengo?");
 
     expect(reply).toBe("Tienes 3 productos");
     expect(errors).toEqual([]);
+  });
+});
+
+/**
+ * The runtime seam: a turn RETURNS its reply and delivers nothing.
+ *
+ * The runtime used to call channel.sendText itself, which made the reply
+ * address a property of the agent loop — there was no way to answer anyone but
+ * a WhatsApp phone, and no way to test the loop without a transport. Returning
+ * is what lets the caller decide where the answer goes.
+ */
+describe("runAgentTurn returns the reply", () => {
+  let db: DB;
+  let deps: Parameters<typeof runAgentTurn>[0];
+
+  beforeEach(() => {
+    queryMock.mockReset();
+    db = openDb(":memory:");
+    deps = {
+      db,
+      config: CONFIG,
+      log: { warn: () => undefined, info: () => undefined, error: () => undefined } as never,
+      shopify: SHOPIFY,
+      cache: CACHE,
+    };
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("hands the reply back and puts nothing on the wire itself", async () => {
+    // deps carries no channel at all — the structural half of this guarantee is
+    // that AgentDeps no longer has the field. The recorder below is wired only
+    // to the responder, so anything arriving in it before deliver() is called
+    // could only have come from the runtime reaching around the seam.
+    const sent: string[] = [];
+    const channel = fakeChannel(sent);
+    queryMock.mockReturnValueOnce(successStream("s1", "Tenemos citronela"));
+
+    const reply = await runAgentTurn(deps, CTX, "¿citronela?");
+
+    expect(reply).toBe("Tenemos citronela");
+    expect(sent).toEqual([]);
+
+    await new Responders(channel).for(whatsappPrincipal(PHONE)).deliver(reply);
+    expect(sent).toEqual(["Tenemos citronela"]);
+  });
+
+  // The empty-turn fallback used to be delivered from inside the runtime. It
+  // has to survive the move: a turn that produced no words still owes the
+  // person an answer, and now the caller is the one that owes it.
+  it("returns the fallback for a wordless turn, so the caller can still answer", async () => {
+    queryMock.mockReturnValueOnce(turnCapStream("s1"));
+
+    expect(await runAgentTurn(deps, CTX, "¿qué tienes?")).toBe(NO_ANSWER_FALLBACK);
+  });
+});
+
+/**
+ * Sessions are resumed and persisted by (agentId, conversationKey).
+ *
+ * One phone can reach both assistants. Keyed by phone alone, a sales turn would
+ * resume the inventory assistant's transcript — the customer answered out of
+ * the owner's half-finished listing.
+ */
+describe("runAgentTurn session key", () => {
+  let db: DB;
+  let deps: Parameters<typeof runAgentTurn>[0];
+
+  beforeEach(() => {
+    queryMock.mockReset();
+    db = openDb(":memory:");
+    deps = {
+      db,
+      config: CONFIG,
+      log: { warn: () => undefined, info: () => undefined, error: () => undefined } as never,
+      shopify: SHOPIFY,
+      cache: CACHE,
+    };
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("does not resume another agent's session for the same phone", async () => {
+    setSessionId(db, agentIdForRole("owner"), PHONE, "session-inventario");
+    queryMock.mockReturnValueOnce(successStream("session-ventas", "Hola"));
+
+    await runAgentTurn(deps, ctxFor("customer"), "hola");
+
+    expect(resumeArg(0)).toBeUndefined();
+  });
+
+  it("resumes the session stored for its own agent", async () => {
+    setSessionId(db, agentIdForRole("customer"), PHONE, "session-ventas");
+    queryMock.mockReturnValueOnce(successStream("session-ventas", "Hola"));
+
+    await runAgentTurn(deps, ctxFor("customer"), "hola");
+
+    expect(resumeArg(0)).toBe("session-ventas");
+  });
+
+  it("persists the new id under its own agent and leaves the other alone", async () => {
+    setSessionId(db, agentIdForRole("owner"), PHONE, "session-inventario");
+    queryMock.mockReturnValueOnce(successStream("session-ventas", "Hola"));
+
+    await runAgentTurn(deps, ctxFor("customer"), "hola");
+
+    expect(getSessionId(db, agentIdForRole("customer"), PHONE)).toBe("session-ventas");
+    expect(getSessionId(db, agentIdForRole("owner"), PHONE)).toBe("session-inventario");
+  });
+});
+
+/**
+ * The temporary role → agent id mapping.
+ *
+ * Pinned by literal because these two ids are written into the database by the
+ * legacy-session migration and read back by every resume. Phase 2 replaces the
+ * function with a definition-backed router; the ids themselves must not drift
+ * in the meantime, or every stored session becomes unreachable in silence.
+ */
+describe("agentIdForRole", () => {
+  it("routes the owner to the inventory agent and everyone else to sales", () => {
+    expect(agentIdForRole("owner")).toBe("vitrina-inventario");
+    expect(agentIdForRole("customer")).toBe("vitrina-ventas");
   });
 });

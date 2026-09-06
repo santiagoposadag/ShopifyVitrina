@@ -12,7 +12,7 @@ import {
   type MessageKind,
 } from "../src/inbox/batcher.js";
 import { openDb, type DB } from "../src/data/db.js";
-import { PerPhoneQueue } from "../src/inbox/queue.js";
+import { PerConversationQueue } from "../src/inbox/queue.js";
 import { getInboxRow, insertInboxMessage, listPendingMedia } from "../src/data/repo.js";
 import type { TurnContext } from "../src/types.js";
 
@@ -29,7 +29,7 @@ interface Harness {
   db: DB;
   batcher: InboxBatcher;
   /** Exposed so a test can wait for the flush chain to actually drain. */
-  queue: PerPhoneQueue;
+  queue: PerConversationQueue;
   /** One entry per agent turn: exactly what the agent was asked to answer. */
   turns: { phone: string; role: TurnContext["role"]; text: string }[];
   /** One entry per failed attempt, in order — final marks the terminal one. */
@@ -40,7 +40,7 @@ function harness(overrides: Partial<InboxBatcherDeps> = {}): Harness {
   const db = openDb(":memory:");
   const turns: Harness["turns"] = [];
   const failures: Harness["failures"] = [];
-  const queue = new PerPhoneQueue();
+  const queue = new PerConversationQueue();
   const batcher = new InboxBatcher({
     db,
     queue,
@@ -656,7 +656,7 @@ describe("voice notes", () => {
    * starved thread can take a while to get its I/O completion back.
    */
   async function drain(h: Harness): Promise<void> {
-    for (let i = 0; i < 500 && h.queue.activePhones > 0; i++) {
+    for (let i = 0; i < 500 && h.queue.activeConversations > 0; i++) {
       await realEventLoopTurn();
       await vi.advanceTimersByTimeAsync(0);
     }
@@ -792,7 +792,7 @@ describe("deferred inbound media", () => {
   });
 
   async function drain(h: Harness): Promise<void> {
-    for (let i = 0; i < 500 && h.queue.activePhones > 0; i++) {
+    for (let i = 0; i < 500 && h.queue.activeConversations > 0; i++) {
       await realEventLoopTurn();
       await vi.advanceTimersByTimeAsync(0);
     }

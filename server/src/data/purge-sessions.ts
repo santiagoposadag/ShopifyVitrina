@@ -1,6 +1,7 @@
 import { loadDotEnv, loadOwnerPhoneNumbers, resolveDataPath } from "../config.js";
+import { agentIdForPhone } from "../router.js";
 import { openDb } from "./db.js";
-import { purgeCustomerSessions } from "./purge.js";
+import { assertOwnerAllowlist, purgeCustomerSessions } from "./purge.js";
 import { transcriptsDir } from "./transcripts.js";
 
 /**
@@ -31,7 +32,20 @@ async function main(): Promise<void> {
   };
   const root = transcriptsDir();
 
-  const db = openDb(dbPath);
+  // BEFORE opening the database, not after. Opening it runs the schema
+  // migration, and a database from an older build has its sessions keyed by
+  // phone alone — so the migration is where those rows are assigned to an
+  // agent, using this same allowlist. With an empty one it would file the
+  // owner's session under the customer agent, and the refusal inside
+  // purgeCustomerSessions would then be guarding a decision already made.
+  assertOwnerAllowlist(config);
+
+  // Resolved, not dropped: this tool's entire contract is that owner sessions
+  // survive it, and opening the database without a resolver would delete every
+  // legacy session — the owner's included — before the purge ran at all. The
+  // mapping is the server's own, so a session migrated here is one the server
+  // will still find.
+  const db = openDb(dbPath, { legacyAgentIdFor: (phone) => agentIdForPhone(config, phone) });
   try {
     const { purged, kept, swept } = purgeCustomerSessions(db, config, root);
     console.log(`Purged ${purged} customer session(s); kept ${kept} owner session(s).`);

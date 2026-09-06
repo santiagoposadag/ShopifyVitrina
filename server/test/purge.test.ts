@@ -4,7 +4,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb, type DB } from "../src/data/db.js";
 import { getSessionId, setSessionId } from "../src/data/repo.js";
-import { purgeCustomerSessions, type PurgeConfig } from "../src/data/purge.js";
+import {
+  assertOwnerAllowlist,
+  purgeCustomerSessions,
+  type PurgeConfig,
+} from "../src/data/purge.js";
+import { agentIdForRole } from "../src/router.js";
+
+/**
+ * The purge judges a session by its CONVERSATION KEY, which on the WhatsApp
+ * door is the phone. The agent id it is stored under is therefore incidental to
+ * the decision — and these fixtures use the real one for each role so the
+ * fixture cannot pass by accident under a mapping that no longer matches.
+ */
+const INVENTORY = agentIdForRole("owner");
+const SALES = agentIdForRole("customer");
 
 const OWNER = "573001110000";
 const CUSTOMER = "573002220000";
@@ -38,8 +52,8 @@ function transcriptExists(sessionId: string): boolean {
 beforeEach(() => {
   db = openDb(":memory:");
   root = mkdtempSync(join(tmpdir(), "vitrina-purge-"));
-  setSessionId(db, OWNER, OWNER_SESSION);
-  setSessionId(db, CUSTOMER, CUSTOMER_SESSION);
+  setSessionId(db, INVENTORY, OWNER, OWNER_SESSION);
+  setSessionId(db, SALES, CUSTOMER, CUSTOMER_SESSION);
   seedTranscript(OWNER_SESSION);
   seedTranscript(CUSTOMER_SESSION);
 });
@@ -58,8 +72,8 @@ describe("purgeCustomerSessions role boundary", () => {
     const result = purgeCustomerSessions(db, CONFIG, root);
 
     expect(result).toMatchObject({ purged: 1, kept: 1 });
-    expect(getSessionId(db, CUSTOMER)).toBeUndefined();
-    expect(getSessionId(db, OWNER)).toBe(OWNER_SESSION);
+    expect(getSessionId(db, SALES, CUSTOMER)).toBeUndefined();
+    expect(getSessionId(db, INVENTORY, OWNER)).toBe(OWNER_SESSION);
   });
 
   it("deletes the purged customer's transcript and leaves the owner's on disk", () => {
@@ -75,7 +89,7 @@ describe("purgeCustomerSessions role boundary", () => {
     const promoted: PurgeConfig = { ...CONFIG, ownerPhoneNumbers: new Set([OWNER, CUSTOMER]) };
 
     expect(purgeCustomerSessions(db, promoted, root)).toMatchObject({ purged: 0, kept: 2 });
-    expect(getSessionId(db, CUSTOMER)).toBe(CUSTOMER_SESSION);
+    expect(getSessionId(db, SALES, CUSTOMER)).toBe(CUSTOMER_SESSION);
   });
 
   it("refuses to run at all when the owner allowlist is empty", () => {
@@ -88,14 +102,14 @@ describe("purgeCustomerSessions role boundary", () => {
     const blind: PurgeConfig = { ...CONFIG, ownerPhoneNumbers: new Set() };
 
     expect(() => purgeCustomerSessions(db, blind, root)).toThrow(/OWNER_PHONE_NUMBERS is empty/);
-    expect(getSessionId(db, OWNER)).toBe(OWNER_SESSION); // nothing was touched
-    expect(getSessionId(db, CUSTOMER)).toBe(CUSTOMER_SESSION);
+    expect(getSessionId(db, INVENTORY, OWNER)).toBe(OWNER_SESSION); // nothing was touched
+    expect(getSessionId(db, SALES, CUSTOMER)).toBe(CUSTOMER_SESSION);
     expect(transcriptExists(OWNER_SESSION)).toBe(true);
   });
 
   it("purges every customer, not just the first", () => {
     const second = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
-    setSessionId(db, OTHER_CUSTOMER, second);
+    setSessionId(db, SALES, OTHER_CUSTOMER, second);
     seedTranscript(second);
 
     expect(purgeCustomerSessions(db, CONFIG, root)).toMatchObject({ purged: 2, kept: 1 });
@@ -127,7 +141,29 @@ describe("purgeCustomerSessions transcript sweep", () => {
     const result = purgeCustomerSessions(db, CONFIG, undefined);
 
     expect(result).toMatchObject({ purged: 1, swept: null });
-    expect(getSessionId(db, CUSTOMER)).toBeUndefined();
+    expect(getSessionId(db, SALES, CUSTOMER)).toBeUndefined();
     expect(transcriptExists(CUSTOMER_SESSION)).toBe(true); // untouched on disk
+  });
+});
+
+/**
+ * The refusal, on its own.
+ *
+ * It is exported and called a second time by the ops entry point BEFORE it
+ * opens the database, because opening the database now runs the session
+ * migration — which asks this same allowlist which agent owned each legacy row.
+ * An empty one there would file the owner's session under the customer agent,
+ * and the check inside purgeCustomerSessions would then be guarding a decision
+ * that had already been made.
+ */
+describe("assertOwnerAllowlist", () => {
+  it("refuses an empty allowlist", () => {
+    expect(() => assertOwnerAllowlist({ ...CONFIG, ownerPhoneNumbers: new Set() })).toThrow(
+      /OWNER_PHONE_NUMBERS is empty/,
+    );
+  });
+
+  it("passes when the allowlist can tell owner from customer", () => {
+    expect(() => assertOwnerAllowlist(CONFIG)).not.toThrow();
   });
 });

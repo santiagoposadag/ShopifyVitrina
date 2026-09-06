@@ -171,14 +171,14 @@ describe("inbox batch claim", () => {
 describe("session expiry", () => {
   it("returns the session while fresh and expires it after maxAgeDays", () => {
     const db = openDb(":memory:");
-    setSessionId(db, "573001", "session-abc");
-    expect(getSessionId(db, "573001", 7)).toBe("session-abc");
+    setSessionId(db, "vitrina-ventas", "573001", "session-abc");
+    expect(getSessionId(db, "vitrina-ventas", "573001", 7)).toBe("session-abc");
 
-    db.prepare(`UPDATE sessions SET updated_at = datetime('now', '-10 days') WHERE phone = ?`).run(
-      "573001",
-    );
-    expect(getSessionId(db, "573001", 7)).toBeUndefined(); // expired → fresh conversation
-    expect(getSessionId(db, "573001")).toBe("session-abc"); // no max age → still stored
+    db.prepare(
+      `UPDATE sessions SET updated_at = datetime('now', '-10 days') WHERE conversation_key = ?`,
+    ).run("573001");
+    expect(getSessionId(db, "vitrina-ventas", "573001", 7)).toBeUndefined(); // expired → fresh conversation
+    expect(getSessionId(db, "vitrina-ventas", "573001")).toBe("session-abc"); // no max age → still stored
     db.close();
   });
 });

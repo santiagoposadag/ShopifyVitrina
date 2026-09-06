@@ -5,15 +5,40 @@ import { dirname } from "node:path";
 export type DB = Database.Database;
 
 /**
+ * How a database written by an older build is brought forward, where bringing
+ * it forward needs a decision this module cannot make on its own.
+ */
+export interface SchemaOptions {
+  /**
+   * Which agent owned a pre-existing session, given the phone it was stored
+   * under. Sessions used to be keyed by phone alone, so a legacy row names a
+   * person and not an assistant — and nothing in this file can see the owner
+   * allowlist that decides which of the two they were talking to.
+   *
+   * SUPPLIED: each legacy row is copied to (resolver(phone), phone) and the
+   * conversation continues across the upgrade.
+   *
+   * OMITTED: legacy rows are DROPPED. That is the deliberate choice, not an
+   * oversight — guessing the agent hands one person's transcript to the wrong
+   * assistant, which the owner cannot detect and which reads as the assistant
+   * inventing context. Dropping costs one conversation's history, and that cost
+   * is already paid routinely: a resume whose transcript is gone falls back to a
+   * fresh session and answers anyway. Every caller that cannot resolve a role
+   * (backup, the purge tool, tests) omits it; the server MUST pass it.
+   */
+  legacyAgentIdFor?: (phone: string) => string;
+}
+
+/**
  * Open the SQLite database, enable WAL, and create the schema if needed.
  * Safe to call multiple times (schema uses IF NOT EXISTS).
  */
-export function openDb(dbPath: string): DB {
+export function openDb(dbPath: string, options: SchemaOptions = {}): DB {
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
-  createSchema(db);
+  createSchema(db, options);
   return db;
 }
 
@@ -23,7 +48,7 @@ export function openDb(dbPath: string): DB {
  * what Shopify has no place for: the durable inbox, agent sessions, the leads
  * the assistant captures, and inbound photos on their way to a product.
  */
-export function createSchema(db: DB): void {
+export function createSchema(db: DB, options: SchemaOptions = {}): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS contacts (
       phone TEXT PRIMARY KEY,
@@ -46,10 +71,21 @@ export function createSchema(db: DB): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- One resumable agent conversation, keyed by WHICH ASSISTANT and WHICH
+    -- CONVERSATION rather than by phone: one person can hold a conversation
+    -- with more than one agent, and sharing a session id between them would
+    -- resume the wrong transcript into the wrong persona.
+    --
+    -- conversation_key is the phone for a WhatsApp principal and a correlation
+    -- id for an agent-to-agent exchange. A database created before this shape
+    -- existed is rebuilt by migrateSessionsKey below — IF NOT EXISTS does not
+    -- reach an existing table, and a PRIMARY KEY cannot be ALTERed.
     CREATE TABLE IF NOT EXISTS sessions (
-      phone TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      conversation_key TEXT NOT NULL,
       agent_session_id TEXT,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (agent_id, conversation_key)
     );
 
     -- Persisted inbound messages (at-least-once processing). The UNIQUE
@@ -122,7 +158,7 @@ export function createSchema(db: DB): void {
     CREATE INDEX IF NOT EXISTS idx_pending_media_phone ON pending_media(phone);
   `);
 
-  migrate(db);
+  migrate(db, options);
 }
 
 /**
@@ -133,7 +169,7 @@ export function createSchema(db: DB): void {
  * pilot would keep its original table and every query naming the new column
  * would throw at runtime. Each step here is idempotent and runs on every boot.
  */
-function migrate(db: DB): void {
+function migrate(db: DB, options: SchemaOptions): void {
   // Added when a captioned photo was found to be indistinguishable from chat:
   // the caption is stored as agent_text, so the photo signal had to become data.
   // Existing rows default to 'text', which is exactly how they read today.
@@ -163,6 +199,79 @@ function migrate(db: DB): void {
   addColumn(db, "inbox", "media_mime", "TEXT");
   addColumn(db, "inbox", "media_name", "TEXT");
   addColumn(db, "inbox", "media_sent_at", "INTEGER");
+  // The one step that is not a column: sessions changed their primary key.
+  migrateSessionsKey(db, options.legacyAgentIdFor);
+}
+
+/**
+ * Re-key `sessions` from (phone) to (agent_id, conversation_key).
+ *
+ * A REBUILD, because neither tool available does the job: CREATE TABLE IF NOT
+ * EXISTS is a no-op against the table that is already there, and SQLite's ALTER
+ * TABLE cannot add, drop or change a primary key. So: create, copy, drop,
+ * rename — the sequence SQLite's own documentation prescribes for this.
+ *
+ * IDEMPOTENT BY THE SHAPE ITSELF, not by a version counter. The guard is the
+ * presence of `conversation_key`, a column that exists only after this has run,
+ * so a second boot returns before touching anything. That matters more than it
+ * looks: a rebuild that ran twice would find an empty legacy table the second
+ * time and replace every session migrated by the first, silently resetting
+ * every live conversation on the next redeploy.
+ *
+ * The check and the rebuild share ONE immediate transaction. A deferred one
+ * takes its read lock first and can only discover a competing writer when it
+ * tries to upgrade, which — with two servers pointed at the same file — is how
+ * one process reads the old shape, waits, and then copies from a table that has
+ * already been replaced. Taking the write lock up front makes the loser block
+ * on it and then re-read the shape inside the lock, where it sees the migration
+ * is done and does nothing.
+ */
+function migrateSessionsKey(db: DB, legacyAgentIdFor?: (phone: string) => string): void {
+  const rebuild = db.transaction(() => {
+    const columns = db.prepare(`PRAGMA table_info(sessions)`).all() as { name: string }[];
+    // Already re-keyed (or created fresh at the new shape) — nothing to do.
+    if (columns.some((c) => c.name === "conversation_key")) return;
+
+    const legacy = legacyAgentIdFor
+      ? (db.prepare(`SELECT phone, agent_session_id, updated_at FROM sessions`).all() as {
+          phone: string;
+          agent_session_id: string | null;
+          updated_at: string;
+        }[])
+      : [];
+
+    db.exec(`
+      CREATE TABLE sessions_rekeyed (
+        agent_id TEXT NOT NULL,
+        conversation_key TEXT NOT NULL,
+        agent_session_id TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (agent_id, conversation_key)
+      );
+    `);
+
+    const insert = db.prepare(
+      `INSERT INTO sessions_rekeyed (agent_id, conversation_key, agent_session_id, updated_at)
+       VALUES (?, ?, ?, ?)`,
+    );
+    for (const row of legacy) {
+      // updated_at is carried over VERBATIM. Expiry is a sliding window
+      // measured from it, so stamping the copies with now() would resurrect
+      // every session the window had already retired and drag months of
+      // history — and its cost — back into the next turn.
+      //
+      // A plain INSERT: the source key was a primary key, so two rows cannot
+      // collide here. If one somehow does, the whole transaction rolls back
+      // with the legacy table intact and the boot fails loudly, which is the
+      // safe direction to fail in.
+      insert.run(legacyAgentIdFor!(row.phone), row.phone, row.agent_session_id, row.updated_at);
+    }
+
+    db.exec(`DROP TABLE sessions;`);
+    db.exec(`ALTER TABLE sessions_rekeyed RENAME TO sessions;`);
+  });
+
+  rebuild.immediate();
 }
 
 /** Add a column unless the table already has it. Table/column names are literals. */

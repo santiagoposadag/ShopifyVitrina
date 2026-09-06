@@ -1,7 +1,7 @@
 import { unlink } from "node:fs/promises";
 import type { FastifyBaseLogger } from "fastify";
 import type { DB } from "../data/db.js";
-import type { PerPhoneQueue } from "./queue.js";
+import type { PerConversationQueue } from "./queue.js";
 import {
   addPendingMedia,
   claimInboxBatch,
@@ -14,6 +14,7 @@ import {
   setInboxTranscript,
   type InboxRow,
 } from "../data/repo.js";
+import { agentIdForRole } from "../router.js";
 import type { MessageKind, TurnContext } from "../types.js";
 
 /**
@@ -128,7 +129,7 @@ export interface InboundMediaStore {
 
 export interface InboxBatcherDeps {
   db: DB;
-  queue: PerPhoneQueue;
+  queue: PerConversationQueue;
   /** Only the level the batcher uses — a failed batch is already handled. */
   log: Pick<FastifyBaseLogger, "error" | "info">;
   /** Silence, in ms, that ends a text-only burst. Every message resets it. */
@@ -449,9 +450,15 @@ export class InboxBatcher {
   }
 
   /**
-   * Close the burst and hand it to the phone's queue. Clearing the timer state
-   * BEFORE enqueuing is what lets messages arriving during the agent turn open
-   * the next burst instead of being swallowed by this one.
+   * Close the burst and hand it to the conversation's queue. Clearing the timer
+   * state BEFORE enqueuing is what lets messages arriving during the agent turn
+   * open the next burst instead of being swallowed by this one.
+   *
+   * The phone IS the conversation key on this door, so the queue key below is
+   * the same string the debounce is tracked under. Debouncing stays per phone
+   * on purpose — a burst is how a person types, not a property of the
+   * conversation — and the queue is what must never let two batches of one
+   * conversation overlap.
    */
   private flush(phone: string): void {
     const timers = this.timers.get(phone);
@@ -459,8 +466,8 @@ export class InboxBatcher {
     clearTimeout(timers.silence);
     clearTimeout(timers.cap);
     this.timers.delete(phone);
-    // Through the queue: batches for one phone must never overlap, and the
-    // claim below relies on that serialization. Different phones stay concurrent.
+    // Through the queue: batches for one conversation must never overlap, and
+    // claimInboxBatch relies on exactly that. Others stay concurrent.
     void this.deps.queue.enqueue(phone, () => this.processBatch(phone));
   }
 
@@ -512,7 +519,24 @@ export class InboxBatcher {
     // on a retry, so Shopify can recognise a replayed stock adjustment. Rows
     // are ordered by arrival and keep their ids, so the anchor holds.
     const turnKey = rows[0]!.dedupe_key;
-    const ctx: TurnContext = { phone, role: roleFor(phone), turnKey };
+    // This is the WhatsApp door's Envelope (inbox/envelope.ts), flattened into
+    // the shape today's runtime takes. Identity is the phone the TRANSPORT
+    // authenticated — never anything read out of the text — and the
+    // conversation key IS that phone on this door. That equality is why this
+    // module can go on debouncing per phone while the queue serializes per
+    // conversation: here they are the same string, and a burst is a human
+    // typing habit rather than a property of a conversation. Do not "simplify"
+    // the two back into one field; a door whose caller has no phone number
+    // still has conversations.
+    const role = roleFor(phone);
+    const ctx: TurnContext = {
+      phone,
+      role,
+      // Derived from the role for now; the definition router replaces this call.
+      agentId: agentIdForRole(role),
+      conversationKey: phone,
+      turnKey,
+    };
     // max, not min: a retried batch absorbs fresh rows (attempts = 1), and min
     // would let one poison row pin ever-growing batches forever. Consequence:
     // fresh messages that joined a terminally failing batch die with it —
