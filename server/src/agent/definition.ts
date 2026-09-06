@@ -163,6 +163,15 @@ function mentionsTool(text: string, toolName: string): boolean {
 export const SEARCH_KNOWLEDGE_TOOL = "search_knowledge";
 
 /**
+ * The registry key of the tool that asks another agent.
+ *
+ * Declared here for the same reason SEARCH_KNOWLEDGE_TOOL is: this module
+ * validates the pairing between that tool and `reach`, and it must stay
+ * loadable without importing the tool layer it validates.
+ */
+export const ASK_AGENT_TOOL = "ask_agent";
+
+/**
  * Tool names a piece of prose mentions that this agent was NOT given.
  *
  * Shared by the persona check below and by the knowledge loader, because a
@@ -286,6 +295,36 @@ export function validateDefinition(definition: AgentDefinition, universe: ToolUn
     );
   }
 
+  // `reach` and `ask_agent` imply each other, in BOTH directions, and each
+  // direction is a different kind of dead configuration. A reach list with no
+  // ask_agent is a permission nothing can use — it reads, to anyone auditing
+  // the file, as an agent that CAN call the agents it names. ask_agent with an
+  // empty reach is a tool the prompt will offer and that can only ever refuse,
+  // which the model reports to the person as the other assistant being
+  // unavailable rather than as a definition that forgot a line.
+  //
+  // Deliberately the same shape as the knowledge pairing above, because it is
+  // the same failure: a capability declared in one half and not the other.
+  const asksAgents = definition.tools.includes(ASK_AGENT_TOOL);
+  if (definition.reach.length > 0 && !asksAgents) {
+    errors.push(
+      `reach names ${definition.reach.length} agent(s) but tools[] does not include ` +
+        `"${ASK_AGENT_TOOL}", so this agent can never call any of them`,
+    );
+  }
+  if (asksAgents && definition.reach.length === 0) {
+    errors.push(
+      `tools[] includes "${ASK_AGENT_TOOL}" but reach is empty, ` +
+        `so the tool can only ever refuse`,
+    );
+  }
+  // An agent that reaches itself is a loop with no hop to grow: the door
+  // refuses it at request time, and a definition that declares it is a mistake
+  // worth failing the boot over rather than discovering at conversation time.
+  if (definition.reach.includes(definition.id)) {
+    errors.push(`reach names this agent itself, which is a loop rather than a capability`);
+  }
+
   for (const toolName of definition.session.resetOn) {
     if (!universe.keys.has(toolName)) {
       errors.push(`session.resetOn names "${toolName}", which is not a tool this build serves`);
@@ -310,6 +349,20 @@ export function loadAndValidateDefinitions(
     const definition = loadDefinition(agentsDir, id);
     validateDefinition(definition, universe);
     definitions.set(id, definition);
+  }
+  // Checked HERE and not in validateDefinition, because it is the only check
+  // that needs to see the other agents: a reach entry naming an agent this
+  // build does not serve is a typo that would surface as a tool refusing every
+  // call at conversation time, blaming the other assistant for not existing.
+  const known = new Set(definitions.keys());
+  for (const definition of definitions.values()) {
+    const unknown = definition.reach.filter((id) => !known.has(id));
+    if (unknown.length > 0) {
+      throw new Error(
+        `Agent definition "${definition.id}" failed validation:\n- reach names ` +
+          `${unknown.map((id) => `"${id}"`).join(", ")}, which this build does not serve`,
+      );
+    }
   }
   return definitions;
 }

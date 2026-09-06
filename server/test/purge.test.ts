@@ -10,6 +10,7 @@ import {
   type PurgeConfig,
 } from "../src/data/purge.js";
 import { agentIdForRole } from "../src/router.js";
+import { agentConversationKey } from "../src/inbox/envelope.js";
 
 /**
  * The purge judges a session by its CONVERSATION KEY, which on the WhatsApp
@@ -165,5 +166,47 @@ describe("assertOwnerAllowlist", () => {
 
   it("passes when the allowlist can tell owner from customer", () => {
     expect(() => assertOwnerAllowlist(CONFIG)).not.toThrow();
+  });
+});
+
+/**
+ * The purge was written when every conversation key was a phone. The agent door
+ * stores something no allowlist can ever match, and `isOwner` would therefore
+ * read every agent-to-agent exchange as a customer's history and delete it.
+ */
+describe("agent-to-agent sessions are not customer histories", () => {
+  const AGENT_KEY = agentConversationKey("super-agent", INVENTORY, "corr-1");
+  const AGENT_SESSION = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+
+  it("keeps a session stored under an agent conversation key", () => {
+    setSessionId(db, INVENTORY, AGENT_KEY, AGENT_SESSION);
+    seedTranscript(AGENT_SESSION);
+
+    const result = purgeCustomerSessions(db, CONFIG, root);
+
+    expect(getSessionId(db, INVENTORY, AGENT_KEY)).toBe(AGENT_SESSION);
+    expect(result).toMatchObject({ purged: 1, kept: 1, keptAgent: 1 });
+  });
+
+  // The transcript half matters as much as the row: a swept transcript is an
+  // exchange that can no longer be resumed even though its row survived.
+  it("leaves the transcript of a kept agent session alone", () => {
+    setSessionId(db, INVENTORY, AGENT_KEY, AGENT_SESSION);
+    seedTranscript(AGENT_SESSION);
+
+    purgeCustomerSessions(db, CONFIG, root);
+
+    expect(transcriptExists(AGENT_SESSION)).toBe(true);
+  });
+
+  // ONE axis: the same key without the namespace IS a plain conversation key,
+  // and a plain key that no allowlist names is a customer's.
+  it("still purges a session whose key merely looks unusual", () => {
+    setSessionId(db, SALES, "super-agent:corr-1", "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+
+    const result = purgeCustomerSessions(db, CONFIG, root);
+
+    expect(getSessionId(db, SALES, "super-agent:corr-1")).toBeUndefined();
+    expect(result).toMatchObject({ keptAgent: 0 });
   });
 });

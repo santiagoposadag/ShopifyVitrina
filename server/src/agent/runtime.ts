@@ -1,6 +1,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { FastifyBaseLogger } from "fastify";
 import type { Config } from "../config.js";
+import { principalId } from "../inbox/envelope.js";
 import type { DB } from "../data/db.js";
 import { clearSessionId, getSessionId, setSessionId } from "../data/repo.js";
 import { buildToolServer, MCP_SERVER_NAME } from "../tools/registry.js";
@@ -397,6 +398,15 @@ function logTurn(
     {
       phone: ctx.phone,
       role: ctx.role,
+      // WHO asked, for a turn that has no phone to name. An agent-door turn
+      // would otherwise log `phone: undefined, role: undefined` and be
+      // indistinguishable from a WhatsApp turn whose context was built wrong.
+      principalKind: ctx.principal.kind,
+      principalId: principalId(ctx.principal),
+      // How many agents this question passed through before it got here. A
+      // chain that is quietly costing three turns per question is invisible
+      // otherwise.
+      hop: ctx.hop,
       // Which assistant answered. Two of them share this log, and "the owner's
       // turn resumed nothing" is otherwise indistinguishable from a session
       // filed under the other agent's id.

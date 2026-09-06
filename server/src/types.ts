@@ -1,3 +1,5 @@
+import type { Principal } from "./inbox/envelope.js";
+
 export type Role = "owner" | "customer";
 
 /**
@@ -72,8 +74,36 @@ export interface InboundMessage {
 
 /** Context bound to the tools for a single inbound message turn. */
 export interface TurnContext {
-  phone: string;
-  role: Role;
+  /**
+   * WHO is asking, as the door that authenticated them stamped it.
+   *
+   * The authority for the two fields below: `phone` and `role` are conveniences
+   * derived from a WhatsApp principal and are ABSENT for any other kind, so a
+   * consumer that branches on the principal reads the same truth the envelope
+   * carries, while one that reaches for a phone finds `undefined` and has to
+   * say what it means. That is deliberate — a rate limiter keyed on an absent
+   * phone throttles every agent caller at once, and it does it silently.
+   */
+  principal: Principal;
+  /**
+   * Where a reply goes on the WhatsApp door, and the number the owner allowlist
+   * judges. ABSENT for a principal that has none: an agent caller has an id and
+   * a credential, and inventing a phone-shaped string for it is how one ends up
+   * in `contacts`, or on the receiving end of a send.
+   */
+  phone?: string;
+  /**
+   * The WhatsApp allowlist role. ABSENT for an agent caller, and that is not a
+   * gap to be filled in: no allowlist entry can name an agent, so there is
+   * nothing for `isOwner` to answer. An agent caller's privileges are the
+   * TARGET definition's `tools[]` plus the registry's `reach` — both
+   * server-side, both data, neither derived from a role. Defaulting this to
+   * "customer" would put an authenticated internal caller behind a kill switch
+   * and a per-phone rate limiter written for people; defaulting it to "owner"
+   * would hand it the store. So it is absent, and every consumer says which it
+   * meant.
+   */
+  role?: Role;
   /**
    * Which agent answers this turn — the persona, and half of the session key.
    *
@@ -106,6 +136,16 @@ export interface TurnContext {
    * shopify/catalog.ts adjustInventory).
    */
   turnKey: string;
+  /**
+   * How many agent-to-agent hops produced this turn. Zero from a human door.
+   *
+   * REQUIRED, and read by `ask_agent` to derive the hop of the call it makes:
+   * the outbound hop is this + 1, computed by the tool from the turn rather
+   * than taken from anything the model wrote. A caller that could set its own
+   * hop could reset it to zero on every call, and the loop guard would then be
+   * only as good as the politeness of the thing it guards against.
+   */
+  hop: number;
   /**
    * Set by a tool to change what happens to the stored agent session AFTER
    * this turn completes. "reset" clears it instead of persisting the new id,

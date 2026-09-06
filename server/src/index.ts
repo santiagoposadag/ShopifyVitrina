@@ -7,6 +7,7 @@ import { ConsecutiveFailureAlert } from "./inbox/alerts.js";
 import { InboxBatcher } from "./inbox/batcher.js";
 import { isOwner, loadConfig, loadDotEnv } from "./config.js";
 import { openDb } from "./data/db.js";
+import { countAgentCredentials } from "./data/agent-registry.js";
 import { BridgeChannel, sweepStagedMedia } from "./whatsapp/bridge.js";
 import type { WhatsAppChannel } from "./whatsapp/channel.js";
 import { CloudApiChannel } from "./whatsapp/cloud.js";
@@ -23,6 +24,10 @@ import { sweepOrphanedTranscripts, transcriptsDir } from "./data/transcripts.js"
 import { CatalogCache } from "./shopify/cache.js";
 import { ShopifyClient } from "./shopify/client.js";
 import { registerWebhook, type WebhookDeps } from "./inbox/webhook.js";
+import { registerAgentDoor } from "./inbox/a2a.js";
+import { inProcessAgentsPort } from "./inbox/agents-port.js";
+import { principalId } from "./inbox/envelope.js";
+import { AgentReplies } from "./egress/agent-reply.js";
 import { Responders } from "./egress/responder.js";
 import { agentIdForPhone, AGENT_IDS } from "./router.js";
 import { toolUniverse } from "./tools/registry.js";
@@ -31,7 +36,7 @@ import { sqliteLeadsPort, sqliteMediaPort } from "./data/tool-ports.js";
 import type { ToolPorts } from "./tools/ports.js";
 import { loadAndValidateDefinitions } from "./agent/definition.js";
 import { countIndexedChunks, estimateTokens, loadKnowledgeBase } from "./knowledge/store.js";
-import type { TurnContext } from "./types.js";
+import type { Role } from "./types.js";
 
 const RATE_LIMIT_NOTICE =
   "Estamos recibiendo muchos mensajes tuyos en poco tiempo. Dame unos minutos y escríbeme de nuevo, por favor.";
@@ -97,13 +102,31 @@ async function main(): Promise<void> {
     universe: toolUniverse(),
   });
   // What the tools may reach, assembled here and nowhere else: the packs state
-  // policy, these four decide what performs it. The catalog adapter is the one
+  // policy, these five decide what performs it. The catalog adapter is the one
   // that holds the client and the shared cache.
   const ports: ToolPorts = {
     catalog: shopifyCatalogPort({ client: shopify, cache, config }),
     leads: sqliteLeadsPort(db),
     media: sqliteMediaPort(db),
     knowledge,
+    // One agent asking another, IN PROCESS: the same admission checks and the
+    // same durable inbox as the HTTP door, because they are the same functions
+    // (inbox/agents-port.ts). Served to nobody in this build — neither shipped
+    // definition declares ask_agent, and giving one of them the ability to ask
+    // another assistant is a decision about what a customer-facing agent can
+    // reach, not a wiring detail.
+    //
+    // The thunks are what let ONE ports object exist: the batcher and the reply
+    // rendezvous are built below, and they are resolved when a turn actually
+    // asks rather than now.
+    agents: inProcessAgentsPort({
+      db,
+      batcher: () => batcher,
+      replies: () => agentReplies,
+      // The DEFINITION's list, not the registry's — see inbox/agents-port.ts.
+      reachOf: (agentId: string) => definitions[agentId]?.reach ?? [],
+      isKnownAgent: (agentId: string) => agentId in definitions,
+    }),
   };
   const queue = new PerConversationQueue();
   const rateLimiter = new RateLimiter({
@@ -111,12 +134,27 @@ async function main(): Promise<void> {
     globalPerDay: config.rateLimitGlobalPerDay,
   });
   const failureAlert = new ConsecutiveFailureAlert();
+  const app = Fastify({ logger: true });
+
+  // The agent door's return path: a caller parked on its own request, or a
+  // callback URL the door already checked against that caller's prefix. Held
+  // here, in the composition root, because a parked caller is in-process state
+  // — the request is what it belongs to, and a restart drops it (the row is
+  // what survives, and it is replayed).
+  const agentReplies = new AgentReplies({
+    log: app.log,
+    // Node's own fetch, narrowed to what a callback POST needs. Adapted here
+    // rather than in the module so that module stays testable with a plain
+    // function and no network anywhere near it.
+    fetchImpl: async (url, init) => {
+      const response = await fetch(url, init);
+      return { ok: response.ok, status: response.status };
+    },
+  });
   // Where a turn's reply goes. The runtime returns the reply and this decides
   // who receives it, from the principal that asked — which is what lets a
   // second kind of caller be answered without touching the agent loop.
-  const responders = new Responders(channel);
-
-  const app = Fastify({ logger: true });
+  const responders = new Responders(channel, agentReplies);
 
   // Housekeeping on boot and hourly: purge unattached inbound media older than
   // 48h, settled inbox rows past their TTL, and agent transcripts no session row
@@ -238,8 +276,7 @@ async function main(): Promise<void> {
     }
   };
 
-  const roleFor = (phone: string): TurnContext["role"] =>
-    isOwner(config, phone) ? "owner" : "customer";
+  const roleFor = (phone: string): Role => (isOwner(config, phone) ? "owner" : "customer");
 
   const batcher = new InboxBatcher({
     db,
@@ -274,7 +311,23 @@ async function main(): Promise<void> {
       return result?.text ?? null;
     },
     onMessage: async (envelope, ctx) => {
-      upsertContact(db, ctx.phone, ctx.role);
+      // WHO is asking, narrowed once. Every gate below that was written for a
+      // person is gated on THIS rather than on `ctx.phone !== undefined`: the
+      // principal is the authority, and a check written for people must not
+      // fire — or fail to fire — on a caller that simply has no phone.
+      const person = envelope.principal.kind === "whatsapp" ? envelope.principal : undefined;
+      // Where this turn's reply goes, decided by the door that authenticated
+      // the caller and not by anything below. Built once, up front, so echo
+      // mode and a real turn answer through exactly the same route.
+      const respond = responders.for(envelope.principal, {
+        conversationKey: envelope.conversationKey,
+        ...(envelope.replyTo !== undefined ? { replyTo: envelope.replyTo } : {}),
+      });
+
+      // `contacts` is a table of PEOPLE — phone primary key, last seen, role
+      // from the allowlist. An agent caller has none of those: it is not a
+      // contact, it holds a credential, and the registry already records it.
+      if (person) upsertContact(db, person.phone, roleFor(person.phone));
 
       // Diagnostic mode, and deliberately the FIRST thing here. It sits ahead of
       // both gates below because a mode whose only job is to show that a message
@@ -282,18 +335,34 @@ async function main(): Promise<void> {
       // neither gate is protecting anything on this path: the kill switch exists
       // to stop Claude calls, the rate limiter to bound their cost, and this
       // makes none. Logged at every turn so a deployment left in it is obvious.
+      //
+      // Delivered through the responder rather than straight to the channel, so
+      // it proves the transport of WHICHEVER door the message came in through.
+      // For a phone that is the identical send it always was; for an agent
+      // caller, echoing to a phone it does not have would be the silent
+      // swallow this mode exists to rule out.
       if (config.echoMode) {
-        app.log.warn({ phone: ctx.phone, role: ctx.role }, "ECHO_MODE: replying without an agent turn");
-        await channel.sendText(ctx.phone, buildEchoReply(envelope.text));
+        app.log.warn(
+          { principal: principalId(envelope.principal), kind: envelope.principal.kind },
+          "ECHO_MODE: replying without an agent turn",
+        );
+        await respond.deliver(buildEchoReply(envelope.text));
         return; // Consumed; the inbox batch settles as done.
       }
 
       // Kill switch: with the customer path disabled, non-owners get a static
       // notice and the agent never runs (no Claude call). One reply per
       // coalesced burst, so a message barrage cannot turn this into spam.
-      if (ctx.role !== "owner" && !config.customerAgentEnabled) {
+      //
+      // A PERSON who is not an owner — never an agent caller. This switch
+      // stands between STRANGERS and a Claude call; an agent caller is not a
+      // stranger, it holds a credential an operator issued and a `reach` that
+      // named this agent, and answering it with a Spanish apology written for a
+      // customer would be a lie to a machine. Closing the agent door is a
+      // different act: delete its registry row.
+      if (person && ctx.role !== "owner" && !config.customerAgentEnabled) {
         try {
-          await channel.sendText(ctx.phone, CUSTOMER_UNAVAILABLE_NOTICE);
+          await channel.sendText(person.phone, CUSTOMER_UNAVAILABLE_NOTICE);
         } catch {
           // Best effort.
         }
@@ -301,13 +370,21 @@ async function main(): Promise<void> {
       }
 
       // Cost protection: customers are rate limited; owners are exempt.
-      if (ctx.role !== "owner") {
-        const decision = rateLimiter.check(ctx.phone);
+      //
+      // And so is an agent caller, because this limiter is KEYED BY PHONE and
+      // an agent has none: keying it on a constant would make every agent share
+      // one bucket, so the busiest caller would silently throttle every other
+      // one, and keying it on `undefined` would do the same thing without even
+      // saying so. What bounds an agent caller's cost instead is the registry
+      // (no row, no request), its `reach`, and the hop cap — all of them
+      // per-caller and none of them guessed here.
+      if (person && ctx.role !== "owner") {
+        const decision = rateLimiter.check(person.phone);
         if (decision !== "ok") {
-          app.log.warn({ phone: ctx.phone, decision }, "agent turn rate limited");
-          if (decision === "phone_limited" && rateLimiter.shouldNotify(ctx.phone)) {
+          app.log.warn({ phone: person.phone, decision }, "agent turn rate limited");
+          if (decision === "phone_limited" && rateLimiter.shouldNotify(person.phone)) {
             try {
-              await channel.sendText(ctx.phone, RATE_LIMIT_NOTICE);
+              await channel.sendText(person.phone, RATE_LIMIT_NOTICE);
             } catch {
               // Best effort.
             }
@@ -333,18 +410,28 @@ async function main(): Promise<void> {
       // the envelope. Rebuilding one from ctx.phone would work today and would
       // be a lie tomorrow: it hard-codes "everyone who asks has a phone" into
       // the one place that is supposed to be indifferent to who asked.
-      await responders.for(envelope.principal).deliver(reply);
+      await respond.deliver(reply);
       failureAlert.recordSuccess();
     },
-    onBatchFailure: async (ctx, { final }) => {
+    onBatchFailure: async (ctx, { final, error }) => {
       // The streak counts EVERY failed attempt, not only terminal ones: this
       // alert is the pilot's outage monitor, and waiting for terminal failures
       // would delay detection by the whole retry budget. The cooldown plus the
       // success reset keep it from spamming.
       if (failureAlert.recordFailure()) void notifyOwnersOfFailures();
       if (!final) return; // the retry may still answer; apologize only when it cannot
+      // An agent caller gets told, not apologised to. It may be parked on an
+      // open request: without this it waits out the full sync timeout for an
+      // answer whose retry budget is already spent, and its own user waits with
+      // it. Nothing is sent anywhere — this settles a promise in this process.
+      if (ctx.principal.kind === "agent") {
+        agentReplies.fail(ctx.conversationKey, error);
+        return;
+      }
       try {
-        await channel.sendText(ctx.phone, AGENT_ERROR_APOLOGY);
+        // Present for a WhatsApp principal by construction; the batcher fills
+        // it from the row the webhook wrote.
+        if (ctx.phone) await channel.sendText(ctx.phone, AGENT_ERROR_APOLOGY);
       } catch {
         // Best effort; the failure is already in the logs.
       }
@@ -354,6 +441,29 @@ async function main(): Promise<void> {
   const deps: WebhookDeps = { config, db, channel, batcher, roleFor };
 
   registerWebhook(app, deps);
+
+  // The second door. It is REGISTERED unconditionally and CLOSED until an
+  // operator creates a registry row (data/agent-credentials.ts): authentication
+  // is a lookup in that table, so an empty one refuses everything. Registering
+  // it conditionally would have made "is the door open?" a question about an
+  // environment variable as well as about the data, and two switches for one
+  // thing is how one of them ends up in the wrong position.
+  registerAgentDoor(app, {
+    db,
+    batcher,
+    replies: agentReplies,
+    // Only the agents this build actually loaded. A definition that failed to
+    // load is not a target: the boot already failed above if one did.
+    isKnownAgent: (agentId: string) => agentId in definitions,
+  });
+  const registeredCallers = countAgentCredentials(db);
+  // Said once at boot, because "the agent door is open" is not something to
+  // discover from a request. Zero is the shipped state and reads as such.
+  app.log.info(
+    registeredCallers === 0
+      ? "Agent door: CLOSED (no rows in agent_registry). POST /agents/:id/messages refuses every request."
+      : `Agent door: open to ${registeredCallers} registered caller(s) at POST /agents/:id/messages`,
+  );
 
   // Un-flushed bursts must not hold the process open on shutdown; their rows
   // stay pending and are replayed on the next boot.

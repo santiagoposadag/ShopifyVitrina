@@ -250,6 +250,36 @@ services:
       - vitrina-sessions:/home/node/.claude
     profiles: ["purge"]
 
+  # Who may speak through the AGENT DOOR (POST /agents/:id/messages), and what
+  # each caller is allowed to reach. The agent_registry table IS the switch:
+  # with no rows the door answers 401 to everything, which is how this ships.
+  # There is deliberately no second enabling flag — two switches for one thing
+  # is how one of them ends up in the wrong position.
+  #   ./scripts/with-secrets.sh docker compose --profile ops run --rm agent-credentials list
+  #   ./scripts/with-secrets.sh docker compose --profile ops run --rm agent-credentials add super-agent --reach vitrina-inventario
+  #
+  # `entrypoint` rather than `command` so `run --rm agent-credentials add ...`
+  # APPENDS its arguments instead of replacing the whole command.
+  #
+  # Needs the secrets wrapper for OWNER_PHONE_NUMBERS alone: opening the database
+  # may migrate legacy sessions, and an empty allowlist would file the owner's
+  # session under the customer agent — the command refuses rather than risk it.
+  #
+  # The token is printed ONCE and only its SHA-256 is stored, so a lost token is
+  # replaced with `rotate`, never looked up.
+  agent-credentials:
+    image: vitrina-server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      <<: *data-env
+      OWNER_PHONE_NUMBERS: ${OWNER_PHONE_NUMBERS:-}
+    entrypoint: ["node", "server/dist/data/agent-credentials.js"]
+    volumes:
+      - vitrina-data:/data
+    profiles: ["ops"]
+
 volumes:
   # A named volume (not a host bind mount): the image already creates /data
   # owned by the non-root `node` user (see the Dockerfiles). A named volume

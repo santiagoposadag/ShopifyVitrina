@@ -24,6 +24,7 @@ import {
 import { renderKnowledgeHits } from "../src/knowledge/tool.js";
 import { fakePorts } from "./helpers/fake-ports.js";
 import type { TurnContext } from "../src/types.js";
+import { whatsappPrincipal } from "../src/inbox/envelope.js";
 
 /**
  * The knowledge base: two tiers, one index, and one property that has to hold
@@ -708,11 +709,13 @@ describe("a database that predates the knowledge index", () => {
 describe("the search_knowledge tool", () => {
   function turnContext(agentId: string): TurnContext {
     return {
+      principal: whatsappPrincipal("573000000000"),
       phone: "573000000000",
       role: "owner",
       agentId,
       conversationKey: "573000000000",
       turnKey: "msg:1",
+      hop: 0,
     };
   }
 

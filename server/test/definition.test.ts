@@ -13,6 +13,7 @@ import {
 } from "../src/agent/definition.js";
 import { AGENT_IDS } from "../src/router.js";
 import { REPO_ROOT } from "../src/config.js";
+import { whatsappPrincipal } from "../src/inbox/envelope.js";
 
 const VALID_YAML = (overrides: Record<string, unknown> = {}) => {
   const base = {
@@ -227,11 +228,13 @@ describe("shipped definitions get exactly the tools they declare", () => {
     const { tools } = buildToolServer({
       definition,
       ctx: {
+        principal: whatsappPrincipal("573000000000"),
         phone: "573000000000",
         role: "customer",
         agentId,
         conversationKey: "573000000000",
         turnKey: "msg:1",
+        hop: 0,
       },
       ports: fakePorts().ports,
     });
@@ -269,5 +272,71 @@ describe("shipped definitions", () => {
       toolUniverse(),
     );
     expect([...definitions.keys()].sort()).toEqual([...Object.values(AGENT_IDS)].sort());
+  });
+});
+
+/**
+ * `reach` and `ask_agent` are a pair, and both halves of the pair are checked
+ * at boot for the same reason the knowledge pairing is: a capability declared
+ * in one half and not the other fails silently, at conversation time, and reads
+ * as the other assistant being unavailable rather than as a missing line here.
+ */
+describe("reach and ask_agent", () => {
+  it("passes a definition that declares both", () => {
+    writeAgent(
+      "fixture-agent",
+      { ...VALID_YAML(), tools: ["ask_agent"], reach: ["vitrina-inventario"] },
+      "Uses ask_agent.",
+    );
+    const definition = loadDefinition(dir, "fixture-agent");
+    expect(() => validateDefinition(definition, toolUniverse())).not.toThrow();
+  });
+
+  // ONE axis: the same definition without the tool.
+  it("fails a reach list the agent has no tool to use", () => {
+    writeAgent("fixture-agent", { ...VALID_YAML(), reach: ["vitrina-inventario"] });
+    const definition = loadDefinition(dir, "fixture-agent");
+    expect(() => validateDefinition(definition, toolUniverse())).toThrow(/ask_agent/);
+  });
+
+  // ONE axis the other way: the tool with nothing it may reach.
+  it("fails an ask_agent that can only ever refuse", () => {
+    writeAgent("fixture-agent", { ...VALID_YAML(), tools: ["ask_agent"], reach: [] }, "ask_agent.");
+    const definition = loadDefinition(dir, "fixture-agent");
+    expect(() => validateDefinition(definition, toolUniverse())).toThrow(/reach is empty/);
+  });
+
+  it("fails a definition that reaches itself", () => {
+    writeAgent(
+      "fixture-agent",
+      { ...VALID_YAML(), tools: ["ask_agent"], reach: ["fixture-agent"] },
+      "ask_agent.",
+    );
+    const definition = loadDefinition(dir, "fixture-agent");
+    expect(() => validateDefinition(definition, toolUniverse())).toThrow(/itself/);
+  });
+
+  // Only the whole set can answer this one, which is why it lives in the loader
+  // rather than in validateDefinition.
+  it("fails a reach entry naming an agent this build does not serve", () => {
+    writeAgent("good-one", { ...VALID_YAML(), id: "good-one", tools: ["ask_agent"], reach: ["ghost"] }, "ask_agent.");
+    expect(() => loadAndValidateDefinitions(dir, ["good-one"], toolUniverse())).toThrow(/ghost/);
+  });
+
+  it("passes a reach entry naming an agent loaded alongside it", () => {
+    writeAgent("good-one", { ...VALID_YAML(), id: "good-one", tools: ["ask_agent"], reach: ["good-two"] }, "ask_agent.");
+    writeAgent("good-two", { ...VALID_YAML(), id: "good-two" });
+    expect(() => loadAndValidateDefinitions(dir, ["good-one", "good-two"], toolUniverse())).not.toThrow();
+  });
+
+  // Shipped as disabled on purpose: giving a customer-facing agent the ability
+  // to ask the inventory agent changes what a stranger's conversation can
+  // reach, and that is the owner's call, not a wiring detail.
+  it("is declared by neither shipped definition", () => {
+    for (const agentId of Object.values(AGENT_IDS)) {
+      const definition = loadDefinition(join(REPO_ROOT, "agents"), agentId);
+      expect(definition.tools).not.toContain("ask_agent");
+      expect(definition.reach).toEqual([]);
+    }
   });
 });

@@ -7,7 +7,7 @@ import { extractCloudInbound, extractCloudStatusErrors } from "./cloud.js";
 import { extractInbound } from "./whatsmeow.js";
 import type { WhatsAppChannel } from "../whatsapp/channel.js";
 import { insertInboxMessage, type InboxMediaKind } from "../data/repo.js";
-import type { InboundMessage, MessageKind, TurnContext } from "../types.js";
+import type { InboundMessage, MessageKind, Role } from "../types.js";
 
 export const SIGNATURE_HEADER = "x-webhook-signature";
 
@@ -89,7 +89,7 @@ export interface WebhookDeps {
   /** Coalesces each phone's burst into a single agent turn, off the ACK path. */
   batcher: InboxBatcher;
   /** Maps a phone number to its role (owner vs customer). */
-  roleFor: (phone: string) => TurnContext["role"];
+  roleFor: (phone: string) => Role;
 }
 
 export function registerWebhook(app: FastifyInstance, deps: WebhookDeps): void {

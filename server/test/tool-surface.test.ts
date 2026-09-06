@@ -19,6 +19,7 @@ import { runRenderCases } from "./helpers/render-cases.js";
 import { serializeTool, type ToolSurface } from "./helpers/tool-surface.js";
 import { fakePorts } from "./helpers/fake-ports.js";
 import { AGENT_IDS } from "../src/router.js";
+import { whatsappPrincipal } from "../src/inbox/envelope.js";
 
 const AGENTS_DIR = join(REPO_ROOT, "agents");
 const FIXTURES_DIR = join(import.meta.dirname, "fixtures");
@@ -56,9 +57,11 @@ function surfaceFor(agentId: string): ToolSurface[] {
   const { tools } = buildToolServer({
     definition,
     ctx: {
+      principal: whatsappPrincipal("573000000000"),
       phone: "573000000000",
       role: "customer",
       agentId,
+      hop: 0,
       conversationKey: "573000000000",
       turnKey: "msg:1",
     },
@@ -84,11 +87,13 @@ describe("tool surface golden fixtures", () => {
       buildToolServer({
         definition,
         ctx: {
+          principal: whatsappPrincipal("573000000000"),
           phone: "573000000000",
           role,
           agentId: AGENT_IDS.owner,
           conversationKey: "573000000000",
           turnKey: "msg:1",
+          hop: 0,
         },
         ports: fakePorts().ports,
       }).tools.map(serializeTool);

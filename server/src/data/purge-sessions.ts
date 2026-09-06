@@ -47,8 +47,15 @@ async function main(): Promise<void> {
   // will still find.
   const db = openDb(dbPath, { legacyAgentIdFor: (phone) => agentIdForPhone(config, phone) });
   try {
-    const { purged, kept, swept } = purgeCustomerSessions(db, config, root);
+    const { purged, kept, keptAgent, swept } = purgeCustomerSessions(db, config, root);
     console.log(`Purged ${purged} customer session(s); kept ${kept} owner session(s).`);
+    // Said out loud rather than folded into "kept": these are exchanges with
+    // another agent, they are kept on purpose (see purge.ts), and an operator
+    // who expected this command to empty the sessions table should see why it
+    // did not.
+    if (keptAgent > 0) {
+      console.log(`Kept ${keptAgent} agent-to-agent exchange(s); they are not customer histories.`);
+    }
     if (root === undefined) {
       // See transcripts.ts: without an explicit root we do NOT guess, because the
       // obvious guess is the developer's own Claude Code history for this repo.

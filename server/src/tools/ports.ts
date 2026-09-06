@@ -264,6 +264,63 @@ export interface KnowledgePort {
   search(input: { agentId: string; query: string; limit?: number }): Promise<KnowledgeHit[]>;
 }
 
+/**
+ * One agent asking another, as `ask_agent` needs it.
+ *
+ * `from` and `hop` are NOT the model's to choose: the pack fills them from the
+ * turn it was built for. They are fields of this request rather than implicit
+ * state so that the recorded call a test asserts on shows exactly what was
+ * sent — a hop that silently defaulted to 1 somewhere in the adapter would be
+ * a loop guard that never guards.
+ */
+export interface AskAgentRequest {
+  /** The agent whose turn is asking. From `ctx.turn.agentId`, never an argument. */
+  from: string;
+  /** The agent being asked. The one thing here the model does choose. */
+  to: string;
+  text: string;
+  /**
+   * The hop of the OUTBOUND call: the asking turn's hop plus one. Derived by
+   * the pack, checked again by whatever performs the exchange.
+   */
+  hop: number;
+  /**
+   * Which exchange this belongs to. Stable for one asking TURN, so a turn that
+   * asks twice continues one conversation with that agent instead of opening
+   * two — and so a retried turn resumes rather than forking.
+   */
+  correlationId: string;
+}
+
+/**
+ * What an exchange came back as.
+ *
+ * A refusal is a RESULT, not an exception: the model has to hear "that agent is
+ * not one you may ask" and act on it, the same way a sold-out variant comes
+ * back as words. An infrastructure failure is the other kind and must throw, so
+ * the turn fails, the batch is retried, and nobody is told a story about what
+ * the other agent said.
+ */
+export type AskAgentResult =
+  | { ok: true; reply: string }
+  | { ok: false; reason: string };
+
+/**
+ * The agent door, from the inside.
+ *
+ * `reachOf` answers from the DEFINITION — what this agent was designed to ask,
+ * versioned in its agent.yaml and validated at boot. The registry's `reach` is
+ * the operator's copy of the same permission for a caller arriving over HTTP;
+ * an in-process ask has no bearer token to look up, and its identity is not in
+ * question because the runtime is the thing that built the turn.
+ */
+export interface AgentsPort {
+  /** Agent ids this one may ask. Used for the refusal message and enforced by `ask`. */
+  reachOf(agentId: string): readonly string[];
+  /** Perform one exchange and wait for the answer. */
+  ask(request: AskAgentRequest): Promise<AskAgentResult>;
+}
+
 /** Everything the packs may reach. One bag, built once at the composition root. */
 export interface ToolPorts {
   catalog: CatalogPort;
@@ -275,4 +332,6 @@ export interface ToolPorts {
    * would surface as a turn failing mid-conversation instead of as a type error.
    */
   knowledge: KnowledgePort;
+  /** Required for the same reason `knowledge` is. */
+  agents: AgentsPort;
 }

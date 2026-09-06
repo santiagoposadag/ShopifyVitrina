@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Responders } from "../src/egress/responder.js";
+import { AgentReplies } from "../src/egress/agent-reply.js";
 import { agentPrincipal, whatsappPrincipal } from "../src/inbox/envelope.js";
 import type { WhatsAppChannel } from "../src/whatsapp/channel.js";
 
@@ -70,5 +71,77 @@ describe("Responder.for(principal)", () => {
     const responders = new Responders(recordingChannel([]));
 
     expect(() => responders.for(agentPrincipal("vitrina-ventas"))).toThrow(/agent/i);
+  });
+});
+
+/**
+ * The agent branch, now that a door produces an agent principal.
+ *
+ * The property under test is the same one the WhatsApp branch has: a responder
+ * is bound to WHO asked when it is created, and a failure to deliver reaches
+ * the batcher instead of settling a batch as done with nothing delivered.
+ */
+describe("Responder.for(agent principal)", () => {
+  function replies(): AgentReplies {
+    return new AgentReplies({
+      log: { error: () => undefined, warn: () => undefined },
+      syncTimeoutMs: 1000,
+    });
+  }
+
+  it("delivers to the caller parked on that conversation", async () => {
+    const agentReplies = replies();
+    const responders = new Responders(recordingChannel([]), agentReplies);
+    const parked = agentReplies.register("a2a:super:target:corr-1");
+
+    await responders
+      .for(agentPrincipal("super"), { conversationKey: "a2a:super:target:corr-1" })
+      .deliver("quedan 4");
+
+    await expect(parked.reply).resolves.toBe("quedan 4");
+  });
+
+  // Two exchanges run concurrently in this process, so a responder that read
+  // its route at deliver() time could answer the wrong caller.
+  it("binds each responder to its own conversation", async () => {
+    const agentReplies = replies();
+    const responders = new Responders(recordingChannel([]), agentReplies);
+    const first = agentReplies.register("a2a:super:target:corr-1");
+    const second = agentReplies.register("a2a:super:target:corr-2");
+
+    const one = responders.for(agentPrincipal("super"), {
+      conversationKey: "a2a:super:target:corr-1",
+    });
+    const two = responders.for(agentPrincipal("super"), {
+      conversationKey: "a2a:super:target:corr-2",
+    });
+    await two.deliver("para el segundo");
+    await one.deliver("para el primero");
+
+    await expect(first.reply).resolves.toBe("para el primero");
+    await expect(second.reply).resolves.toBe("para el segundo");
+  });
+
+  it("refuses an agent principal with no route rather than dropping the reply", () => {
+    const responders = new Responders(recordingChannel([]), replies());
+
+    expect(() => responders.for(agentPrincipal("super"))).toThrow(/agent/i);
+  });
+
+  it("propagates a callback failure instead of swallowing it", async () => {
+    const agentReplies = new AgentReplies({
+      log: { error: () => undefined, warn: () => undefined },
+      fetchImpl: async () => ({ ok: false, status: 500 }),
+    });
+    const responders = new Responders(recordingChannel([]), agentReplies);
+
+    await expect(
+      responders
+        .for(agentPrincipal("super"), {
+          conversationKey: "a2a:super:target:corr-1",
+          replyTo: "https://super.internal/callbacks/7",
+        })
+        .deliver("quedan 4"),
+    ).rejects.toThrow(/500/);
   });
 });

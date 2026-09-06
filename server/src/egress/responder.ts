@@ -1,5 +1,8 @@
+import type { AgentReplies, ReplyRoute } from "./agent-reply.js";
 import type { Principal } from "../inbox/envelope.js";
 import type { WhatsAppChannel } from "../whatsapp/channel.js";
+
+export type { ReplyRoute } from "./agent-reply.js";
 
 /**
  * Where a turn's reply goes.
@@ -28,23 +31,40 @@ export interface Responder {
 
 /** Picks the delivery route for a principal. One implementation per door. */
 export interface ResponderFactory {
-  for(principal: Principal): Responder;
+  /**
+   * The PRINCIPAL says who is owed the reply; the ROUTE says how to reach a
+   * caller that carries no address of its own. A phone IS an address, so the
+   * WhatsApp branch needs nothing more. An agent is identified by a credential
+   * and reached through the exchange it opened — which is the conversation key,
+   * plus, when it set one, a callback URL the door has already validated.
+   *
+   * Optional, so every existing caller keeps compiling AND keeps meaning what
+   * it meant: without a route an agent principal has no way home, and the
+   * factory refuses rather than returning a responder that would drop the
+   * reply.
+   */
+  for(principal: Principal, route?: ReplyRoute): Responder;
 }
 
 /**
- * The only factory in this build: everything that can currently ask a question
- * came in through WhatsApp, so everything is answered there.
+ * The two ways a reply leaves this process: a WhatsApp message, or the answer
+ * to an agent that asked.
  *
- * The agent branch throws instead of returning a responder that quietly drops
- * the reply — no producer of an agent principal exists yet, so reaching it
- * means a door was wired up without its return path, and that is precisely the
- * failure this seam exists to prevent. It surfaces as a failed batch (retried,
- * then an apology) rather than as a silent success.
+ * The agent branch still THROWS when this build wired no agent replies, or when
+ * a caller arrives with no route — instead of returning a responder that
+ * quietly drops the reply. Reaching either case means a door was wired up
+ * without its return path, which is precisely the failure this seam exists to
+ * prevent; it surfaces as a failed batch (retried, then an apology) rather than
+ * as a silent success.
  */
 export class Responders implements ResponderFactory {
-  constructor(private readonly channel: WhatsAppChannel) {}
+  constructor(
+    private readonly channel: WhatsAppChannel,
+    /** Absent in a build with no agent door: the branch below then refuses. */
+    private readonly agentReplies?: AgentReplies,
+  ) {}
 
-  for(principal: Principal): Responder {
+  for(principal: Principal, route?: ReplyRoute): Responder {
     switch (principal.kind) {
       case "whatsapp": {
         // The phone is captured HERE, not read at deliver() time: conversations
@@ -53,10 +73,21 @@ export class Responders implements ResponderFactory {
         const { phone } = principal;
         return { deliver: (reply: string) => this.channel.sendText(phone, reply) };
       }
-      case "agent":
-        throw new Error(
-          `no reply route for agent principal ${principal.agentId}: the agent door has no responder yet`,
-        );
+      case "agent": {
+        const replies = this.agentReplies;
+        if (!replies || !route) {
+          throw new Error(
+            `no reply route for agent principal ${principal.agentId}: the agent door has no responder here`,
+          );
+        }
+        // Captured for the same reason the phone above is: this responder may
+        // be held across an await while another conversation's turn runs.
+        const bound: ReplyRoute = {
+          conversationKey: route.conversationKey,
+          ...(route.replyTo !== undefined ? { replyTo: route.replyTo } : {}),
+        };
+        return { deliver: (reply: string) => replies.deliver(bound, reply) };
+      }
     }
   }
 }

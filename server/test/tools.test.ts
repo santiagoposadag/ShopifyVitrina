@@ -18,6 +18,7 @@ import type { SearchHit } from "../src/shopify/rank.js";
 import type { ShopifyProduct } from "../src/shopify/types.js";
 import type { TurnContext } from "../src/types.js";
 import { callsTo, fakePorts, fakeProduct } from "./helpers/fake-ports.js";
+import { whatsappPrincipal } from "../src/inbox/envelope.js";
 
 const AGENTS_DIR = join(REPO_ROOT, "agents");
 
@@ -44,11 +45,13 @@ const OWNER_ONLY_TOOLS = [
 
 function turnContext(overrides: Partial<TurnContext> = {}): TurnContext {
   return {
+    principal: whatsappPrincipal("573000000000"),
     phone: "573000000000",
     role: "customer",
     agentId: AGENT_IDS.customer,
     conversationKey: "573000000000",
     turnKey: "msg:1",
+    hop: 0,
     ...overrides,
   };
 }

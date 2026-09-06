@@ -127,6 +127,32 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
       media_name TEXT,
       -- WhatsApp's own send stamp, on its way to pending_media.sent_at.
       media_sent_at INTEGER,
+      -- The envelope, persisted: who asked, which agent must answer, which
+      -- conversation, where the reply goes, and how many agent-to-agent hops
+      -- produced it. Written by the door that AUTHENTICATED the sender, and
+      -- read again when the batch is claimed — so a row replayed after a crash
+      -- is routed by what was proven then, not by whatever a registry or an
+      -- allowlist happens to say at replay time.
+      --
+      -- agent_id is NULL on a WhatsApp row ON PURPOSE: a phone's target agent
+      -- is resolved when the burst flushes (router.ts), one turn for many rows,
+      -- and freezing it per row would let one burst disagree with itself.
+      agent_id TEXT,
+      principal_kind TEXT NOT NULL DEFAULT 'whatsapp',
+      -- The phone, or the CALLING agent's id as its credential identified it.
+      -- Never anything the message said about itself.
+      principal_id TEXT,
+      -- What claimInboxBatch claims by, and half the session key: the phone on
+      -- the WhatsApp door, an 'a2a:<caller>:<correlation>' key on the agent
+      -- door. Nullable only because ALTER TABLE cannot add a NOT NULL column
+      -- without a constant default; every writer fills it and migrate()
+      -- backfills the rows written before it existed.
+      conversation_key TEXT,
+      -- A callback URL for a caller that cannot take the reply in its own
+      -- response body. NULL means "answer whoever asked, the way that door
+      -- answers" — which is every WhatsApp message.
+      reply_to TEXT,
+      hop INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending','processing','done','failed')),
       attempts INTEGER NOT NULL DEFAULT 0,
@@ -190,8 +216,47 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
       indexed_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- WHO may speak through the agent door, and what each caller may reach.
+    --
+    -- THIS TABLE IS THE SWITCH. The door authenticates by looking a presented
+    -- token up in here, so an empty table matches nothing and every request is
+    -- refused — that is the whole "off by default" story, and there is no
+    -- separate flag that a deployment could leave on by accident.
+    --
+    -- token_hash, never a token: this file is copied by data/backup.ts and
+    -- lives on a volume, so a stored credential would sit in every copy of it.
+    -- SHA-256 is enough BECAUSE the token is 256 random bits (see
+    -- data/agent-registry.ts): there is no dictionary to run against it, which
+    -- is what makes the slow-KDF reasoning for passwords not apply here.
+    --
+    -- reach is a JSON array of agent ids, and it is the OPERATOR's copy of the
+    -- permission: an agent definition's own reach list says what that agent was
+    -- designed to ask, this says what this deployment permits for this
+    -- credential, and the door consults the one that belongs to the caller it
+    -- authenticated.
+    --
+    -- callback_prefix is the only URL family this caller may name in replyTo.
+    -- NULL means it may name none, which is the default: a callback is a
+    -- request WE make to a URL a request body chose.
+    CREATE TABLE IF NOT EXISTS agent_registry (
+      agent_id TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL,
+      reach TEXT NOT NULL DEFAULT '[]',
+      callback_prefix TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      rotated_at TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
-    -- Every batch flush claims one phone's un-settled rows by (phone, status).
+    -- Every batch flush claims one CONVERSATION's un-settled rows. The index
+    -- that serves that claim is created in migrate() below, not here: on a
+    -- database from an older build the column does not exist yet at this point,
+    -- and CREATE INDEX over a missing column fails the boot outright.
+    --
+    -- The (phone, status) index stays. It no longer serves the claim, but it is
+    -- what makes "everything this person ever sent" answerable, and dropping an
+    -- index is not something to do on the same boot that adds six columns to
+    -- the table it belongs to.
     CREATE INDEX IF NOT EXISTS idx_inbox_phone_status ON inbox(phone, status);
     CREATE INDEX IF NOT EXISTS idx_leads_created_at ON leads(created_at);
     CREATE INDEX IF NOT EXISTS idx_pending_media_phone ON pending_media(phone);
@@ -238,8 +303,51 @@ function migrate(db: DB, options: SchemaOptions): void {
   addColumn(db, "inbox", "media_mime", "TEXT");
   addColumn(db, "inbox", "media_name", "TEXT");
   addColumn(db, "inbox", "media_sent_at", "INTEGER");
+  // The envelope: one inbox, two doors. Every one of these is nullable or has a
+  // CONSTANT default, which is all ALTER TABLE ADD COLUMN accepts — a NOT NULL
+  // column whose default had to be read from another column could not be added
+  // to the running pilot's table at all, which is why conversation_key arrives
+  // nullable and is filled by the backfill below.
+  addColumn(db, "inbox", "agent_id", "TEXT");
+  addColumn(db, "inbox", "principal_kind", "TEXT NOT NULL DEFAULT 'whatsapp'");
+  addColumn(db, "inbox", "principal_id", "TEXT");
+  addColumn(db, "inbox", "conversation_key", "TEXT");
+  addColumn(db, "inbox", "reply_to", "TEXT");
+  addColumn(db, "inbox", "hop", "INTEGER NOT NULL DEFAULT 0");
+  backfillInboxEnvelope(db);
+  // Created HERE rather than in createSchema: the column it indexes is added by
+  // the step immediately above, so on an existing database a CREATE INDEX in
+  // the schema block would run against a table that does not have it yet and
+  // fail the boot.
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_inbox_conversation_status
+       ON inbox(conversation_key, status);`,
+  );
   // The one step that is not a column: sessions changed their primary key.
   migrateSessionsKey(db, options.legacyAgentIdFor);
+}
+
+/**
+ * Give every legacy inbox row the envelope its door never wrote.
+ *
+ * A row from an older build is a WhatsApp row by definition — that was the only
+ * door — so its conversation is its phone and its principal is that same phone.
+ * `principal_kind` needs nothing: the ADD COLUMN above defaults it to
+ * 'whatsapp', which is what those rows are.
+ *
+ * RUN ON EVERY BOOT, deliberately, rather than only on the boot that added the
+ * columns. Both statements match only NULLs and every writer since fills both,
+ * so the steady-state cost is one scan of a table the TTL keeps to days — and
+ * the alternative is worse than that cost: a crash between the ALTER and the
+ * UPDATE would leave rows whose conversation_key is NULL, which claimInboxBatch
+ * can never match, and those messages would sit unanswered forever with nothing
+ * reporting it.
+ */
+function backfillInboxEnvelope(db: DB): void {
+  db.exec(`
+    UPDATE inbox SET conversation_key = phone WHERE conversation_key IS NULL;
+    UPDATE inbox SET principal_id = phone WHERE principal_id IS NULL;
+  `);
 }
 
 /**

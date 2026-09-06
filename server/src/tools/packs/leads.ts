@@ -6,6 +6,11 @@ import { text, type ToolFactory } from "../factory.js";
  * The leads toolpack: what a conversation captures when the catalog cannot
  * answer it. The phone comes from the TURN, never from the model — a lead filed
  * against a number the model made up reaches nobody.
+ *
+ * Which is also why a turn with NO phone cannot save one: a lead is a promise
+ * to contact somebody back, and a caller that has no phone number leaves
+ * nothing to contact. Refused in words the model can act on rather than with a
+ * placeholder row that a human would later try to call.
  */
 
 export const saveLead: ToolFactory = (ctx, { leads }) =>
@@ -21,8 +26,14 @@ export const saveLead: ToolFactory = (ctx, { leads }) =>
       product_code: z.string().optional().describe("SKU or handle the lead is about, if any"),
     },
     async ({ type, name, note, product_code }) => {
+      const phone = ctx.turn.phone;
+      if (!phone) {
+        return text(
+          "This conversation has no phone number, so a lead saved here could never be answered. Nothing was saved.",
+        );
+      }
       const lead = await leads.save({
-        phone: ctx.turn.phone,
+        phone,
         type,
         name,
         note,

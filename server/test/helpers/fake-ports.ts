@@ -1,4 +1,7 @@
 import type {
+  AgentsPort,
+  AskAgentRequest,
+  AskAgentResult,
   CartLine,
   CatalogPort,
   CatalogSearch,
@@ -207,7 +210,24 @@ export function fakePorts(): FakePorts {
     },
   };
 
-  state.ports = { catalog, leads, media, knowledge };
+  /**
+   * The agent door as a plain object. It REFUSES by default and reaches
+   * nobody: a fake that answered would let a test pass while the real door was
+   * never asked, and every suite but the ask_agent one has no business sending
+   * a message to another agent at all.
+   */
+  const agents: AgentsPort = {
+    reachOf(agentId: string): readonly string[] {
+      record("reachOf", agentId);
+      return [];
+    },
+    async ask(request: AskAgentRequest): Promise<AskAgentResult> {
+      record("askAgent", request);
+      return { ok: false, reason: "reach_denied" };
+    },
+  };
+
+  state.ports = { catalog, leads, media, knowledge, agents };
   return state;
 }
 

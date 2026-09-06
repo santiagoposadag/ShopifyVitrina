@@ -15,8 +15,8 @@ import {
   type InboxRow,
 } from "../data/repo.js";
 import { agentIdForRole } from "../router.js";
-import type { MessageKind, TurnContext } from "../types.js";
-import { whatsappPrincipal, type Envelope } from "./envelope.js";
+import type { MessageKind, Role, TurnContext } from "../types.js";
+import { agentPrincipal, whatsappPrincipal, type Envelope } from "./envelope.js";
 
 /**
  * Total processing attempts a batch's rows get before settling as 'failed'.
@@ -159,7 +159,12 @@ export interface InboxBatcherDeps {
    * role it resolves, and this pair becomes one argument and one derivation.
    */
   onMessage: (envelope: Envelope, ctx: TurnContext) => Promise<void>;
-  roleFor: (phone: string) => TurnContext["role"];
+  /**
+   * The WhatsApp allowlist, as a function. Returns a role for every phone and
+   * is asked about NOTHING ELSE: an agent caller has no phone for it to judge,
+   * and its role is absent rather than defaulted (see TurnContext).
+   */
+  roleFor: (phone: string) => Role;
   /**
    * Turn a stored voice note into words. Optional: with no transcription
    * provider configured, audio rows fall back to a reply asking for text.
@@ -263,18 +268,55 @@ export class InboxBatcher {
   }
 
   /**
+   * Run one conversation's un-settled rows NOW, with no debounce, and resolve
+   * when the turn has settled them.
+   *
+   * The agent door's entry point. Debouncing is a human behaviour — a person
+   * types a listing as a dozen messages — and an agent sends one complete
+   * message, so making it wait out a silence window would add seconds to every
+   * call for nothing (§2.6). Everything else is unchanged: the row went through
+   * the same inbox, this claim increments the same attempts counter, and the
+   * batch settles done/failed exactly as a WhatsApp burst does.
+   *
+   * Through the SAME queue, so the one-turn-at-a-time invariant holds across
+   * both doors: a replayed row and a live call for one conversation cannot
+   * overlap, which is what claimInboxBatch depends on.
+   */
+  deliverNow(conversationKey: string): Promise<void> {
+    return this.deps.queue.enqueue(conversationKey, () => this.processBatch(conversationKey));
+  }
+
+  /**
    * Re-enqueue rows a previous process accepted but never finished. Call once on
-   * boot, BEFORE listening, so replayed messages enter each phone's queue ahead
-   * of new webhook traffic and per-phone ordering holds. Rows coalesce per phone
-   * exactly like live traffic. Returns the number of rows found.
+   * boot, BEFORE listening, so replayed messages enter each conversation's queue
+   * ahead of new traffic and per-conversation ordering holds. Rows coalesce per
+   * conversation exactly like live traffic. Returns the number of rows found.
+   *
+   * Two doors, two ways in, and the difference is the debounce: a WhatsApp
+   * conversation opens a burst window (more of the person's messages may be on
+   * their way), while an agent row is run immediately — nothing is following it,
+   * and its caller is a request that has been waiting since before the crash.
    */
   replayPending(): number {
     const rows = listReplayableInbox(this.deps.db);
-    // Scheduled as "text" even for photo bursts: these rows are ALREADY
-    // persisted, so there is no upload wave still in flight to wait for. The
-    // window only has to cover messages still arriving — and if more photos do
-    // land, their schedule() call upgrades the burst.
-    for (const phone of new Set(rows.map((row) => row.phone))) this.schedule(phone, "text");
+    const conversations = new Map<string, boolean>();
+    for (const row of rows) {
+      // Sticky per conversation: one agent-door row makes the whole
+      // conversation immediate, and the two never mix (an 'a2a:' key cannot be
+      // a phone).
+      conversations.set(
+        row.conversation_key,
+        (conversations.get(row.conversation_key) ?? false) || row.principal_kind === "agent",
+      );
+    }
+    for (const [conversationKey, immediate] of conversations) {
+      // Scheduled as "text" even for photo bursts: these rows are ALREADY
+      // persisted, so there is no upload wave still in flight to wait for. The
+      // window only has to cover messages still arriving — and if more photos do
+      // land, their schedule() call upgrades the burst.
+      if (immediate) void this.deliverNow(conversationKey);
+      else this.schedule(conversationKey, "text");
+    }
     if (rows.length > 0) this.deps.log.info(`Replaying ${rows.length} unfinished inbox message(s)`);
     return rows.length;
   }
@@ -489,22 +531,78 @@ export class InboxBatcher {
   }
 
   /**
-   * Arm a delayed re-flush for a phone whose batch just failed. When it fires,
-   * an OPEN burst for the phone wins: its own flush will claim the pending
-   * retry rows together with the new messages, and firing here too would steal
-   * the burst's rows before its window closed. If the burst already flushed
-   * everything, the claim below returns no rows and this is a no-op.
+   * Arm a delayed re-flush for a conversation whose batch just failed. When it
+   * fires, an OPEN burst for that conversation wins: its own flush will claim
+   * the pending retry rows together with the new messages, and firing here too
+   * would steal the burst's rows before its window closed. If the burst already
+   * flushed everything, the claim returns no rows and this is a no-op. An agent
+   * conversation never has a burst, so the retry always fires there.
    */
-  private armRetry(phone: string): void {
-    if (this.retries.has(phone)) return; // defensive; the per-phone queue serializes failures
+  private armRetry(conversationKey: string): void {
+    // Defensive; the per-conversation queue serializes failures.
+    if (this.retries.has(conversationKey)) return;
     this.retries.set(
-      phone,
+      conversationKey,
       setTimeout(() => {
-        this.retries.delete(phone);
-        if (this.timers.has(phone)) return;
-        void this.deps.queue.enqueue(phone, () => this.processBatch(phone));
+        this.retries.delete(conversationKey);
+        if (this.timers.has(conversationKey)) return;
+        void this.deliverNow(conversationKey);
       }, RETRY_DELAY_MS),
     );
+  }
+
+  /**
+   * Who this batch is from, which agent must answer it, and how it is answered.
+   *
+   * Everything here is read from the CLAIMED ROWS, because the rows are what
+   * the door persisted after authenticating the sender. Null means the rows
+   * cannot be routed at all.
+   */
+  private identify(rows: InboxRow[]): {
+    principal: Envelope["principal"];
+    agentId: string;
+    phone?: string;
+    role?: Role;
+    hop: number;
+    replyTo?: string;
+  } | null {
+    const first = rows[0]!;
+    if (first.principal_kind === "agent") {
+      const callerId = first.principal_id;
+      const agentId = first.agent_id;
+      if (!callerId || !agentId) return null;
+      // The most recent caller's callback wins. Normally there is exactly one
+      // row here — the door refuses a second exchange while one is un-settled —
+      // so this only decides a case that a future door might create.
+      const callbacks = rows.filter((row) => row.reply_to);
+      const replyTo = callbacks[callbacks.length - 1]?.reply_to ?? undefined;
+      return {
+        principal: agentPrincipal(callerId),
+        agentId,
+        // MAX, not the first row's: the hop bounds a forwarding chain, and a
+        // batch that ever merged two messages must be bounded by the longest
+        // chain that produced it, not by whichever arrived first. No phone and
+        // no role — see TurnContext for why neither is defaulted.
+        hop: Math.max(...rows.map((row) => row.hop)),
+        ...(replyTo !== undefined ? { replyTo } : {}),
+      };
+    }
+    // The WhatsApp door: the phone is the one the TRANSPORT authenticated,
+    // never anything read out of the text, and the conversation key IS that
+    // phone. That equality is why this module can go on debouncing per phone
+    // while the queue serializes per conversation. Do not "simplify" the two
+    // back into one field: a door whose caller has no phone still has
+    // conversations.
+    const phone = first.phone;
+    const role = this.deps.roleFor(phone);
+    return {
+      principal: whatsappPrincipal(phone),
+      // Derived from the role for now; the definition router replaces this call.
+      agentId: agentIdForRole(role),
+      phone,
+      role,
+      hop: 0,
+    };
   }
 
   /** Best-effort: a failing hook must not break processBatch's never-throws contract. */
@@ -515,7 +613,10 @@ export class InboxBatcher {
     try {
       await this.deps.onBatchFailure?.(ctx, info);
     } catch (err) {
-      this.deps.log.error({ err, phone: ctx.phone }, "onBatchFailure hook failed");
+      this.deps.log.error(
+        { err, conversationKey: ctx.conversationKey },
+        "onBatchFailure hook failed",
+      );
     }
   }
 
@@ -524,9 +625,9 @@ export class InboxBatcher {
    * returns the rows to 'pending' and arms a delayed retry until the attempt
    * budget (MAX_BATCH_ATTEMPTS) is spent, then the batch settles as 'failed'.
    */
-  private async processBatch(phone: string): Promise<void> {
-    const { db, log, onMessage, roleFor } = this.deps;
-    const rows = claimInboxBatch(db, phone);
+  private async processBatch(conversationKey: string): Promise<void> {
+    const { db, log, onMessage } = this.deps;
+    const rows = claimInboxBatch(db, conversationKey);
     if (rows.length === 0) return;
 
     const ids = rows.map((row) => row.id);
@@ -536,23 +637,39 @@ export class InboxBatcher {
     // on a retry, so Shopify can recognise a replayed stock adjustment. Rows
     // are ordered by arrival and keep their ids, so the anchor holds.
     const turnKey = rows[0]!.dedupe_key;
-    // The identity half of this burst, and the WhatsApp door is where it comes
-    // from: the phone is the one the TRANSPORT authenticated, never anything
-    // read out of the text, and the conversation key IS that phone here. That
-    // equality is why this module can go on debouncing per phone while the
-    // queue serializes per conversation — the same string on this door — and a
-    // burst is a human typing habit rather than a property of a conversation.
-    // Do not "simplify" the two back into one field: a door whose caller has no
-    // phone number still has conversations.
-    const role = roleFor(phone);
-    const principal = whatsappPrincipal(phone);
+    // The identity half of this batch, READ BACK OFF THE ROWS the door wrote.
+    //
+    // That is the whole reason those columns exist. The door is what
+    // authenticated the sender — a signature over the raw body, or a bearer
+    // token looked up in the registry — and by the time this runs, that proof
+    // is gone: the request is over, and a row replayed after a crash has no
+    // request at all. Re-deriving identity here from an allowlist or a registry
+    // would let a row be answered as somebody it was not admitted as.
+    //
+    // A WhatsApp row is the exception, deliberately: its target agent is
+    // resolved HERE, from the phone, because one burst is many rows and
+    // freezing the agent per row would let a burst disagree with itself.
+    const identity = this.identify(rows);
+    if (!identity) {
+      // A row that names an agent principal but no target agent. No door can
+      // write one, so this is a hand-edited or corrupted row rather than a
+      // transient failure — retrying it would fail identically on every
+      // attempt until the cap, three agent-less turns later.
+      markInboxBatchFailed(db, ids);
+      log.error(
+        { conversationKey, inboxIds: ids },
+        "inbox batch has no target agent; settling it failed without a turn",
+      );
+      return;
+    }
     const ctx: TurnContext = {
-      phone,
-      role,
-      // Derived from the role for now; the definition router replaces this call.
-      agentId: agentIdForRole(role),
-      conversationKey: phone,
+      principal: identity.principal,
+      ...(identity.phone !== undefined ? { phone: identity.phone } : {}),
+      ...(identity.role !== undefined ? { role: identity.role } : {}),
+      agentId: identity.agentId,
+      conversationKey,
       turnKey,
+      hop: identity.hop,
     };
     // max, not min: a retried batch absorbs fresh rows (attempts = 1), and min
     // would let one poison row pin ever-growing batches forever. Consequence:
@@ -573,7 +690,10 @@ export class InboxBatcher {
           .filter((row) => row.audio_path)
           .map((row) => unlink(row.audio_path!).catch(() => undefined)),
       );
-      log.error({ phone, inboxIds: ids, attempts }, "inbox batch exceeded attempt cap; giving up");
+      log.error(
+        { conversationKey, inboxIds: ids, attempts },
+        "inbox batch exceeded attempt cap; giving up",
+      );
       await this.notifyFailure(ctx, {
         final: true,
         attempts,
@@ -610,14 +730,15 @@ export class InboxBatcher {
     // single-message envelope will use — the agent door has its text from the
     // start and can build the envelope outright.
     const envelope: Envelope = {
-      principal,
+      principal: ctx.principal,
       agentId: ctx.agentId,
       conversationKey: ctx.conversationKey,
       text,
       turnKey: ctx.turnKey,
-      // A human door starts every chain: nothing forwarded this message here,
-      // so there is no loop for the hop cap to break yet.
-      hop: 0,
+      // Set by the door for an agent caller; a human door starts every chain,
+      // so nothing forwarded that message and there is no loop to break yet.
+      hop: ctx.hop,
+      ...(identity.replyTo !== undefined ? { replyTo: identity.replyTo } : {}),
     };
 
     try {
@@ -629,9 +750,9 @@ export class InboxBatcher {
         markInboxBatchFailed(db, ids);
       } else {
         markInboxBatchPending(db, ids);
-        this.armRetry(phone);
+        this.armRetry(conversationKey);
       }
-      log.error({ err, phone, inboxIds: ids, attempts, final }, "inbox batch failed");
+      log.error({ err, conversationKey, inboxIds: ids, attempts, final }, "inbox batch failed");
       await this.notifyFailure(ctx, { final, attempts, error: err });
     }
   }

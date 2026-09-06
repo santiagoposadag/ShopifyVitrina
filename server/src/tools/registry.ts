@@ -1,6 +1,6 @@
 import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentDefinition, ToolUniverse } from "../agent/definition.js";
-import { SEARCH_KNOWLEDGE_TOOL } from "../agent/definition.js";
+import { ASK_AGENT_TOOL, SEARCH_KNOWLEDGE_TOOL } from "../agent/definition.js";
 import { searchKnowledge } from "../knowledge/tool.js";
 import type { TurnContext } from "../types.js";
 import { newToolContext, type SdkTool, type ToolFactory } from "./factory.js";
@@ -18,6 +18,7 @@ import {
   searchCatalog,
   updateProduct,
 } from "./packs/catalog.js";
+import { askAgent } from "./packs/agents.js";
 import { buildCart } from "./packs/cart.js";
 import { listLeads, saveLead } from "./packs/leads.js";
 import { attachPendingPhotos } from "./packs/media.js";
@@ -66,6 +67,12 @@ export const TOOL_REGISTRY: ReadonlyMap<string, ToolEntry> = new Map<string, Too
   ["attach_pending_photos", { name: "attach_pending_photos", create: attachPendingPhotos }],
   ["list_locations", { name: "list_locations", create: listLocations }],
   ["list_leads", { name: "list_leads", create: listLeads }],
+  // Served to nobody in this build: neither shipped definition declares it, and
+  // giving one of them the ability to ask another assistant is a decision about
+  // what a CUSTOMER-facing agent can reach, not a wiring detail. Enabling it is
+  // an edit to an agent.yaml (tools[] plus a reach entry), which the boot
+  // validator checks as a pair.
+  [ASK_AGENT_TOOL, { name: ASK_AGENT_TOOL, create: askAgent }],
   // The key is the constant agent/definition.ts validates the pairing against,
   // so the name the boot check looks for and the name the registry serves
   // cannot drift apart.

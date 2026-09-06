@@ -154,9 +154,24 @@ export type InboxStatus = "pending" | "processing" | "done" | "failed";
  */
 export type InboxMediaKind = "photo" | "audio";
 
+/**
+ * Which door authenticated this row's sender. Mirrors `Principal`'s own tags
+ * (inbox/envelope.ts) rather than importing them, for the same reason
+ * MessageKind lives in types.ts: this module must be able to type its columns
+ * without importing a module that imports it back.
+ */
+export type PrincipalKind = "whatsapp" | "agent";
+
 export interface InboxRow {
   id: number;
   dedupe_key: string;
+  /**
+   * The WhatsApp sender. EMPTY STRING on an agent-door row: the column is NOT
+   * NULL and predates the second door, and an agent caller has no phone. Empty
+   * rather than the caller's id, deliberately — a phone column holding
+   * "super-agent" could be handed to sendText, and the only thing worse than a
+   * failed send is a successful one to a stranger.
+   */
   phone: string;
   agent_text: string;
   /** What the event was, straight from the webhook — never re-derived from the text. */
@@ -178,6 +193,24 @@ export interface InboxRow {
   media_name: string | null;
   /** WhatsApp's send stamp (unix seconds), on its way to pending_media.sent_at. */
   media_sent_at: number | null;
+  /** The TARGET agent. NULL on a WhatsApp row — resolved when the burst flushes. */
+  agent_id: string | null;
+  principal_kind: PrincipalKind;
+  /** The phone, or the CALLING agent's id as its credential identified it. */
+  principal_id: string | null;
+  /**
+   * What claimInboxBatch claims by: the phone, or an 'a2a:' correlation key.
+   *
+   * Typed non-null although the column is nullable. Nothing can write NULL —
+   * the insert resolves it in SQL — and the boot backfill fills the rows
+   * written before the column existed, so a NULL here would mean a row written
+   * by a build that no longer exists.
+   */
+  conversation_key: string;
+  /** A callback URL for a caller that cannot take the reply in its response. */
+  reply_to: string | null;
+  /** Agent-to-agent hops that produced this message; 0 from a human door. */
+  hop: number;
   status: InboxStatus;
   attempts: number;
   received_at: string;
@@ -205,16 +238,37 @@ export function insertInboxMessage(
     media_mime?: string | null;
     media_name?: string | null;
     media_sent_at?: number | null;
+    /** The TARGET agent. Only the agent door knows it at insert time. */
+    agent_id?: string | null;
+    principal_kind?: PrincipalKind;
+    /** The caller as its DOOR identified it. Defaults to the phone. */
+    principal_id?: string | null;
+    /**
+     * Defaults to the phone, which is what it IS on the WhatsApp door — so
+     * every caller written before a second door existed keeps working and keeps
+     * meaning the same thing.
+     */
+    conversation_key?: string | null;
+    reply_to?: string | null;
+    hop?: number;
   },
 ): InboxRow | null {
   const info = db
     .prepare(
       `INSERT OR IGNORE INTO inbox
          (dedupe_key, phone, agent_text, kind, audio_path,
-          media_ref, media_kind, media_mime, media_name, media_sent_at)
+          media_ref, media_kind, media_mime, media_name, media_sent_at,
+          agent_id, principal_kind, principal_id, conversation_key, reply_to, hop)
        VALUES
          (@dedupe_key, @phone, @agent_text, @kind, @audio_path,
-          @media_ref, @media_kind, @media_mime, @media_name, @media_sent_at)`,
+          @media_ref, @media_kind, @media_mime, @media_name, @media_sent_at,
+          @agent_id, @principal_kind, @principal_id,
+          -- The phone IS the conversation on the WhatsApp door. Resolved in SQL
+          -- so no caller can persist a row with no conversation at all: such a
+          -- row can never be claimed, and never claimed means a message that is
+          -- never answered and never reported.
+          COALESCE(@conversation_key, @phone),
+          @reply_to, @hop)`,
     )
     .run({
       kind: "text",
@@ -224,10 +278,56 @@ export function insertInboxMessage(
       media_mime: null,
       media_name: null,
       media_sent_at: null,
+      agent_id: null,
+      principal_kind: "whatsapp",
+      conversation_key: null,
+      reply_to: null,
+      hop: 0,
       ...input,
+      // Defaulted from the phone rather than left null: on the WhatsApp door
+      // the sender IS the principal, and an audit column that is empty for
+      // every row written before a second door existed answers no question.
+      principal_id: input.principal_id ?? input.phone,
     });
   if (info.changes === 0) return null;
   return getInboxRow(db, Number(info.lastInsertRowid));
+}
+
+/**
+ * Persist an agent-door message, unless that conversation already has one in
+ * flight.
+ *
+ * ONE EXCHANGE AT A TIME PER CONVERSATION, and this is where it is enforced.
+ * `claimInboxBatch` takes every un-settled row of a conversation at once, so
+ * two exchanges opened on one key would be answered by a single turn — and
+ * "which of you asked this" then has no answer, because the reply is one string
+ * and the two callers are two open requests. Refusing is something a caller can
+ * act on; merging is how one agent receives another's answer.
+ *
+ * ONE IMMEDIATE TRANSACTION over the look and the write. A check followed by an
+ * insert would let two simultaneous requests each find nothing and each insert;
+ * taking the write lock up front makes the loser block and then re-read inside
+ * the lock, where it sees the row the winner wrote. Same reasoning as the
+ * sessions rebuild in data/db.ts.
+ *
+ * `busy` and a null `row` are different answers: busy means an exchange is
+ * still running, null means this exact message id was already accepted (the
+ * UNIQUE dedupe key absorbed it), and a caller acts differently on each.
+ */
+export function insertAgentInboxMessage(
+  db: DB,
+  input: Parameters<typeof insertInboxMessage>[1] & { conversation_key: string },
+): { row: InboxRow | null; busy: boolean } {
+  const inFlight = db.prepare(
+    `SELECT 1 FROM inbox
+     WHERE conversation_key = ? AND status IN ('pending','processing')
+     LIMIT 1`,
+  );
+  const tx = db.transaction((): { row: InboxRow | null; busy: boolean } => {
+    if (inFlight.get(input.conversation_key)) return { row: null, busy: true };
+    return { row: insertInboxMessage(db, input), busy: false };
+  });
+  return tx.immediate();
 }
 
 /**
@@ -280,30 +380,36 @@ export function getInboxRow(db: DB, id: number): InboxRow | null {
 }
 
 /**
- * Claim every un-settled row for a phone as ONE batch: 'pending' rows plus
- * 'processing' rows a previous process crashed on. Marking them in a single
- * transaction keeps at-least-once intact — a crash mid-batch leaves them
+ * Claim every un-settled row of ONE CONVERSATION as a batch: 'pending' rows
+ * plus 'processing' rows a previous process crashed on. Marking them in a
+ * single transaction keeps at-least-once intact — a crash mid-batch leaves them
  * 'processing', so listReplayableInbox picks the whole burst up again on boot.
  *
  * Ordered by arrival (received_at is only second-resolution, so id breaks ties)
  * because the joined prompt has to read in the order the user typed it.
  *
- * Callers MUST run this inside the phone's queue: serialization is what stops
- * two batches from claiming the same rows.
+ * BY CONVERSATION, NOT BY PHONE. On the WhatsApp door the two are the same
+ * string and this behaves exactly as it always did; on the agent door the key
+ * is a namespaced correlation id, and that namespace is what stops an agent's
+ * exchange from claiming — answering, and settling — a person's pending
+ * messages by naming their phone number as its correlation id.
+ *
+ * Callers MUST run this inside the conversation's queue: serialization is what
+ * stops two batches from claiming the same rows.
  */
-export function claimInboxBatch(db: DB, phone: string): InboxRow[] {
+export function claimInboxBatch(db: DB, conversationKey: string): InboxRow[] {
   const select = db.prepare(
     `SELECT * FROM inbox
-     WHERE phone = ? AND status IN ('pending','processing')
+     WHERE conversation_key = ? AND status IN ('pending','processing')
      ORDER BY received_at ASC, id ASC`,
   );
   const claim = db.prepare(
     `UPDATE inbox SET status = 'processing', attempts = attempts + 1 WHERE id = ?`,
   );
   // Read and claim share one transaction, so the batch is atomic even if a
-  // future caller ever violates the per-phone-queue invariant above.
+  // future caller ever violates the per-conversation-queue invariant above.
   const tx = db.transaction((): InboxRow[] => {
-    const rows = select.all(phone) as InboxRow[];
+    const rows = select.all(conversationKey) as InboxRow[];
     for (const row of rows) claim.run(row.id);
     return rows.map((row) => ({ ...row, status: "processing" as const, attempts: row.attempts + 1 }));
   });

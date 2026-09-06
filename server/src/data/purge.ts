@@ -1,5 +1,6 @@
 import type { Config } from "../config.js";
 import { isOwner } from "../config.js";
+import { isAgentConversationKey } from "../inbox/envelope.js";
 import type { DB } from "./db.js";
 import { clearSessionId, listSessions } from "./repo.js";
 import { deleteTranscript, sweepOrphanedTranscripts } from "./transcripts.js";
@@ -17,6 +18,8 @@ export interface PurgeResult {
   purged: number;
   /** Owner sessions deliberately left alone. */
   kept: number;
+  /** Agent-to-agent exchanges left alone. Reported, never silently skipped. */
+  keptAgent: number;
   /** Orphaned transcripts collected, or null when no root was configured. */
   swept: number | null;
 }
@@ -32,11 +35,19 @@ export interface PurgeResult {
  *
  * The allowlist is consulted with the session's CONVERSATION KEY, which on the
  * WhatsApp door is the phone — so this decides exactly what it decided when
- * sessions were keyed by phone alone. It stays correct only while every stored
- * key is a phone. The moment a door stores something else (an agent-to-agent
- * correlation id), that key will not match any allowlist entry and its session
- * will be purged as a customer's; whoever adds that door has to decide what a
- * purge means for it rather than inheriting this rule by default.
+ * sessions were keyed by phone alone.
+ *
+ * AGENT-TO-AGENT EXCHANGES ARE KEPT, and that is this door's answer to the
+ * question the phase before it left open. Their key is a correlation id, which
+ * no allowlist can ever contain, so `isOwner` would read every one of them as a
+ * customer's — a false negative by construction rather than a decision. And the
+ * thing it would delete is not a customer's history: there is no person and no
+ * personal data behind it, only a machine that may be mid-exchange, which is
+ * the same in-progress work the owner exemption exists to protect. Same
+ * reasoning as assertOwnerAllowlist below: where the allowlist cannot answer,
+ * the destructive default is the wrong one. An operator who does want them gone
+ * deletes the caller's registry row — the door closes, and the sessions expire
+ * on their own sliding window.
  *
  * `root` is the transcript directory, or undefined to skip the disk half
  * entirely (see transcripts.ts for why it has no default). Dropping the row is
@@ -69,7 +80,10 @@ export function purgeCustomerSessions(db: DB, config: PurgeConfig, root?: string
   assertOwnerAllowlist(config);
 
   const sessions = listSessions(db);
-  const customers = sessions.filter((s) => !isOwner(config, s.conversation_key));
+  const agents = sessions.filter((s) => isAgentConversationKey(s.conversation_key));
+  const customers = sessions.filter(
+    (s) => !isAgentConversationKey(s.conversation_key) && !isOwner(config, s.conversation_key),
+  );
 
   for (const session of customers) {
     clearSessionId(db, session.agent_id, session.conversation_key);
@@ -84,5 +98,10 @@ export function purgeCustomerSessions(db: DB, config: PurgeConfig, root?: string
       )
     : null;
 
-  return { purged: customers.length, kept: sessions.length - customers.length, swept };
+  return {
+    purged: customers.length,
+    kept: sessions.length - customers.length - agents.length,
+    keptAgent: agents.length,
+    swept,
+  };
 }

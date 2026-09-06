@@ -32,11 +32,11 @@ interface Harness {
   /** Exposed so a test can wait for the flush chain to actually drain. */
   queue: PerConversationQueue;
   /** One entry per agent turn: exactly what the agent was asked to answer. */
-  turns: { phone: string; role: TurnContext["role"]; text: string }[];
+  turns: { phone: TurnContext["phone"]; role: TurnContext["role"]; text: string }[];
   /** The envelope the door produced for each turn, untouched. */
   envelopes: Envelope[];
   /** One entry per failed attempt, in order — final marks the terminal one. */
-  failures: { phone: string; final: boolean; attempts: number }[];
+  failures: { phone: TurnContext["phone"]; final: boolean; attempts: number }[];
 }
 
 function harness(overrides: Partial<InboxBatcherDeps> = {}): Harness {

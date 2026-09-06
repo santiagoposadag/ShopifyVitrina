@@ -38,11 +38,13 @@ const PHONE = "573001112233";
  */
 function ctxFor(role: Role): TurnContext {
   return {
+    principal: whatsappPrincipal(PHONE),
     phone: PHONE,
     role,
     agentId: agentIdForRole(role),
     conversationKey: PHONE,
     turnKey: "msg:1",
+    hop: 0,
   };
 }
 
@@ -131,6 +133,16 @@ const PORTS: ToolPorts = {
   leads: sqliteLeadsPort(portsDb),
   media: sqliteMediaPort(portsDb),
   knowledge: KNOWLEDGE,
+  // Neither shipped definition declares ask_agent, so no turn here can reach
+  // this; it throws rather than answering, for the same reason the fetch given
+  // to these tests throws — a turn that ever did reach another agent from this
+  // suite must fail loudly instead of quietly succeeding.
+  agents: {
+    reachOf: () => [],
+    ask: () => {
+      throw new Error("a runtime test must not ask another agent");
+    },
+  },
 };
 
 /**
@@ -168,7 +180,7 @@ async function runAndRespond(
   channel: WhatsAppChannel,
 ): Promise<string> {
   const reply = await runAgentTurn(deps, ctx, text);
-  await new Responders(channel).for(whatsappPrincipal(ctx.phone)).deliver(reply);
+  await new Responders(channel).for(ctx.principal).deliver(reply);
   return reply;
 }
 

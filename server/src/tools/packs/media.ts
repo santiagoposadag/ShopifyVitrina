@@ -18,12 +18,20 @@ export const attachPendingPhotos: ToolFactory = (ctx, { catalog, media }) =>
     ),
     { ref: z.string().describe("SKU, handle, or Shopify id of the product to upload them to") },
     async ({ ref }) => {
+      // Pending photos belong to a CHAT: they were sent to us by a person, and
+      // they are claimed by that person's phone. A turn with no phone has no
+      // pending photos by construction, and asking for "everyone's" would upload
+      // one owner's product shots to whatever product another caller named.
+      const phone = ctx.turn.phone;
+      if (!phone) {
+        return text("This conversation has no photos of its own to upload. Nothing was uploaded.");
+      }
       try {
         const resolved = await catalog.resolve(ref);
         if (!resolved) {
           return text(`No product found for "${ref}". Create it first with create_product.`);
         }
-        const pending = await media.listPending(ctx.turn.phone);
+        const pending = await media.listPending(phone);
         if (pending.length === 0) return text("No pending photos from this chat to upload.");
 
         // Arrival order is the order the owner shot them in, and the first one
