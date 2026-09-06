@@ -1,5 +1,7 @@
 import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentDefinition, ToolUniverse } from "../agent/definition.js";
+import { SEARCH_KNOWLEDGE_TOOL } from "../agent/definition.js";
+import { searchKnowledge } from "../knowledge/tool.js";
 import type { TurnContext } from "../types.js";
 import { newToolContext, type SdkTool, type ToolFactory } from "./factory.js";
 import type { ToolPorts } from "./ports.js";
@@ -64,6 +66,10 @@ export const TOOL_REGISTRY: ReadonlyMap<string, ToolEntry> = new Map<string, Too
   ["attach_pending_photos", { name: "attach_pending_photos", create: attachPendingPhotos }],
   ["list_locations", { name: "list_locations", create: listLocations }],
   ["list_leads", { name: "list_leads", create: listLeads }],
+  // The key is the constant agent/definition.ts validates the pairing against,
+  // so the name the boot check looks for and the name the registry serves
+  // cannot drift apart.
+  [SEARCH_KNOWLEDGE_TOOL, { name: SEARCH_KNOWLEDGE_TOOL, create: searchKnowledge }],
 ]);
 
 /**

@@ -1,3 +1,4 @@
+import type { PromptKnowledge } from "../knowledge/store.js";
 import type { AgentDefinition } from "./definition.js";
 
 /**
@@ -41,13 +42,71 @@ function renderSlots(text: string, slots: Record<string, string>): string {
 }
 
 /**
- * Compose one agent's system prompt: base, then persona, joined the same way
- * `systemPrompt(role)` used to join `shared` and its role branch — a blank
- * line, nothing else. Byte-identical for the two agents that exist today; see
- * the golden fixtures in test/prompt.test.ts.
+ * The framing around an agent's inline knowledge.
+ *
+ * English, like every other instruction here, while the documents it introduces
+ * are Spanish — they are quoted to a Colombian shop owner in their own words.
+ *
+ * The second line is the one that has to be there. GROUNDING_PREAMBLE says
+ * product facts may only come from a tool result in this conversation, and this
+ * section hands the model a block of facts with no tool call behind it: without
+ * saying which kind of fact these are, the cheapest reading is that the rule
+ * just got relaxed, and the next price the model quotes comes from a document
+ * that was written months ago.
  */
-export function composePrompt(definition: AgentDefinition): string {
+const KNOWLEDGE_PREAMBLE = `BUSINESS KNOWLEDGE — how this business and this store work, written by its owner.
+- You may state what is below without a tool call: it is vocabulary and policy, not product data.
+- Price, SKU, stock, availability and URLs still come ONLY from a tool result in THIS conversation, whatever this section says.
+- Never present an example in it as a real product.`;
+
+/**
+ * Written ONLY for an agent that actually has a searchable tier.
+ *
+ * A prompt telling an agent to call a tool it was not given is the exact hole
+ * the Phase 2 validator closes from the other side; here it would also be
+ * unfalsifiable from the outside — the model would report that it looked
+ * something up and found nothing.
+ */
+const SEARCH_KNOWLEDGE_INSTRUCTION = `More of this business's knowledge is indexed and is NOT in this prompt. Before answering a question about its policies, vocabulary or procedures that you cannot already answer from the section above, call search_knowledge with the person's own words and answer from what it returns. If it returns nothing, say it is not recorded rather than answering from general knowledge.`;
+
+/**
+ * The knowledge section of a composed prompt, or "" for an agent with none.
+ *
+ * Exported for tests: this is the only part of the prompt that is not pinned
+ * byte-for-byte against the pre-refactor `systemPrompt`, so it needs its own pin.
+ */
+export function knowledgeSection(knowledge: PromptKnowledge | undefined): string {
+  if (!knowledge) return "";
+  const parts: string[] = [];
+  if (knowledge.inlineText.length > 0) parts.push(KNOWLEDGE_PREAMBLE, knowledge.inlineText);
+  if (knowledge.hasSearchable) {
+    // The preamble still applies when there is no inline tier: it is what says
+    // these facts are not product data.
+    if (parts.length === 0) parts.push(KNOWLEDGE_PREAMBLE);
+    parts.push(SEARCH_KNOWLEDGE_INSTRUCTION);
+  }
+  return parts.join("\n\n");
+}
+
+/**
+ * Compose one agent's system prompt: base, then persona, then knowledge —
+ * joined the same way `systemPrompt(role)` used to join `shared` and its role
+ * branch: a blank line, nothing else.
+ *
+ * ADDITIVE, and that is a requirement rather than an implementation detail. The
+ * personas are tuned and pinned byte-for-byte against the pre-refactor
+ * `systemPrompt` (test/prompt.test.ts's golden fixtures), so knowledge is
+ * appended and nothing is moved out of prompt.md. An agent with no knowledge —
+ * `knowledge` undefined, which is what the base returns for one that declares
+ * none — composes exactly the bytes it composed before this phase existed.
+ */
+export function composePrompt(
+  definition: AgentDefinition,
+  knowledge?: PromptKnowledge,
+): string {
   const base = BASES[definition.prompt.base];
   const persona = renderSlots(definition.personaText, definition.prompt.slots);
-  return base.length > 0 ? `${base}\n\n${persona}` : persona;
+  const head = base.length > 0 ? `${base}\n\n${persona}` : persona;
+  const section = knowledgeSection(knowledge);
+  return section.length > 0 ? `${head}\n\n${section}` : head;
 }

@@ -14,7 +14,9 @@ import { toolUniverse } from "../src/tools/registry.js";
 import { shopifyCatalogPort } from "../src/shopify/catalog-port.js";
 import { sqliteLeadsPort, sqliteMediaPort } from "../src/data/tool-ports.js";
 import type { ToolPorts } from "../src/tools/ports.js";
+import { openKnowledgeBase } from "../src/knowledge/store.js";
 import { loadAndValidateDefinitions, type AgentDefinition } from "../src/agent/definition.js";
+import { composePrompt } from "../src/agent/prompt.js";
 import type { Role, TurnContext } from "../src/types.js";
 
 // Only `query` is faked; tools.ts imports createSdkMcpServer/tool from the same
@@ -117,10 +119,18 @@ const DEFINITIONS: Record<string, AgentDefinition> = Object.fromEntries(
  * servable set through the real registry.
  */
 const portsDb = openDb(":memory:");
+/**
+ * The knowledge base the turns below run with: empty, and deliberately not the
+ * shipped one. These tests pin the SDK loop, and an agent's documents are
+ * pinned in knowledge.test.ts — what this has to be is a real KnowledgeBase, so
+ * the wiring it travels through is the wiring production uses.
+ */
+const KNOWLEDGE = openKnowledgeBase(portsDb, []);
 const PORTS: ToolPorts = {
   catalog: shopifyCatalogPort({ client: SHOPIFY, cache: CACHE, config: CONFIG }),
   leads: sqliteLeadsPort(portsDb),
   media: sqliteMediaPort(portsDb),
+  knowledge: KNOWLEDGE,
 };
 
 /**
@@ -241,6 +251,7 @@ describe("runAgentTurn session fallback", () => {
       } as never,
       ports: PORTS,
       definitions: DEFINITIONS,
+      knowledge: KNOWLEDGE,
     };
   });
 
@@ -350,6 +361,7 @@ describe("runAgentTurn session reset after publish", () => {
       log: { warn: () => undefined, info: () => undefined } as never,
       ports: PORTS,
       definitions: DEFINITIONS,
+      knowledge: KNOWLEDGE,
     };
   });
 
@@ -447,6 +459,7 @@ describe("runAgentTurn tool accounting", () => {
       },
       ports: PORTS,
       definitions: DEFINITIONS,
+      knowledge: KNOWLEDGE,
     } as never;
   });
 
@@ -495,6 +508,7 @@ describe("runAgentTurn tool surface", () => {
       log: { warn: () => undefined, info: () => undefined, error: () => undefined },
       ports: PORTS,
       definitions: DEFINITIONS,
+      knowledge: KNOWLEDGE,
     } as never as Parameters<typeof runAgentTurn>[0];
 
     await runAgentTurn(deps, ctxFor("owner"), "hola");
@@ -513,6 +527,7 @@ describe("runAgentTurn tool surface", () => {
       log: { warn: () => undefined, info: () => undefined, error: () => undefined },
       ports: PORTS,
       definitions: DEFINITIONS,
+      knowledge: KNOWLEDGE,
     } as never as Parameters<typeof runAgentTurn>[0];
 
     await runAgentTurn(deps, ctxFor("owner"), "hola");
@@ -547,6 +562,7 @@ describe("runAgentTurn tool surface", () => {
       log: { warn: () => undefined, info: () => undefined, error: () => undefined },
       ports: PORTS,
       definitions: overridden,
+      knowledge: KNOWLEDGE,
     } as never as Parameters<typeof runAgentTurn>[0];
 
     await runAgentTurn(deps, ctxFor("owner"), "hola");
@@ -566,6 +582,7 @@ describe("runAgentTurn tool surface", () => {
       log: { warn: () => undefined, info: () => undefined, error: () => undefined },
       ports: PORTS,
       definitions: DEFINITIONS,
+      knowledge: KNOWLEDGE,
     } as never as Parameters<typeof runAgentTurn>[0];
 
     await runAgentTurn(deps, ctxFor("owner"), "hola");
@@ -600,6 +617,7 @@ describe("runAgentTurn never answers with silence", () => {
       } as never,
       ports: PORTS,
       definitions: DEFINITIONS,
+      knowledge: KNOWLEDGE,
     };
   });
 
@@ -661,6 +679,7 @@ describe("runAgentTurn returns the reply", () => {
       log: { warn: () => undefined, info: () => undefined, error: () => undefined } as never,
       ports: PORTS,
       definitions: DEFINITIONS,
+      knowledge: KNOWLEDGE,
     };
   });
 
@@ -716,6 +735,7 @@ describe("runAgentTurn session key", () => {
       log: { warn: () => undefined, info: () => undefined, error: () => undefined } as never,
       ports: PORTS,
       definitions: DEFINITIONS,
+      knowledge: KNOWLEDGE,
     };
   });
 
@@ -770,6 +790,7 @@ describe("runAgentTurn session.maxAgeDays override", () => {
       log: { warn: () => undefined, info: () => undefined, error: () => undefined } as never,
       ports: PORTS,
       definitions: DEFINITIONS,
+      knowledge: KNOWLEDGE,
     };
   });
 
@@ -829,5 +850,67 @@ describe("agentIdForRole", () => {
   it("routes the owner to the inventory agent and everyone else to sales", () => {
     expect(agentIdForRole("owner")).toBe("vitrina-inventario");
     expect(agentIdForRole("customer")).toBe("vitrina-ventas");
+  });
+});
+
+/**
+ * The knowledge base reaches the model through the SYSTEM PROMPT, and that is
+ * the one link nothing else in this file would catch: an agent whose documents
+ * never made it into the prompt answers perfectly well, from memory, and no
+ * assertion about the reply could tell the difference.
+ */
+describe("runAgentTurn composes the prompt with this agent's own knowledge", () => {
+  let db: DB;
+
+  beforeEach(() => {
+    queryMock.mockReset();
+    db = openDb(":memory:");
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  function depsWith(knowledge: ReturnType<typeof openKnowledgeBase>) {
+    return {
+      db,
+      config: CONFIG,
+      log: { warn: () => undefined, info: () => undefined, error: () => undefined },
+      ports: PORTS,
+      definitions: DEFINITIONS,
+      knowledge,
+    } as never as Parameters<typeof runAgentTurn>[0];
+  }
+
+  it("appends the inline slice and the search instruction, after the persona", async () => {
+    queryMock.mockReturnValueOnce(successStream("s1", "Hola"));
+    const knowledge = openKnowledgeBase(db, [
+      {
+        agentId: AGENT_IDS.owner,
+        prompt: { inlineText: "DATO DE PRUEBA DEL NEGOCIO.", hasSearchable: true },
+        chunks: [],
+        inlineTokens: 9,
+      },
+    ]);
+
+    await runAgentTurn(depsWith(knowledge), ctxFor("owner"), "hola");
+
+    const [{ options }] = queryMock.mock.calls[0] as [{ options: { systemPrompt: string } }];
+    const persona = composePrompt(DEFINITIONS[AGENT_IDS.owner] as AgentDefinition);
+    // The persona half, byte for byte, and the knowledge strictly after it.
+    expect(options.systemPrompt.startsWith(`${persona}\n\n`)).toBe(true);
+    expect(options.systemPrompt).toContain("DATO DE PRUEBA DEL NEGOCIO.");
+    expect(options.systemPrompt).toContain("search_knowledge");
+  });
+
+  it("changes nothing for an agent the base has no knowledge for", async () => {
+    queryMock.mockReturnValueOnce(successStream("s1", "Hola"));
+
+    await runAgentTurn(depsWith(openKnowledgeBase(db, [])), ctxFor("customer"), "hola");
+
+    const [{ options }] = queryMock.mock.calls[0] as [{ options: { systemPrompt: string } }];
+    expect(options.systemPrompt).toBe(
+      composePrompt(DEFINITIONS[AGENT_IDS.customer] as AgentDefinition),
+    );
   });
 });

@@ -33,6 +33,13 @@ const OWNER_ONLY_TOOLS = [
   "attach_pending_photos",
   "list_locations",
   "list_leads",
+  // Phase 4. NOT one of the pre-split fourteen: this list was captured from
+  // the role-selected owner set in agent/tools.ts, and search_knowledge did not
+  // exist then. It is here because agents/vitrina-inventario/agent.yaml
+  // deliberately declares it — the pin caught that change, which is its job.
+  // It stays a strict set equality: a tool that arrives without an edit here is
+  // a tool nobody decided to grant.
+  "search_knowledge",
 ];
 
 function turnContext(overrides: Partial<TurnContext> = {}): TurnContext {

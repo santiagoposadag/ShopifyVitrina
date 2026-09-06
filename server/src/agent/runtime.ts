@@ -5,6 +5,7 @@ import type { DB } from "../data/db.js";
 import { clearSessionId, getSessionId, setSessionId } from "../data/repo.js";
 import { buildToolServer, MCP_SERVER_NAME } from "../tools/registry.js";
 import type { ToolPorts } from "../tools/ports.js";
+import type { KnowledgeBase } from "../knowledge/store.js";
 import type { AgentDefinition } from "./definition.js";
 import { composePrompt } from "./prompt.js";
 import type { TurnContext } from "../types.js";
@@ -50,6 +51,18 @@ export interface AgentDeps {
    * restart, once something sets one.
    */
   definitions: Record<string, AgentDefinition>;
+  /**
+   * Every agent's knowledge, loaded and indexed once at boot (see
+   * knowledge/store.ts). Required rather than optional: an agent whose
+   * definition declares knowledge and whose runtime was handed none would
+   * compose a prompt that is missing it — no error, no log line, just an
+   * assistant that has quietly forgotten what its owner told it.
+   *
+   * Consulted per turn rather than at boot for the same reason the prompt is
+   * composed per turn: nothing here is cached, so a future reload changes the
+   * next turn rather than needing a restart.
+   */
+  knowledge: KnowledgeBase;
   /**
    * Only the levels this module uses: per-turn usage and each tool call (info),
    * a session fallback and a denied tool (warn), and a turn that ended with no
@@ -232,7 +245,7 @@ async function runQuery(
   incomingText: string,
   resumeId: string | undefined,
 ): Promise<TurnResult> {
-  const { config, ports, log } = deps;
+  const { config, knowledge, ports, log } = deps;
   // Exactly `definition.tools[]`, in the order the definition lists them. The
   // role on the context selects nothing here any more.
   const { server, toolNames } = buildToolServer({ definition, ctx, ports });
@@ -251,7 +264,10 @@ async function runQuery(
       model: config.model,
       env: buildAgentEnv(config),
       ...(config.maxThinkingTokens > 0 ? { maxThinkingTokens: config.maxThinkingTokens } : {}),
-      systemPrompt: composePrompt(definition),
+      // base + persona + this agent's own knowledge. `promptFor` returns
+      // undefined for an agent that declares none, and the composition is then
+      // byte-for-byte what it was before the knowledge base existed.
+      systemPrompt: composePrompt(definition, knowledge.promptFor(definition.id)),
       mcpServers: { [MCP_SERVER_NAME]: server },
       // REMOVE every built-in tool from the model's context. This is the option
       // that actually restricts what exists; allowedTools only auto-approves,

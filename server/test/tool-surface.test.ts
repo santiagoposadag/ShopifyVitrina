@@ -34,6 +34,15 @@ const FIXTURES_DIR = join(import.meta.dirname, "fixtures");
  * descriptions were rewritten". Slot rendering is included by construction:
  * both shipped definitions declare `slots: {}`, so every template must fall
  * back to the literal it replaced.
+ *
+ * ONE ENTRY HAS A DIFFERENT PROVENANCE, and it matters for how much this
+ * fixture is worth as evidence: `search_knowledge` (owner, last in the array)
+ * has NO pre-split counterpart — the tool was introduced by phase 4's knowledge
+ * base, so its entry was captured from the code that introduced it rather than
+ * from agent/tools.ts. Every other entry here predates the registry split and
+ * is the byte-identity evidence for it. Do not regenerate the whole file: that
+ * would silently turn all of it into a snapshot of current code, which proves
+ * nothing about what the descriptions used to say.
  */
 function goldenSurface(): Record<string, ToolSurface[]> {
   return JSON.parse(readFileSync(join(FIXTURES_DIR, "tool-surface.json"), "utf8")) as Record<

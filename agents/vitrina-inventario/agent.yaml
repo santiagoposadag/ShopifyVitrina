@@ -27,14 +27,40 @@ tools:
   - attach_pending_photos
   - list_locations
   - list_leads
+  # The knowledge base's own tool. Declared here and knowledge.searchable below
+  # are checked against each other at boot, in BOTH directions: documents no
+  # tool can read, and a tool with nothing to read, are each a silent hole.
+  - search_knowledge
 prompt:
   base: grounding
   persona: prompt.md
   slots: {}
 knowledge:
-  inline: []
-  searchable: []
-  maxInlineTokens: 0
+  # Two tiers, and the split is not about size for its own sake.
+  #
+  # INLINE is in the system prompt on every turn, which is the only thing a
+  # RESUMED transcript is guaranteed to carry: vocabulary the assistant must
+  # never be without goes here, and it is paid for on every turn.
+  #
+  # SEARCHABLE is indexed (FTS5) and reached through search_knowledge, so the
+  # grounding rule keeps holding — the assistant states what a tool returned —
+  # and long procedures cost nothing on the turns that do not need them.
+  #
+  # Paths are relative to this directory and must stay under knowledge/. Every
+  # .md file in there must be declared by one of the two lists: a document
+  # nothing declares is one no turn can reach, and boot fails on it rather than
+  # leaving the owner believing the assistant was told something.
+  inline:
+    - knowledge/glosario.md
+  searchable:
+    - knowledge/operaciones.md
+  # A budget over the INLINE documents only, checked at boot against a
+  # deliberate OVER-estimate (3 characters per token; real Spanish prose is
+  # nearer 4). glosario.md measures about 1160 by that count, so this leaves
+  # room for an edit without being so loose that the budget stops meaning
+  # anything. Exceeding it FAILS BOOT and is never truncated — half a glossary
+  # reads exactly like a whole one and nobody would ever see the cut.
+  maxInlineTokens: 1400
 session:
   # Deliberately UNSET: SESSION_MAX_AGE_DAYS (config.ts) stays authoritative
   # for this agent. Setting this to today's default of 7 would make the YAML

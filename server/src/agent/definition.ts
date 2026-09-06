@@ -31,7 +31,16 @@ const PromptSpecSchema = z
   })
   .strict();
 
-/** Phase 4's seam. `inline`/`searchable` are paths under knowledge/; nothing reads them yet. */
+/**
+ * The two knowledge tiers. Paths are relative to the agent's own directory and
+ * must resolve under its `knowledge/` folder — knowledge/store.ts reads them at
+ * boot and enforces both the containment and the budget.
+ *
+ * `maxInlineTokens` is a budget over the INLINE documents only, measured with
+ * the deliberate over-estimate in store.ts. It does not cover the runtime's own
+ * few lines of framing around them, which are the same for every agent and are
+ * not something a definition can change.
+ */
 const KnowledgeSpecSchema = z
   .object({
     inline: z.array(z.string()),
@@ -144,6 +153,42 @@ function mentionsTool(text: string, toolName: string): boolean {
 }
 
 /**
+ * The registry key of the knowledge search tool.
+ *
+ * Declared HERE, not in the registry, because this module must stay loadable
+ * without importing the tool layer it validates — and the pairing rule below
+ * ("searchable knowledge and this tool imply each other") needs the name. The
+ * registry imports this constant, so there is still exactly one spelling of it.
+ */
+export const SEARCH_KNOWLEDGE_TOOL = "search_knowledge";
+
+/**
+ * Tool names a piece of prose mentions that this agent was NOT given.
+ *
+ * Shared by the persona check below and by the knowledge loader, because a
+ * knowledge document reaches the model exactly as the prompt does — inline in
+ * the system prompt, or as a tool result — and an instruction to call a tool
+ * the agent does not have is the same hole either way.
+ */
+export function undeclaredToolMentions(
+  text: string,
+  definition: AgentDefinition,
+  universe: ToolUniverse,
+): string[] {
+  // What this agent's model will actually see. Only the tools that EXIST are
+  // mapped: an unknown key in tools[] is already its own error, and reporting
+  // it twice buries the one line that names the typo.
+  const declaredExposed = new Set(
+    definition.tools
+      .map((key) => universe.exposedNames.get(key))
+      .filter((name): name is string => name !== undefined),
+  );
+  return [...new Set(universe.exposedNames.values())].filter(
+    (exposed) => mentionsTool(text, exposed) && !declaredExposed.has(exposed),
+  );
+}
+
+/**
  * Load one definition from `<agentsDir>/<id>/`. Throws with the offending
  * path on a missing file, malformed YAML, an unknown key, or a wrong type —
  * every one of those must fail BOOT, not the first turn that reaches this
@@ -201,12 +246,6 @@ export function validateDefinition(definition: AgentDefinition, universe: ToolUn
     }
   }
 
-  // What this agent's model will actually see. Only the tools that exist are
-  // mapped: an unknown key is already an error above, and reporting it twice
-  // buries the one line that names the typo.
-  const declaredExposed = new Set(
-    definition.tools.map((key) => universe.exposedNames.get(key)).filter((name) => name !== undefined),
-  );
   const seenExposed = new Set<string>();
   for (const key of definition.tools) {
     const exposed = universe.exposedNames.get(key);
@@ -219,10 +258,32 @@ export function validateDefinition(definition: AgentDefinition, universe: ToolUn
     seenExposed.add(exposed);
   }
 
-  for (const exposed of new Set(universe.exposedNames.values())) {
-    if (mentionsTool(definition.personaText, exposed) && !declaredExposed.has(exposed)) {
-      errors.push(`prompt.md mentions "${exposed}", which is not in tools[]`);
-    }
+  for (const exposed of undeclaredToolMentions(definition.personaText, definition, universe)) {
+    errors.push(`prompt.md mentions "${exposed}", which is not in tools[]`);
+  }
+
+  // The two tiers and the tool imply each other, in BOTH directions, and each
+  // direction is its own silent failure. Searchable documents with no
+  // search_knowledge are knowledge indexed at boot that no turn can ever reach.
+  // search_knowledge with nothing searchable is a tool the prompt will offer
+  // and that always answers "nothing found" — which reads to the model as the
+  // business having no policy, rather than as a definition that forgot a file.
+  //
+  // The DOCUMENTS are checked by knowledge/store.ts, which can read the disk;
+  // what is checkable here is the pairing, and it is checked here so a
+  // definition built in memory (a test, a future loader) cannot skip it.
+  const searchesKnowledge = definition.tools.includes(SEARCH_KNOWLEDGE_TOOL);
+  if (definition.knowledge.searchable.length > 0 && !searchesKnowledge) {
+    errors.push(
+      `knowledge.searchable declares ${definition.knowledge.searchable.length} document(s) ` +
+        `but tools[] does not include "${SEARCH_KNOWLEDGE_TOOL}", so nothing can read them`,
+    );
+  }
+  if (searchesKnowledge && definition.knowledge.searchable.length === 0) {
+    errors.push(
+      `tools[] includes "${SEARCH_KNOWLEDGE_TOOL}" but knowledge.searchable is empty, ` +
+        `so the tool can only ever answer that it found nothing`,
+    );
   }
 
   for (const toolName of definition.session.resetOn) {

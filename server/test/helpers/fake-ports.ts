@@ -3,6 +3,8 @@ import type {
   CatalogPort,
   CatalogSearch,
   CatalogSearchResult,
+  KnowledgeHit,
+  KnowledgePort,
   LeadDraft,
   LeadsPort,
   MediaPort,
@@ -40,6 +42,8 @@ export interface FakePorts {
   pending: PendingPhoto[];
   /** What `adjustInventory` reports back as the resulting count. */
   quantityAfterAdjust: number | null;
+  /** What the knowledge port answers with. */
+  knowledgeHits: KnowledgeHit[];
 }
 
 export function fakeProduct(overrides: Partial<ShopifyProduct> = {}): ShopifyProduct {
@@ -84,6 +88,7 @@ export function fakePorts(): FakePorts {
     products,
     pending: [],
     quantityAfterAdjust: 1,
+    knowledgeHits: [],
     ports: undefined as unknown as ToolPorts,
   };
   const record = (method: string, ...args: unknown[]): void => {
@@ -189,7 +194,20 @@ export function fakePorts(): FakePorts {
     },
   };
 
-  state.ports = { catalog, leads, media };
+  /**
+   * The knowledge base as a plain object: it records the scope it was asked
+   * for, which is the assertion that matters — a leak between agents is a
+   * wrong `agentId` on this call, not a wrong string in a rendered result.
+   * `hits` is what it answers with; empty by default.
+   */
+  const knowledge: KnowledgePort = {
+    async search(input): Promise<KnowledgeHit[]> {
+      record("searchKnowledge", input);
+      return state.knowledgeHits;
+    },
+  };
+
+  state.ports = { catalog, leads, media, knowledge };
   return state;
 }
 

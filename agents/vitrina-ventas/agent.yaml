@@ -19,6 +19,21 @@ prompt:
   persona: prompt.md
   slots: {}
 knowledge:
+  # DELIBERATELY EMPTY, and not an oversight.
+  #
+  # The customer-facing documents this agent would want are returns, shipping,
+  # payment and opening hours — exactly the facts nobody has supplied yet. A
+  # sales agent with a knowledge base full of "PENDIENTE" would quote a
+  # placeholder to a customer, and a confidently invented return policy is
+  # worse than no knowledge base at all: the customer acts on it.
+  #
+  # Its prompt is therefore byte-for-byte what it was before the knowledge base
+  # existed (composePrompt adds nothing for an agent with no documents), and its
+  # behaviour is unchanged by this phase.
+  #
+  # When the owner supplies real policy, adding it is: a file under
+  # knowledge/, one line in inline: or searchable:, a budget here, and — for
+  # the searchable tier only — search_knowledge in tools[] above.
   inline: []
   searchable: []
   maxInlineTokens: 0

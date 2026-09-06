@@ -30,6 +30,7 @@ import { shopifyCatalogPort } from "./shopify/catalog-port.js";
 import { sqliteLeadsPort, sqliteMediaPort } from "./data/tool-ports.js";
 import type { ToolPorts } from "./tools/ports.js";
 import { loadAndValidateDefinitions } from "./agent/definition.js";
+import { countIndexedChunks, estimateTokens, loadKnowledgeBase } from "./knowledge/store.js";
 import type { TurnContext } from "./types.js";
 
 const RATE_LIMIT_NOTICE =
@@ -77,13 +78,32 @@ async function main(): Promise<void> {
   const definitions = Object.fromEntries(
     loadAndValidateDefinitions(config.agentDefinitionsDir, Object.values(AGENT_IDS), toolUniverse()),
   );
+  // Fails BOOT for the same reasons the definitions above do: a knowledge path
+  // that does not exist, a document nothing declares, a document naming a tool
+  // this agent was not given, or inline documents that do not fit their
+  // declared budget are all deploy-time typos in a data file. Unlike the
+  // credential check further down, none of them fixes itself while the process
+  // runs, and an agent booted with half its knowledge answers confidently from
+  // the half it has.
+  //
+  // Also where the searchable tier is indexed (SQLite FTS5, same file as the
+  // inbox). The index is derived from the documents and rebuilt here, so it is
+  // replaced rather than appended to — a restart is routine and must not
+  // duplicate a chunk.
+  const knowledge = loadKnowledgeBase({
+    db,
+    agentsDir: config.agentDefinitionsDir,
+    definitions: Object.values(definitions),
+    universe: toolUniverse(),
+  });
   // What the tools may reach, assembled here and nowhere else: the packs state
-  // policy, these three decide what performs it. The catalog adapter is the one
+  // policy, these four decide what performs it. The catalog adapter is the one
   // that holds the client and the shared cache.
   const ports: ToolPorts = {
     catalog: shopifyCatalogPort({ client: shopify, cache, config }),
     leads: sqliteLeadsPort(db),
     media: sqliteMediaPort(db),
+    knowledge,
   };
   const queue = new PerConversationQueue();
   const rateLimiter = new RateLimiter({
@@ -146,6 +166,26 @@ async function main(): Promise<void> {
       ? `WhatsApp transport: Meta Cloud API (phone number id ${config.whatsappPhoneNumberId}, ${config.whatsappGraphVersion})`
       : "WhatsApp transport: whatsmeow bridge (linked device)",
   );
+
+  // Said once at boot, per agent, because the ways a knowledge base goes wrong
+  // after it loads are all quiet: a definition whose lists someone emptied, a
+  // document that shrank to nothing, an index that swept more than it should
+  // have. "0 chunks" here is the difference between an agent that has no
+  // knowledge and one that lost it.
+  for (const definition of Object.values(definitions)) {
+    const forPrompt = knowledge.promptFor(definition.id);
+    app.log.info(
+      {
+        agentId: definition.id,
+        inlineDocuments: definition.knowledge.inline.length,
+        inlineTokensEstimated: forPrompt ? estimateTokens(forPrompt.inlineText) : 0,
+        maxInlineTokens: definition.knowledge.maxInlineTokens,
+        searchableDocuments: definition.knowledge.searchable.length,
+        indexedChunks: countIndexedChunks(db, definition.id),
+      },
+      `knowledge base ready for ${definition.id}`,
+    );
+  }
 
   if (config.echoMode) {
     app.log.warn(
@@ -285,7 +325,7 @@ async function main(): Promise<void> {
       // agent turn, which is the cheaper mistake and is what ctx.turnKey makes
       // safe against on the Shopify side.
       const reply = await runAgentTurn(
-        { db, config, ports, definitions, log: app.log },
+        { db, config, ports, definitions, knowledge, log: app.log },
         ctx,
         envelope.text,
       );

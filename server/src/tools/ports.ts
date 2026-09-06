@@ -235,9 +235,44 @@ export interface MediaPort {
   markAttached(ids: number[], productId: string): Promise<void>;
 }
 
+/** One chunk of an agent's own knowledge, as the tool hands it to the model. */
+export interface KnowledgeHit {
+  /**
+   * Whose knowledge this is. Always the agent that asked — carried on the hit
+   * so a test can assert the scope held, and so a leak would be visible in a
+   * recorded call rather than only in a rendered string.
+   */
+  agentId: string;
+  /** The document it came from, e.g. "glosario.md". What a citation names. */
+  source: string;
+  heading: string;
+  body: string;
+}
+
+/**
+ * The knowledge base, as the tool needs it.
+ *
+ * ONE method, and `agentId` is a required input of it: there is no unscoped
+ * search to reach by accident. The value comes from the TURN (`ctx.turn.agentId`,
+ * which the router set from the transport), never from the tool's arguments —
+ * `search_knowledge` deliberately gives the model no parameter that could name
+ * an agent. Today both agents belong to one business, so a leak between them
+ * would not disclose anything; the scope is built as if it would, because the
+ * point of the platform is a second business.
+ */
+export interface KnowledgePort {
+  search(input: { agentId: string; query: string; limit?: number }): Promise<KnowledgeHit[]>;
+}
+
 /** Everything the packs may reach. One bag, built once at the composition root. */
 export interface ToolPorts {
   catalog: CatalogPort;
   leads: LeadsPort;
   media: MediaPort;
+  /**
+   * Required even for a definition that declares no knowledge tool, so the
+   * composition root cannot forget it for the one that does: a missing port
+   * would surface as a turn failing mid-conversation instead of as a type error.
+   */
+  knowledge: KnowledgePort;
 }

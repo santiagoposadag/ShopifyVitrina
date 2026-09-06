@@ -151,6 +151,45 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
       attached_at TEXT
     );
 
+    -- The knowledge index: an agent's own documents, chunked, for
+    -- search_knowledge. DERIVED DATA, and the only table here that is: the
+    -- documents under agents/<id>/knowledge/ are the source of truth and this
+    -- is rebuilt from them at boot (see knowledge/store.ts). Losing it costs
+    -- nothing but the next boot; that is what makes re-indexing by
+    -- delete-then-insert, inside one transaction, an acceptable way to do it.
+    --
+    -- New tables, so IF NOT EXISTS IS the migration for a database that
+    -- predates them: nothing here alters an existing table and no column is
+    -- added to one.
+    --
+    -- FTS5, not a plain table: the whole point is matching an owner's own
+    -- words against prose. The remove_diacritics option is what makes "publicacion"
+    -- find "publicación" — Spanish is typed both ways on a phone keyboard, and
+    -- an accent deciding whether a policy is found is a silent miss.
+    --
+    -- agent_id is UNINDEXED so it can never be MATCHed as text: it is a scope,
+    -- not a search term, and a query that could reach it could name another
+    -- agent's chunks. Every read filters on it in SQL (see searchChunks).
+    CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks USING fts5(
+      agent_id UNINDEXED,
+      source UNINDEXED,
+      ordinal UNINDEXED,
+      heading,
+      body,
+      tokenize = 'unicode61 remove_diacritics 2'
+    );
+
+    -- What each agent's indexed content currently is, so a boot that changes
+    -- nothing writes nothing. Without it every restart would delete and
+    -- re-insert every chunk, which is correct but leaves a window in which a
+    -- turn running in ANOTHER process sees an empty knowledge base.
+    CREATE TABLE IF NOT EXISTS knowledge_index (
+      agent_id TEXT PRIMARY KEY,
+      content_hash TEXT NOT NULL,
+      chunk_count INTEGER NOT NULL,
+      indexed_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
     -- Every batch flush claims one phone's un-settled rows by (phone, status).
     CREATE INDEX IF NOT EXISTS idx_inbox_phone_status ON inbox(phone, status);

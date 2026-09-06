@@ -417,6 +417,26 @@
           ]
         }
       }
+    },
+    {
+      "name": "search_knowledge",
+      "description": "Search this assistant's own knowledge base (business policies, vocabulary, procedures) with the person's own words. Use it before answering a question about how this business works that the system prompt does not already answer, and answer from what it returns. It does NOT contain product data: prices, SKUs, stock and availability still come from the catalog tools.",
+      "params": {
+        "query": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "What to look for, in the person's own words. Spanish, keywords or a question."
+          ]
+        },
+        "limit": {
+          "type": "ZodNumber",
+          "optional": true,
+          "descriptions": [
+            "How many entries to return (default 3, max 10)"
+          ]
+        }
+      }
     }
   ],
   "vitrina-ventas": [
