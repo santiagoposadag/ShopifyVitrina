@@ -1,6 +1,6 @@
 # Decoupling the Agent into a Platform
 
-**Goal:** one runtime that can host N agents. Each agent is **data** (a definition: behaviour, knowledge, tool set), the runtime is **code**, and a request reaches an agent through one inbox whether it comes from a WhatsApp user or from another agent. **Phases 1, 2, 3, 4, 5 are landed; Phase 6 is planned.**
+**Goal:** one runtime that can host N agents. Each agent is **data** (a definition: behaviour, knowledge, tool set), the runtime is **code**, and a request reaches an agent through one inbox whether it comes from a WhatsApp user or from another agent. **All six phases are landed.**
 
 **Supersedes** [agent-catalog-decoupling.md](agent-catalog-decoupling.md), which was written ten days before the Shopify migration and describes a `repo.ts` catalog that no longer exists. **Complements** [agent-roles-routing.md](agent-roles-routing.md), which decides *who* reaches *which* agent; this page decides what an agent *is* and how a message gets in and out.
 
@@ -282,7 +282,7 @@ classDiagram
 | `get_product` with two closures by role | Two tools: `catalog.get_product` and `catalog.get_product_any_status`; the definition picks one | `server/src/agent/tools.ts` line 348, before Phase 1 |
 | Example SKUs, axes, confirmation phrasing inside descriptions | `knowledge/` docs + `slots` rendered into generic descriptions | `server/src/agent/tools.ts` line 499, before Phase 1 |
 | `sessionAfterTurn = "reset"` set inside a tool | `session.resetOn` declared; runtime watches the tool stream it already reads | `server/src/agent/agent.ts` line 531, before Phase 1 |
-| `isOwner(phone)` | `router.ts`: assignment table `phone → role`, definition `roles` says which agent | `server/src/config.ts` line 430, before Phase 1 |
+| `isOwner(phone)` (OWNER_PHONE_NUMBERS allowlist) | `roleForPhone(db, phone)` (assignments table read by router) + `role-assignments` ops entry point | `server/src/config.ts` line 462 → `server/src/data/assignments.ts` line 78 |
 
 > ℹ️ The boot validator is the piece that closes today's silent hole: every tool name the prompt mentions must be in `definition.tools`, and every name in `definition.tools` must exist in the registry. A typo fails startup instead of producing an agent that asks for a tool it does not have.
 
@@ -444,6 +444,7 @@ erDiagram
   ASSIGNMENTS {
     text phone PK
     text role "generalises OWNER_PHONE_NUMBERS"
+    text created_at
   }
   AGENT_REGISTRY {
     text agent_id PK
@@ -535,7 +536,7 @@ flowchart LR
 | 3 | None | `tools.test.ts` prefix pin becomes a set-equality pin per definition; Shopify call recordings unchanged | ✅ Landed |
 | 4 | Owner answers "¿qué significa publicar?" from knowledge instead of the prompt | New: inline budget respected; `search_knowledge` returns chunks only from its agent | ✅ Landed |
 | 5 | New endpoint, off by default until a registry row exists | New: unknown token 401 · reach violation 403 · hop 4 refused · role never read from text · sync and async reply both durable | ✅ Landed |
-| 6 | `OWNER_PHONE_NUMBERS` still honoured as seed rows | `config.test.ts` empty-allowlist refusal in the purge tool stays | Planned |
+| 6 | `OWNER_PHONE_NUMBERS` still honoured as seed rows; role assignments live table | New: `assignments.test.ts` seed-not-sync pins; `router.test.ts` routing on role + definition; `purge.test.ts` guard checks both table and variable | ✅ Landed |
 
 ### 3.1 Invariants that survive every phase
 

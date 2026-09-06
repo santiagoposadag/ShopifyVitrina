@@ -21,7 +21,7 @@ graph TB
 | `inbox.agent_text` | `webhook.ts` at insert, `batcher.ts` on transcription | Tools |
 | `inbox.audio_path` | `webhook.ts` sets it, `setInboxTranscript` clears it | Anything that does not also write the transcript |
 | `sessions.agent_session_id` | `runAgentTurn`, **after** the turn | A tool mid-turn — it would be clobbered |
-| `contacts.role` | `index.ts` `onMessage` | The access decision — that is `config.isOwner` |
+| `contacts.role` | `index.ts` `onMessage` (read from `roleFor`) | Never read for access decisions — the `assignments` table decides that |
 | `pending_media.attached_to` | `attach_pending_photos`, only for ids that landed | The listing query, which claims nothing |
 | `leads.*` | `save_lead` only | The owner path |
 

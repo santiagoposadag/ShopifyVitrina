@@ -86,11 +86,12 @@ migrated on every boot. `server/src/data/db.ts:11`
 | Table | Key fact |
 |---|---|
 | `sessions` | One row per phone. `updated_at` refreshes every turn, making expiry a sliding window |
-| `contacts` | `role` records what we **last saw**, never what decides access — that is the env allowlist |
+| `contacts` | `role` records what we **last saw**, never what decides access — that is the `assignments` table (seeded from the env allowlist at boot) |
 | `leads` | `type` is checked in SQL: `inquiry` \| `back_in_stock` \| `follow_up` |
 
-> ⚠️ `purgeCustomerSessions` reads roles from `config.isOwner`, **never** from
-> `contacts.role`. The allowlist is the authority; the table is an observation.
+> ⚠️ `purgeCustomerSessions` reads roles from `roleForPhone(db)` (assignments table),
+> with `config.isOwner` as a secondary check — never from `contacts.role`. The
+> assignments table is the authority; contacts records an observation.
 > `server/src/data/purge.ts:51`
 
 ## Migrations

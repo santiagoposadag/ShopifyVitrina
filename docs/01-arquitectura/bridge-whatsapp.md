@@ -71,8 +71,9 @@ graph LR
 ```
 
 > ⚠️ A LID's digits look exactly like a phone number to `normalizePhone`, so one reaching
-> the server misses `OWNER_PHONE_NUMBERS` and the owner silently reads as a **customer** —
-> while a reply to it goes to whoever really owns those digits. `bridge/inbound.go:104`
+> the server will not match any row in the `assignments` table (which stores actual phone
+> numbers), and the owner silently reads as a **customer** — while a reply to it goes to
+> whoever really owns those digits. `bridge/inbound.go:104`
 
 > ℹ️ The LID store must be looked up **per call**, never captured at construction: an
 > unpaired device has no sub-stores at all, so reading it at startup panics on first boot.

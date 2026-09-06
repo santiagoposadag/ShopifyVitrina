@@ -54,7 +54,8 @@ graph LR
 
 > ⚠️ `loadDotEnv` anchors at `REPO_ROOT`, **not the cwd**, and swallows a missing file.
 > `npm run <script> -w server` runs from `server/`, where a cwd-relative `.env` misses
-> silently — and an empty `OWNER_PHONE_NUMBERS` makes every phone a customer.
+> silently — and an empty `OWNER_PHONE_NUMBERS` seeds no rows into the `assignments` table,
+> so every phone reads as a customer (the safe default).
 > `server/src/config.ts:318`
 
 > ℹ️ The credential check never blocks startup: the inbox is durable, so messages that
@@ -93,8 +94,9 @@ graph LR
 | Drop every **customer** history | `docker compose --profile purge run --rm purge-sessions` |
 | Kill the customer path entirely | `CUSTOMER_AGENT_ENABLED=false`, restart |
 
-> ⚠️ The purge refuses to run on an empty `OWNER_PHONE_NUMBERS`: every session would look
-> like a customer's, the owner's included, and the damage is silent and unrecoverable.
+> ⚠️ The purge refuses to run when no owner is assigned (checked from both the `assignments`
+> table and `OWNER_PHONE_NUMBERS`): every session would look like a customer's, the owner's
+> included, and the damage is silent and unrecoverable.
 > `server/src/data/purge.ts:44`
 
 **[← WhatsApp transport](bridge-whatsapp.md)** · **[Shopify setup →](../shopify-setup.md)** · **[Coolify runbook →](../coolify-deploy.md)**
