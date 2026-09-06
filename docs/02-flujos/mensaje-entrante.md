@@ -89,7 +89,7 @@ sequenceDiagram
 |---|---|
 | Photos keep the order the owner shot them | Bridge outbox is sequential by insertion id |
 | A phone's messages join the prompt in arrival order | `ORDER BY received_at ASC, id ASC` |
-| Two batches for one phone never overlap | `PerPhoneQueue` |
+| Two batches for one phone never overlap | `PerConversationQueue` |
 | Different phones stay concurrent | One tail promise per phone |
 | Replayed rows enter before new traffic | `replayPending()` runs **before** `listen()` |
 

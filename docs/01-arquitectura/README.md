@@ -45,6 +45,7 @@ graph TB
 | [`pipeline-mensajes.md`](pipeline-mensajes.md) | Webhook → batcher → queue → agent, and why each stage exists |
 | [`capa-shopify.md`](capa-shopify.md) | The four modules of `shopify/`, and the two 200-OK failure shapes |
 | [`agente-y-sesiones.md`](agente-y-sesiones.md) | The Agent SDK turn, the role boundary, session lifetime |
+| [`base-conocimiento.md`](base-conocimiento.md) | Two-tier knowledge (inline and searchable), indexing, the search tool |
 | [`bridge-whatsapp.md`](bridge-whatsapp.md) | The linked-device transport, the outbox, LID resolution |
 | [`cloud-api-whatsapp.md`](cloud-api-whatsapp.md) | Meta's official transport, the deferred media fetch, the 24h window |
 | [`despliegue.md`](despliegue.md) | Images, volumes, secrets, health, and what a restart cannot fix |

@@ -1,6 +1,6 @@
 # Decoupling the Agent into a Platform
 
-**Goal:** one runtime that can host N agents. Each agent is **data** (a definition: behaviour, knowledge, tool set), the runtime is **code**, and a request reaches an agent through one inbox whether it comes from a WhatsApp user or from another agent. **Phases 1, 2, 3 are landed; Phases 4, 5, 6 are planned.**
+**Goal:** one runtime that can host N agents. Each agent is **data** (a definition: behaviour, knowledge, tool set), the runtime is **code**, and a request reaches an agent through one inbox whether it comes from a WhatsApp user or from another agent. **Phases 1, 2, 3, 4 are landed; Phases 5, 6 are planned.**
 
 **Supersedes** [agent-catalog-decoupling.md](agent-catalog-decoupling.md), which was written ten days before the Shopify migration and describes a `repo.ts` catalog that no longer exists. **Complements** [agent-roles-routing.md](agent-roles-routing.md), which decides *who* reaches *which* agent; this page decides what an agent *is* and how a message gets in and out.
 
@@ -326,11 +326,9 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-  subgraph SRC["agents/&lt;id&gt;/knowledge/"]
-    K1["policies.md<br/>returns · shipping · hours"]
-    K2["glossary.md<br/>what 'publicar' means · option axes"]
-    K3["faq.md"]
-    K4["examples.md<br/>sample SKUs · confirmation phrasing"]
+  subgraph SRC["agents/&lt;id&gt;/knowledge/ (inline · searchable tiers)"]
+    K1["glosario.md<br/>INLINE · what 'publicar' means · option axes"]
+    K2["operaciones.md<br/>SEARCHABLE · procedures · workflows"]
   end
   LOAD["knowledge/store.ts<br/>chunk · index at boot"]
   INL["inline slice<br/>≤ maxInlineTokens<br/>→ system prompt"]
@@ -338,19 +336,21 @@ flowchart LR
   TOOL["search_knowledge<br/>tool · returns chunks"]
   RT["runtime"]
 
-  K1 & K2 & K3 & K4 --> LOAD
+  K1 & K2 --> LOAD
   LOAD --> INL --> RT
   LOAD --> FTS --> TOOL --> RT
 
   classDef defs fill:#ece1f7,stroke:#7d4bc0,color:#1a2230;
   classDef agent fill:#f7e6df,stroke:#cd5f40,color:#1a2230;
   classDef data fill:#dbe8f6,stroke:#2d6aa8,color:#1a2230;
-  class K1,K2,K3,K4 defs;
+  class K1,K2 defs;
   class LOAD,INL,TOOL,RT agent;
   class FTS data;
 ```
 
 > ℹ️ Two tiers on purpose. Short, always-relevant facts go **inline** so a resumed transcript still carries them. Long material goes behind a **tool**, so the grounding rule holds: the agent states what a tool returned. No vector store in phase 1; FTS5 is already in the SQLite build we ship.
+
+> ⚠️ **Customer-facing policy documents (returns, shipping, payment, hours) do not yet exist.** The sales agent has no knowledge documents deliberately — it would quote placeholders to a customer. When policies are written, they land as files and are declared in the appropriate agent's `knowledge.inline` or `knowledge.searchable`.
 
 ### 2.5 One WhatsApp message, to be
 
@@ -448,16 +448,27 @@ erDiagram
     text reach "agentIds it may call"
   }
   KNOWLEDGE_CHUNKS {
-    text agent_id
-    text source
-    text chunk "FTS5"
+    text agent_id "UNINDEXED · scope guard"
+    text source "UNINDEXED · file name"
+    text ordinal "UNINDEXED · position in source"
+    text heading
+    text body
+  }
+  KNOWLEDGE_INDEX {
+    text agent_id PK
+    text content_hash "sha256 · guards re-index"
+    int chunk_count
+    text indexed_at
   }
   INBOX ||--o{ SESSIONS : "agent_id + conversation_key"
   ASSIGNMENTS ||--o{ INBOX : "phone → role"
   AGENT_REGISTRY ||--o{ INBOX : "principal agent"
+  KNOWLEDGE_INDEX ||--o{ KNOWLEDGE_CHUNKS : "agent_id"
 ```
 
 > ⚠️ `sessions` is keyed by `phone` today (`server/src/data/db.ts:49`) and `CREATE TABLE IF NOT EXISTS` never alters an existing table. The key change needs a real migration step, not a DDL edit.
+
+> ℹ️ `agent_id` in `KNOWLEDGE_CHUNKS` is UNINDEXED on purpose — a scoped read never uses MATCH against it. The scope comes from a bound parameter in every query; `search_knowledge` has no parameter naming an agent, only from the transport through `ctx.turn.agentId`. This structure makes per-agent isolation structural rather than a filter someone remembers to apply.
 
 ### 2.8 Where files land
 
@@ -518,7 +529,7 @@ flowchart LR
 | 1 | None. Owner and customer map to two definitions with today's exact prompts | `agent.test.ts` persona pins move to the two `prompt.md` files; new: `runAgentTurn` returns and does not send | ✅ Landed |
 | 2 | None | New: boot fails on a prompt naming a tool outside `definition.tools` | ✅ Landed |
 | 3 | None | `tools.test.ts` prefix pin becomes a set-equality pin per definition; Shopify call recordings unchanged | ✅ Landed |
-| 4 | Owner answers "¿qué significa publicar?" from knowledge instead of the prompt | New: inline budget respected; `search_knowledge` returns chunks only from its agent | Planned |
+| 4 | Owner answers "¿qué significa publicar?" from knowledge instead of the prompt | New: inline budget respected; `search_knowledge` returns chunks only from its agent | ✅ Landed |
 | 5 | New endpoint, off by default until a registry row exists | New: unknown token 401 · reach violation 403 · hop 4 refused · role never read from text | Planned |
 | 6 | `OWNER_PHONE_NUMBERS` still honoured as seed rows | `config.test.ts` empty-allowlist refusal in the purge tool stays | Planned |
 
@@ -529,7 +540,7 @@ flowchart LR
 | `turnKey` from the FIRST inbox row · per-turn counter | `Envelope.turnKey`, minted in the batcher as today `server/src/types.ts:88` |
 | Role from the transport, never from the text | `router.ts` for phones; `a2a.ts` token for agents |
 | `tools: []` removes built-ins; `allowedTools` only approves | `runtime.ts`, verbatim (`server/src/agent/agent.ts` line 352, before Phase 1) |
-| One turn at a time per conversation | `PerPhoneQueue` renamed to per-conversation, same class `server/src/inbox/queue.ts:9` |
+| One turn at a time per conversation | `PerConversationQueue`, same class `server/src/inbox/queue.ts:9` |
 | A turn without words still answers | `NO_ANSWER_FALLBACK` in `runtime.ts`; the responder sends it |
 | Reset session on publish | Tool sets `ctx.sessionAfterTurn = "reset"` on publish transition; `session.resetOn` is declared in definition but not read by the runtime |
 | ECHO_MODE ahead of both gates | Unchanged in `index.ts` |
