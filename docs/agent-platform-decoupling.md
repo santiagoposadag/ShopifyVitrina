@@ -1,6 +1,6 @@
 # Decoupling the Agent into a Platform
 
-**Goal:** one runtime that can host N agents. Each agent is **data** (a definition: behaviour, knowledge, tool set), the runtime is **code**, and a request reaches an agent through one inbox whether it comes from a WhatsApp user or from another agent. **Phases 1, 2, 3, 4 are landed; Phases 5, 6 are planned.**
+**Goal:** one runtime that can host N agents. Each agent is **data** (a definition: behaviour, knowledge, tool set), the runtime is **code**, and a request reaches an agent through one inbox whether it comes from a WhatsApp user or from another agent. **Phases 1, 2, 3, 4, 5 are landed; Phase 6 is planned.**
 
 **Supersedes** [agent-catalog-decoupling.md](agent-catalog-decoupling.md), which was written ten days before the Shopify migration and describes a `repo.ts` catalog that no longer exists. **Complements** [agent-roles-routing.md](agent-roles-routing.md), which decides *who* reaches *which* agent; this page decides what an agent *is* and how a message gets in and out.
 
@@ -414,6 +414,9 @@ sequenceDiagram
 | Who says the caller's role | The **agent registry**, from the bearer token | Same rule as WhatsApp: identity from the transport, never from the message |
 | Debounce | None for agent principals | Bursts are a human behaviour; an agent sends one complete message |
 | Durability | Still through `inbox` | One retry story, one replay story, one place to audit |
+| Conversation key | `a2a:<caller>:<target>:<correlation>` | Two exchanges between the same pair under same correlation must hold separate transcripts; both ends plus correlation prevent collisions and claim ambiguity |
+| Idempotency | Optional `messageId` on the request, distinct from correlation | Lets a caller tag its own messages; lacking one, each request lands a fresh row |
+| Concurrency | One exchange at a time per conversation; second refused 409 | `claimInboxBatch` claims by conversation key; two parked callers on one key cannot be told apart when a reply arrives |
 
 ### 2.7 Data model changes
 
@@ -425,7 +428,7 @@ erDiagram
     text agent_id "NEW · target definition"
     text principal_kind "NEW · whatsapp | agent"
     text principal_id "NEW · phone | agentId"
-    text conversation_key "NEW · phone | correlationId"
+    text conversation_key "NEW · phone | a2a:caller:target:correlationId"
     text reply_to "NEW · nullable callback"
     int hop "NEW · loop guard"
     text agent_text
@@ -446,6 +449,7 @@ erDiagram
     text agent_id PK
     text token_hash
     text reach "agentIds it may call"
+    text callback_prefix "nullable · prefix for replyTo"
   }
   KNOWLEDGE_CHUNKS {
     text agent_id "UNINDEXED · scope guard"
@@ -530,7 +534,7 @@ flowchart LR
 | 2 | None | New: boot fails on a prompt naming a tool outside `definition.tools` | ✅ Landed |
 | 3 | None | `tools.test.ts` prefix pin becomes a set-equality pin per definition; Shopify call recordings unchanged | ✅ Landed |
 | 4 | Owner answers "¿qué significa publicar?" from knowledge instead of the prompt | New: inline budget respected; `search_knowledge` returns chunks only from its agent | ✅ Landed |
-| 5 | New endpoint, off by default until a registry row exists | New: unknown token 401 · reach violation 403 · hop 4 refused · role never read from text | Planned |
+| 5 | New endpoint, off by default until a registry row exists | New: unknown token 401 · reach violation 403 · hop 4 refused · role never read from text · sync and async reply both durable | ✅ Landed |
 | 6 | `OWNER_PHONE_NUMBERS` still honoured as seed rows | `config.test.ts` empty-allowlist refusal in the purge tool stays | Planned |
 
 ### 3.1 Invariants that survive every phase

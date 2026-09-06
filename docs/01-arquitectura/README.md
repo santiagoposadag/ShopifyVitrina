@@ -4,8 +4,9 @@
 graph TB
     subgraph SRV["server — Node 20 · Fastify · ESM"]
         WH["inbox/webhook.ts<br/>HMAC · persist · fast ACK"]
-        BA["inbox/batcher.ts<br/>adaptive debounce"]
-        QU["inbox/queue.ts<br/>per-phone serialization"]
+        A2A["inbox/a2a.ts<br/>bearer token · sync|async"]
+        BA["inbox/batcher.ts<br/>adaptive debounce<br/>agents: none"]
+        QU["inbox/queue.ts<br/>per-conversation serialization"]
         AG["agent/agent.ts<br/>Agent SDK turn"]
         TO["agent/tools.ts<br/>MCP tool server"]
         SH["shopify/<br/>client · catalog · rank · cache"]
@@ -19,8 +20,12 @@ graph TB
 
     META["Meta Cloud API<br/>official transport"]
 
-    IN --> OB -->|"POST /webhook"| WH --> BA --> QU --> AG --> TO --> SH
+    IN --> OB -->|"POST /webhook"| WH
     META -->|"POST /webhook"| WH
+    A2A -->|"bearer token"| DB["agent_registry"]
+    WH --> BA
+    A2A --> BA
+    BA --> QU --> AG --> TO --> SH
     AG -->|"reply"| AP
     AG -->|"reply"| META
 ```
@@ -43,6 +48,7 @@ graph TB
 | Page | Contents |
 |---|---|
 | [`pipeline-mensajes.md`](pipeline-mensajes.md) | Webhook → batcher → queue → agent, and why each stage exists |
+| [`puerta-agente.md`](puerta-agente.md) | Agent-to-agent door: authentication, status codes, conversation key, hop guard |
 | [`capa-shopify.md`](capa-shopify.md) | The four modules of `shopify/`, and the two 200-OK failure shapes |
 | [`agente-y-sesiones.md`](agente-y-sesiones.md) | The Agent SDK turn, the role boundary, session lifetime |
 | [`base-conocimiento.md`](base-conocimiento.md) | Two-tier knowledge (inline and searchable), indexing, the search tool |
@@ -80,6 +86,7 @@ graph LR
 | `server/dist/index.js` | image `CMD` |
 | `server/dist/data/backup.js` | `compose.yaml:194`, `server/package.json` |
 | `server/dist/data/purge-sessions.js` | `compose.yaml:218`, `server/package.json` |
+| `server/dist/data/agent-credentials.js` | `compose.yaml:278`, `server/package.json` |
 | `/bridge -healthcheck` | `compose.yaml:167`, `bridge/main.go:157` |
 
 > ⚠️ Moving an entry point means updating `compose.yaml` and `package.json` too.
