@@ -24,7 +24,6 @@ import { CatalogCache } from "./shopify/cache.js";
 import { ShopifyClient } from "./shopify/client.js";
 import { registerWebhook, type WebhookDeps } from "./inbox/webhook.js";
 import { Responders } from "./egress/responder.js";
-import { whatsappPrincipal } from "./inbox/envelope.js";
 import { agentIdForPhone } from "./router.js";
 import type { TurnContext } from "./types.js";
 
@@ -214,7 +213,7 @@ async function main(): Promise<void> {
       const result = await transcribe(filePath, config);
       return result?.text ?? null;
     },
-    onMessage: async (ctx: TurnContext, text: string) => {
+    onMessage: async (envelope, ctx) => {
       upsertContact(db, ctx.phone, ctx.role);
 
       // Diagnostic mode, and deliberately the FIRST thing here. It sits ahead of
@@ -225,7 +224,7 @@ async function main(): Promise<void> {
       // makes none. Logged at every turn so a deployment left in it is obvious.
       if (config.echoMode) {
         app.log.warn({ phone: ctx.phone, role: ctx.role }, "ECHO_MODE: replying without an agent turn");
-        await channel.sendText(ctx.phone, buildEchoReply(text));
+        await channel.sendText(ctx.phone, buildEchoReply(envelope.text));
         return; // Consumed; the inbox batch settles as done.
       }
 
@@ -265,12 +264,16 @@ async function main(): Promise<void> {
       // wait forever for a reply that exists nowhere. The retry costs a second
       // agent turn, which is the cheaper mistake and is what ctx.turnKey makes
       // safe against on the Shopify side.
-      const reply = await runAgentTurn({ db, config, shopify, cache, log: app.log }, ctx, text);
-      // This door only ever produces WhatsApp principals: the phone is the one
-      // the webhook authenticated, carried through the inbox row. Once an
-      // envelope travels the whole pipeline (the agent door), the principal
-      // arrives with it instead of being rebuilt here.
-      await responders.for(whatsappPrincipal(ctx.phone)).deliver(reply);
+      const reply = await runAgentTurn(
+        { db, config, shopify, cache, log: app.log },
+        ctx,
+        envelope.text,
+      );
+      // Answered through the principal the DOOR authenticated, carried here in
+      // the envelope. Rebuilding one from ctx.phone would work today and would
+      // be a lie tomorrow: it hard-codes "everyone who asks has a phone" into
+      // the one place that is supposed to be indifferent to who asked.
+      await responders.for(envelope.principal).deliver(reply);
       failureAlert.recordSuccess();
     },
     onBatchFailure: async (ctx, { final }) => {

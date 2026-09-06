@@ -56,12 +56,20 @@ export function principalId(principal: Principal): string {
  * plus `agentId: "vitrina-inventario"`, and collapsing the two would make that
  * message indistinguishable from the inventory assistant talking to itself.
  *
- * WHERE THIS LIVES TODAY: with only the WhatsApp door built, the batcher
- * flattens these fields into a TurnContext plus the joined batch text at the
- * moment it claims a burst (inbox/batcher.ts). This interface is the contract
- * those fields have to keep — written down now so the second door adds a
- * producer rather than a change of shape, which would land on the runtime, the
- * session key and the responder at once.
+ * WHERE THIS LIVES TODAY: the WhatsApp door builds one per coalesced burst, in
+ * `InboxBatcher.processBatch`, and it travels to the composition root, which
+ * reads the prompt off it and answers `principal` through the responder. The
+ * agent door adds a second producer and changes nothing else.
+ *
+ * It travels ALONGSIDE a TurnContext rather than replacing it, and the two
+ * overlap on the identity fields for now. That is not an oversight: the context
+ * is per-turn MUTABLE state (a tool writes `sessionAfterTurn` into it mid-turn),
+ * and a message-shaped record is the wrong home for something a tool writes.
+ * The router that arrives with agent definitions is what collapses them — it
+ * builds the context from the envelope plus the role it resolves, and the
+ * duplication ends there. A ROLE FIELD DOES NOT BELONG HERE: the role is
+ * derived from the principal by the router, not carried by the door, or the
+ * next door to be written gets to declare its own caller's privileges.
  */
 export interface Envelope {
   principal: Principal;

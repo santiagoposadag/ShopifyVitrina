@@ -16,6 +16,7 @@ import {
 } from "../data/repo.js";
 import { agentIdForRole } from "../router.js";
 import type { MessageKind, TurnContext } from "../types.js";
+import { whatsappPrincipal, type Envelope } from "./envelope.js";
 
 /**
  * Total processing attempts a batch's rows get before settling as 'failed'.
@@ -140,8 +141,24 @@ export interface InboxBatcherDeps {
   mediaDebounceMs: number;
   /** Ceiling for a burst containing media. */
   mediaMaxWaitMs: number;
-  /** Async worker invoked once per coalesced burst. */
-  onMessage: (ctx: TurnContext, text: string) => Promise<void>;
+  /**
+   * Async worker invoked once per coalesced burst.
+   *
+   * Two arguments, and they are not the same thing. The ENVELOPE is what the
+   * door produced: who is asking, which agent must answer, which conversation,
+   * what they said, and the turn key — all of it immutable, and all of it the
+   * only identity a caller may act on. The CONTEXT is the per-turn scratch space
+   * the runtime and its tools share, and it is MUTABLE by design:
+   * `sessionAfterTurn` is written by a tool mid-turn and read after it, so it is
+   * turn state and not envelope data, and folding it into the envelope would
+   * make a message-shaped record something a tool writes into.
+   *
+   * They overlap on the identity fields today, deliberately: the runtime still
+   * takes a TurnContext. The router that arrives with agent definitions is what
+   * collapses the two — it will build the context FROM the envelope plus the
+   * role it resolves, and this pair becomes one argument and one derivation.
+   */
+  onMessage: (envelope: Envelope, ctx: TurnContext) => Promise<void>;
   roleFor: (phone: string) => TurnContext["role"];
   /**
    * Turn a stored voice note into words. Optional: with no transcription
@@ -519,16 +536,16 @@ export class InboxBatcher {
     // on a retry, so Shopify can recognise a replayed stock adjustment. Rows
     // are ordered by arrival and keep their ids, so the anchor holds.
     const turnKey = rows[0]!.dedupe_key;
-    // This is the WhatsApp door's Envelope (inbox/envelope.ts), flattened into
-    // the shape today's runtime takes. Identity is the phone the TRANSPORT
-    // authenticated — never anything read out of the text — and the
-    // conversation key IS that phone on this door. That equality is why this
-    // module can go on debouncing per phone while the queue serializes per
-    // conversation: here they are the same string, and a burst is a human
-    // typing habit rather than a property of a conversation. Do not "simplify"
-    // the two back into one field; a door whose caller has no phone number
-    // still has conversations.
+    // The identity half of this burst, and the WhatsApp door is where it comes
+    // from: the phone is the one the TRANSPORT authenticated, never anything
+    // read out of the text, and the conversation key IS that phone here. That
+    // equality is why this module can go on debouncing per phone while the
+    // queue serializes per conversation — the same string on this door — and a
+    // burst is a human typing habit rather than a property of a conversation.
+    // Do not "simplify" the two back into one field: a door whose caller has no
+    // phone number still has conversations.
     const role = roleFor(phone);
+    const principal = whatsappPrincipal(phone);
     const ctx: TurnContext = {
       phone,
       role,
@@ -582,8 +599,29 @@ export class InboxBatcher {
       return;
     }
 
+    // The envelope is assembled HERE, at the point the prompt exists, and its
+    // identity fields are read off the context so the two cannot drift into
+    // disagreeing about who is asking.
+    //
+    // Identity is settled long before the text is: the attempt-cap branch above
+    // abandons a batch that never produced a prompt at all, and it still has to
+    // name the conversation it gave up on. So the context is built first and the
+    // envelope second, which is the reverse of the order a door with a
+    // single-message envelope will use — the agent door has its text from the
+    // start and can build the envelope outright.
+    const envelope: Envelope = {
+      principal,
+      agentId: ctx.agentId,
+      conversationKey: ctx.conversationKey,
+      text,
+      turnKey: ctx.turnKey,
+      // A human door starts every chain: nothing forwarded this message here,
+      // so there is no loop for the hop cap to break yet.
+      hop: 0,
+    };
+
     try {
-      await onMessage(ctx, text);
+      await onMessage(envelope, ctx);
       markInboxBatchDone(db, ids);
     } catch (err) {
       const final = attempts >= MAX_BATCH_ATTEMPTS;
