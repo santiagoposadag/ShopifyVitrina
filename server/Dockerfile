@@ -50,6 +50,10 @@ COPY --from=prod-deps /app/server/node_modules ./server/node_modules
 COPY --from=build /app/server/dist ./server/dist
 COPY package.json ./
 COPY server/package.json server/package.json
+# Definitions are DATA, not compiled: REPO_ROOT resolves to /app at runtime
+# (server/dist is two levels down), so AGENT_DEFINITIONS_DIR's default of
+# "agents" needs the directory present here or every boot fails validation.
+COPY agents/ ./agents/
 
 # /data holds the SQLite db (inbox, sessions, leads) and inbound photos waiting
 # to be uploaded to Shopify; /home/node/.claude is where the Agent SDK

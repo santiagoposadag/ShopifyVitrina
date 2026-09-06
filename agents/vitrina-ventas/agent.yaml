@@ -1,0 +1,33 @@
+# The customer-facing sales assistant. `tools:` must equal exactly what
+# buildToolServer serves the "customer" role today — pinned by set-equality in
+# server/test/definition.test.ts, derived from buildToolServer itself, not
+# copied out by hand.
+id: vitrina-ventas
+roles:
+  - customer
+model:
+  # Matches the `maxTurns: 12` literal runtime.ts has hardcoded since before
+  # this file existed. Not yet read by the runtime — see the Phase 2 report.
+  maxTurns: 12
+tools:
+  - search_catalog
+  - get_product
+  - save_lead
+  - build_cart
+prompt:
+  base: grounding
+  persona: prompt.md
+  slots: {}
+knowledge:
+  inline: []
+  searchable: []
+  maxInlineTokens: 0
+session:
+  # Matches SESSION_MAX_AGE_DAYS's default in config.ts. Not yet read by the
+  # runtime, which still applies config.sessionMaxAgeDays to every agent — see
+  # the Phase 2 report.
+  maxAgeDays: 7
+  # The customer path has no publish transition — nothing resets its session.
+  resetOn: []
+  keyedBy: principal
+reach: []

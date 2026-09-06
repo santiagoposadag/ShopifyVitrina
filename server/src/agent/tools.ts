@@ -937,5 +937,27 @@ export function buildToolServer(deps: ToolDeps) {
   };
 }
 
+/**
+ * Every tool name this build can serve, across every role — the authority
+ * `agent/definition.ts`'s boot validator checks `tools[]` and
+ * `session.resetOn` against. Owner is the superset (`ownerTools` starts with
+ * `...customerTools`), so building once with that role is enough; there is no
+ * second list anywhere to keep in sync with this one.
+ *
+ * A placeholder `ctx` is safe here: `buildToolServer` only reads `ctx.role` at
+ * construction time to pick a tool set, and every closure that touches the
+ * rest of `ctx` runs on a call this function never makes.
+ *
+ * Phase 3's registry replaces the CALL inside this function, not the callers
+ * of it — `definition.ts` asks for "the tool universe" once, by name.
+ */
+export function allToolNames(deps: Omit<ToolDeps, "ctx">): string[] {
+  const { toolNames } = buildToolServer({
+    ...deps,
+    ctx: { phone: "", role: "owner", agentId: "", conversationKey: "", turnKey: "" },
+  });
+  return toolNames.map((n) => n.replace(`mcp__${MCP_SERVER_NAME}__`, ""));
+}
+
 /** Re-exported so tests and the prompt can agree on the legal status values. */
 export { PRODUCT_STATUSES };

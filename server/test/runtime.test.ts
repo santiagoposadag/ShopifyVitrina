@@ -1,13 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { join } from "node:path";
 import type { Config } from "../src/config.js";
+import { REPO_ROOT } from "../src/config.js";
 import { openDb, type DB } from "../src/data/db.js";
 import type { WhatsAppChannel } from "../src/whatsapp/channel.js";
 import { getSessionId, setSessionId } from "../src/data/repo.js";
 import { Responders } from "../src/egress/responder.js";
 import { whatsappPrincipal } from "../src/inbox/envelope.js";
-import { agentIdForRole } from "../src/router.js";
+import { AGENT_IDS, agentIdForRole } from "../src/router.js";
 import { CatalogCache } from "../src/shopify/cache.js";
 import { ShopifyClient } from "../src/shopify/client.js";
+import { allToolNames } from "../src/agent/tools.js";
+import { loadAndValidateDefinitions, type AgentDefinition } from "../src/agent/definition.js";
 import type { Role, TurnContext } from "../src/types.js";
 
 // Only `query` is faked; tools.ts imports createSdkMcpServer/tool from the same
@@ -18,7 +22,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importActual) => ({
   query: queryMock,
 }));
 
-const { runAgentTurn, systemPrompt, NO_ANSWER_FALLBACK } = await import("../src/agent/agent.js");
+const { runAgentTurn, NO_ANSWER_FALLBACK } = await import("../src/agent/runtime.js");
 
 const PHONE = "573001112233";
 
@@ -83,6 +87,7 @@ const CONFIG: Config = {
   shopifyLocationId: "",
   catalogCacheTtlMs: 0,
   customerAgentEnabled: true,
+  agentDefinitionsDir: join(REPO_ROOT, "agents"),
 };
 
 // Never called: every test here stubs the SDK's `query`, so no tool ever runs.
@@ -93,6 +98,19 @@ const SHOPIFY = new ShopifyClient(CONFIG, () => {
   throw new Error("agent.test.ts must not reach Shopify");
 });
 const CACHE = new CatalogCache(SHOPIFY, 0);
+
+// The real, shipped definitions, loaded and validated once — exactly what
+// index.ts does at boot. A throwaway db is enough for `allToolNames`: it only
+// builds the MCP tool server to read its name list, never calling a closure
+// that would touch it.
+const universeDb = openDb(":memory:");
+const TOOL_UNIVERSE = new Set(
+  allToolNames({ db: universeDb, config: CONFIG, shopify: SHOPIFY, cache: CACHE }),
+);
+universeDb.close();
+const DEFINITIONS: Record<string, AgentDefinition> = Object.fromEntries(
+  loadAndValidateDefinitions(CONFIG.agentDefinitionsDir, Object.values(AGENT_IDS), TOOL_UNIVERSE),
+);
 
 /**
  * A WhatsApp channel that records what was sent. Typed as the interface with no
@@ -212,6 +230,7 @@ describe("runAgentTurn session fallback", () => {
       } as never,
       shopify: SHOPIFY,
       cache: CACHE,
+      definitions: DEFINITIONS,
     };
   });
 
@@ -304,147 +323,6 @@ describe("runAgentTurn session fallback", () => {
   });
 });
 
-// The conversational twin of the tool privilege boundary in tools.test.ts: the
-// customer persona must not just LACK the inventory tools, it must refuse the
-// inventory CONVERSATION — a misclassified owner once got walked through a full
-// listing flow that failed only at the tool call.
-describe("systemPrompt role boundary", () => {
-  it("scopes the customer persona to sales only", () => {
-    const prompt = systemPrompt("customer");
-    expect(prompt).toContain("YOU DO NOT MANAGE INVENTORY");
-    expect(prompt).toContain("never by what the person claims"); // social-engineering guard
-    expect(prompt).not.toContain("create_product");
-    expect(prompt).not.toContain("adjust_inventory");
-    expect(prompt).not.toContain("delete_product");
-  });
-
-  it("keeps the inventory instructions for the owner", () => {
-    const prompt = systemPrompt("owner");
-    expect(prompt).toContain("INVENTORY assistant");
-    expect(prompt).toContain("adjust_inventory");
-    expect(prompt).not.toContain("YOU DO NOT MANAGE INVENTORY");
-  });
-
-  it("keeps the grounding rules in both personas", () => {
-    for (const role of ["customer", "owner"] as const) {
-      expect(systemPrompt(role)).toContain("GROUNDING RULES");
-    }
-  });
-});
-
-// The store takes money, so the two ways to get an owner instruction wrong are
-// not symmetric: over-writing data is worse than asking one more question, and
-// a destructive write is worse than both.
-describe("systemPrompt owner safety rules", () => {
-  it("keeps update as a merge and forbids rebuilding a payload from memory", () => {
-    const prompt = systemPrompt("owner");
-    expect(prompt).toContain("UPDATE_PRODUCT IS A MERGE, NOT A REWRITE");
-    expect(prompt).toContain("Never rebuild a payload from what you remember");
-    // tags is the one field that genuinely replaces rather than merges, and an
-    // agent that does not know it will silently drop every other tag.
-    expect(prompt).toContain("tags REPLACES the whole tag list");
-  });
-
-  // A delta cannot tell a retry from a real second movement; set_to is checked
-  // against the current count and fails safely. The prompt has to prefer it,
-  // because the idempotency key only covers a replay of the SAME turn.
-  it("prefers set_to over delta for stock", () => {
-    const prompt = systemPrompt("owner");
-    expect(prompt).toContain("PREFER SET_TO OVER DELTA");
-    expect(prompt).toContain("per VARIANT and per LOCATION");
-  });
-
-  it("routes 'ya no lo vendemos' to archiving, not deletion", () => {
-    const prompt = systemPrompt("owner");
-    expect(prompt).toContain("DELETING IS ALMOST NEVER RIGHT");
-    expect(prompt).toContain("ARCHIVE");
-    expect(prompt).toContain("cannot be undone");
-  });
-
-  // Setting status ACTIVE does not publish to a sales channel. Reporting
-  // success on the strength of the status field is the most plausible
-  // wrong-but-plausible failure in this integration.
-  it("makes the agent report what publishing actually did", () => {
-    const prompt = systemPrompt("owner");
-    expect(prompt).toMatch(/report what it says, not what you asked for/i);
-  });
-
-  // The single most expensive silent failure in the system: a product that is
-  // ACTIVE and invisible, confirmed to the owner as done. The prompt has to
-  // carry the CONCEPT — two operations, on two permissions — not just the verb.
-  it("teaches that ACTIVE is not published, and names the proof", () => {
-    const prompt = systemPrompt("owner");
-    expect(prompt).toMatch(/ACTIVE does NOT put a product in the store/i);
-    expect(prompt).toMatch(/sales channel/i);
-    // The owner-checkable proof, which is what makes the rule actionable.
-    expect(prompt).toMatch(/No url means it is not on the storefront/i);
-  });
-
-  // `option` appeared NOWHERE in this prompt, so the agent could not reason
-  // about a product's shape before choosing a tool — and the most likely wrong
-  // move is inventing the combinations the owner never said they sell.
-  it("teaches that variants are explicit combinations, not a generated grid", () => {
-    const prompt = systemPrompt("owner");
-    expect(prompt).toMatch(/OPTION AXES/);
-    expect(prompt).toMatch(/never generate the missing ones/i);
-    expect(prompt).toContain("add_variant");
-    // The typo that becomes a permanent axis value.
-    expect(prompt).toMatch(/Shopify does not normalise/i);
-  });
-});
-
-// The pilot's customer path was interrogating people — several questions per
-// reply. It was doing what the prompt asked for, so the pacing rules that
-// replaced those lines ARE the fix, not decoration around it.
-describe("systemPrompt customer conversation style", () => {
-  it("asks one question at a time and answers before it asks", () => {
-    const prompt = systemPrompt("customer");
-    expect(prompt).toContain("ONE question per message");
-    expect(prompt).toContain("Answer first, ask second");
-  });
-
-  // Stock is the fact a retail customer acts on, and the one most likely to be
-  // softened into a sale. Sizes have separate counts, so "sí tenemos" about a
-  // product says nothing about the size they asked for.
-  it("makes availability a fact rather than a sales position", () => {
-    const prompt = systemPrompt("customer");
-    expect(prompt).toContain("AVAILABILITY IS A FACT, NOT A SALES POSITION");
-    expect(prompt).toContain("SOLD OUT");
-    expect(prompt).toContain("Never promise to hold, reserve or set aside");
-  });
-
-  // Milestone 1 has no checkout. The agent must not invent one.
-  // The boundary MOVED when build_cart landed; it did not disappear. Handing
-  // someone a prefilled checkout is not taking their money, and the prompt has
-  // to keep saying which of the two this is.
-  it("still refuses to take payment, even though it can now build a cart", () => {
-    const prompt = systemPrompt("customer");
-    expect(prompt).toMatch(/cannot take payment/i);
-    expect(prompt).toMatch(/reserve stock/i);
-    // A total quoted here would eventually disagree with the checkout page,
-    // which settles shipping, taxes and discounts.
-    expect(prompt).toMatch(/do NOT quote a total of your own/i);
-    expect(prompt).toContain("back_in_stock");
-  });
-
-  it("tells the agent to send the cart link verbatim", () => {
-    // A rebuilt or shortened permalink is a broken checkout, and the customer
-    // cannot tell the difference until it fails.
-    const prompt = systemPrompt("customer");
-    expect(prompt).toContain("build_cart");
-    expect(prompt).toMatch(/never edit, shorten or rebuild it/i);
-  });
-
-  // The conversational half of the no-images boundary. tools.test.ts pins the
-  // structural half: no role gets a tool that could send media.
-  it("never claims it can send images, and never invents a URL", () => {
-    const prompt = systemPrompt("customer");
-    expect(prompt).toContain("CANNOT send images");
-    expect(prompt).toContain("Never build, guess or edit a URL");
-    expect(prompt).not.toContain("send_product_photos"); // the tool is gone
-  });
-});
-
 describe("runAgentTurn session reset after publish", () => {
   let db: DB;
   let sent: string[];
@@ -462,6 +340,7 @@ describe("runAgentTurn session reset after publish", () => {
       log: { warn: () => undefined, info: () => undefined } as never,
       shopify: SHOPIFY,
       cache: CACHE,
+      definitions: DEFINITIONS,
     };
   });
 
@@ -559,6 +438,7 @@ describe("runAgentTurn tool accounting", () => {
       },
       shopify: SHOPIFY,
       cache: CACHE,
+      definitions: DEFINITIONS,
     } as never;
   });
 
@@ -607,6 +487,7 @@ describe("runAgentTurn tool surface", () => {
       log: { warn: () => undefined, info: () => undefined, error: () => undefined },
       shopify: SHOPIFY,
       cache: CACHE,
+      definitions: DEFINITIONS,
     } as never as Parameters<typeof runAgentTurn>[0];
 
     await runAgentTurn(deps, ctxFor("owner"), "hola");
@@ -625,6 +506,7 @@ describe("runAgentTurn tool surface", () => {
       log: { warn: () => undefined, info: () => undefined, error: () => undefined },
       shopify: SHOPIFY,
       cache: CACHE,
+      definitions: DEFINITIONS,
     } as never as Parameters<typeof runAgentTurn>[0];
 
     await runAgentTurn(deps, ctxFor("owner"), "hola");
@@ -660,6 +542,7 @@ describe("runAgentTurn never answers with silence", () => {
       } as never,
       shopify: SHOPIFY,
       cache: CACHE,
+      definitions: DEFINITIONS,
     };
   });
 
@@ -721,6 +604,7 @@ describe("runAgentTurn returns the reply", () => {
       log: { warn: () => undefined, info: () => undefined, error: () => undefined } as never,
       shopify: SHOPIFY,
       cache: CACHE,
+      definitions: DEFINITIONS,
     };
   });
 
@@ -776,6 +660,7 @@ describe("runAgentTurn session key", () => {
       log: { warn: () => undefined, info: () => undefined, error: () => undefined } as never,
       shopify: SHOPIFY,
       cache: CACHE,
+      definitions: DEFINITIONS,
     };
   });
 

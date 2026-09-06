@@ -1,5 +1,5 @@
 import Fastify from "fastify";
-import { runAgentTurn } from "./agent/agent.js";
+import { runAgentTurn } from "./agent/runtime.js";
 import { buildEchoReply } from "./agent/echo.js";
 import { checkAgentCredential } from "./agent/preflight.js";
 import { transcribe, transcriptionEnabled } from "./agent/transcribe.js";
@@ -24,7 +24,9 @@ import { CatalogCache } from "./shopify/cache.js";
 import { ShopifyClient } from "./shopify/client.js";
 import { registerWebhook, type WebhookDeps } from "./inbox/webhook.js";
 import { Responders } from "./egress/responder.js";
-import { agentIdForPhone } from "./router.js";
+import { agentIdForPhone, AGENT_IDS } from "./router.js";
+import { allToolNames } from "./agent/tools.js";
+import { loadAndValidateDefinitions } from "./agent/definition.js";
 import type { TurnContext } from "./types.js";
 
 const RATE_LIMIT_NOTICE =
@@ -65,6 +67,14 @@ async function main(): Promise<void> {
   // if every turn shares it.
   const shopify = new ShopifyClient(config);
   const cache = new CatalogCache(shopify, config.catalogCacheTtlMs);
+  // Fails BOOT, not the first turn that reaches a broken agent: a typo in
+  // agent.yaml or a prompt naming a tool it was never given is a deploy-time
+  // mistake, not a transient one, so unlike the credential check below there
+  // is nothing to gain by letting the process come up anyway.
+  const toolUniverse = new Set(allToolNames({ db, config, shopify, cache }));
+  const definitions = Object.fromEntries(
+    loadAndValidateDefinitions(config.agentDefinitionsDir, Object.values(AGENT_IDS), toolUniverse),
+  );
   const queue = new PerConversationQueue();
   const rateLimiter = new RateLimiter({
     perPhonePerHour: config.rateLimitPerPhonePerHour,
@@ -265,7 +275,7 @@ async function main(): Promise<void> {
       // agent turn, which is the cheaper mistake and is what ctx.turnKey makes
       // safe against on the Shopify side.
       const reply = await runAgentTurn(
-        { db, config, shopify, cache, log: app.log },
+        { db, config, shopify, cache, definitions, log: app.log },
         ctx,
         envelope.text,
       );

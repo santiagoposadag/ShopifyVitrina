@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentEnv } from "../src/agent/agent.js";
+import { buildAgentEnv } from "../src/agent/runtime.js";
 import type { Config } from "../src/config.js";
 
 /**

@@ -217,6 +217,15 @@ export interface Config {
    * call). Owners are unaffected.
    */
   customerAgentEnabled: boolean;
+  /**
+   * Where `agents/<id>/agent.yaml` + `prompt.md` live. Defaults to the
+   * repo-root `agents/` directory (see REPO_ROOT above), which is safe to
+   * default — unlike AGENT_TRANSCRIPTS_DIR, an unset value here does not
+   * silently disable anything, it just reads the definitions this build ships
+   * with. A deployment overrides it to mount a different definition set
+   * without a rebuild.
+   */
+  agentDefinitionsDir: string;
 }
 
 function required(name: string): string {
@@ -424,6 +433,7 @@ export function loadConfig(): Config {
     shopifyLocationId: optional("SHOPIFY_LOCATION_ID", ""),
     catalogCacheTtlMs: optionalCountOrZero("CATALOG_CACHE_TTL_MS", 60_000),
     customerAgentEnabled: optionalBool("CUSTOMER_AGENT_ENABLED", true),
+    agentDefinitionsDir: resolveDataPath(optional("AGENT_DEFINITIONS_DIR", "agents")),
   };
 }
 

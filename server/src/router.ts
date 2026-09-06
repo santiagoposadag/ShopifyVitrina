@@ -4,18 +4,19 @@ import type { Role } from "./types.js";
 /**
  * Which agent answers.
  *
- * TEMPORARY, AND DELIBERATELY ONE FUNCTION. There is no definition loader yet:
- * the two personas still live in `systemPrompt(role)` and the two tool sets in
- * `buildToolServer`, so an "agent id" here names nothing that exists on disk.
- * What it does is give sessions, logs and the legacy migration a stable name to
- * key on, so the definitions can land in a later phase without moving any data.
+ * TEMPORARY, AND DELIBERATELY ONE FUNCTION. The two personas now live in
+ * `agents/<id>/prompt.md` and the two tool sets are still selected by
+ * `ctx.role` in `buildToolServer` — Phase 3 is what makes `agent.yaml`'s
+ * `tools[]` the authority there. What this function does is give sessions,
+ * logs and the legacy migration a stable name to key on, independent of
+ * whichever phase the tool selection is in.
  *
- * The phase that introduces `agents/<id>/agent.yaml` replaces this by DELETING
- * `agentIdForRole` and routing on the definition's declared roles instead. The
- * literals live here and nowhere else for exactly that reason — scattered
- * through the pipeline they would have to be found before they could be
- * removed, and one missed copy is a conversation resumed under an id nothing
- * routes to any more.
+ * The phase that replaces `isOwner(phone)` with an assignments table (§2.7)
+ * is what finally DELETES `agentIdForRole` and routes on a definition's
+ * declared roles instead. The literals live here and nowhere else for exactly
+ * that reason — scattered through the pipeline they would have to be found
+ * before they could be removed, and one missed copy is a conversation resumed
+ * under an id nothing routes to any more.
  */
 export const AGENT_IDS = {
   owner: "vitrina-inventario",
