@@ -3,37 +3,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify as stringifyYaml } from "yaml";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { openDb } from "../src/data/db.js";
-import { CatalogCache } from "../src/shopify/cache.js";
-import { ShopifyClient } from "../src/shopify/client.js";
-import { allToolNames, buildToolServer, MCP_SERVER_NAME } from "../src/agent/tools.js";
+import { buildToolServer, TOOL_REGISTRY, toolUniverse } from "../src/tools/registry.js";
+import { fakePorts } from "./helpers/fake-ports.js";
 import {
   loadAndValidateDefinitions,
   loadDefinition,
   validateDefinition,
   type ToolUniverse,
 } from "../src/agent/definition.js";
-import { AGENT_IDS, agentIdForRole } from "../src/router.js";
+import { AGENT_IDS } from "../src/router.js";
 import { REPO_ROOT } from "../src/config.js";
-import type { Config } from "../src/config.js";
-
-const TEST_CONFIG = {
-  shopifyStoreDomain: "tienda.myshopify.com",
-  shopifyAdminToken: "shpat_x",
-  shopifyApiVersion: "2026-01",
-  shopifyLocationId: "",
-} as Config;
-
-// Every test below builds its own throwaway db: the fixture universe must not
-// leak between tests, and better-sqlite3 handles are cheap in memory.
-function toolUniverse(): ToolUniverse {
-  const db = openDb(":memory:");
-  const shopify = new ShopifyClient(TEST_CONFIG);
-  const cache = new CatalogCache(shopify, 0);
-  const names = allToolNames({ db, config: TEST_CONFIG, shopify, cache });
-  db.close();
-  return new Set(names);
-}
 
 const VALID_YAML = (overrides: Record<string, unknown> = {}) => {
   const base = {
@@ -178,6 +157,48 @@ describe("validateDefinition", () => {
   });
 });
 
+/**
+ * The registry key and the name the model sees are not the same string.
+ *
+ * `get_product_any_status` is a key; what the model calls is `get_product`, the
+ * same name the customer's ACTIVE-only reader answers to. A persona writes
+ * prose for the MODEL, so the boot check has to read it against exposed names —
+ * against keys it would reject the owner's own shipped persona for saying
+ * `get_product`, and the phase would end with the two entries unusable.
+ */
+describe("validateDefinition across the key / exposed-name seam", () => {
+  it("accepts a persona naming get_product when the agent declares the any-status entry", () => {
+    writeAgent(
+      "fixture-agent",
+      VALID_YAML({ tools: ["get_product_any_status"] }),
+      "Call get_product to read a draft.",
+    );
+    const definition = loadDefinition(dir, "fixture-agent");
+    expect(() => validateDefinition(definition, toolUniverse())).not.toThrow();
+  });
+
+  it("still fails a persona naming get_product when the agent has neither entry", () => {
+    writeAgent(
+      "fixture-agent",
+      VALID_YAML({ tools: ["search_catalog"] }),
+      "Call get_product to read a draft.",
+    );
+    const definition = loadDefinition(dir, "fixture-agent");
+    expect(() => validateDefinition(definition, toolUniverse())).toThrow(/get_product/);
+  });
+
+  // Both entries at once puts two tools of one name in front of the model, and
+  // which one it reaches decides whether a customer can read a draft.
+  it("fails boot when two declared tools are exposed under the same name", () => {
+    writeAgent(
+      "fixture-agent",
+      VALID_YAML({ tools: ["get_product", "get_product_any_status"] }),
+    );
+    const definition = loadDefinition(dir, "fixture-agent");
+    expect(() => validateDefinition(definition, toolUniverse())).toThrow(/get_product/);
+  });
+});
+
 describe("loadAndValidateDefinitions", () => {
   it("loads and validates every id, or throws before returning any of them", () => {
     writeAgent("good-one", VALID_YAML({ id: "good-one" }));
@@ -194,48 +215,48 @@ describe("loadAndValidateDefinitions", () => {
 });
 
 /**
- * The privilege boundary, pinned again from the definition side before Phase 3
- * makes `tools[]` the authority `buildToolServer` actually reads. Derived from
- * `buildToolServer` itself — the same way tools.test.ts derives it — so the
- * two pins cannot drift into agreeing with each other instead of with the code.
+ * The privilege boundary from the definition side: `tools[]` is now the
+ * authority the tool server reads, so the pin is that the server serves that
+ * list and only that list. tools.test.ts pins the same boundary from the other
+ * end, against the literal tool names, so the two cannot drift into agreeing
+ * with each other instead of with the code.
  */
-describe("shipped definitions match buildToolServer's tool sets", () => {
-  function toolNamesFor(role: "owner" | "customer"): Set<string> {
-    const db = openDb(":memory:");
-    const shopify = new ShopifyClient(TEST_CONFIG);
-    const cache = new CatalogCache(shopify, 0);
-    const { toolNames } = allToolNamesForRole({ db, config: TEST_CONFIG, shopify, cache }, role);
-    db.close();
-    return new Set(toolNames);
-  }
-
-  // allToolNames always builds the owner (superset) role; the per-role set for
-  // this pin has to go through buildToolServer directly instead.
-  function allToolNamesForRole(
-    deps: { db: ReturnType<typeof openDb>; config: Config; shopify: ShopifyClient; cache: CatalogCache },
-    role: "owner" | "customer",
-  ) {
-    const { toolNames } = buildToolServer({
-      ...deps,
+describe("shipped definitions get exactly the tools they declare", () => {
+  function servedKeysFor(agentId: string): Set<string> {
+    const definition = loadDefinition(join(REPO_ROOT, "agents"), agentId);
+    const { tools } = buildToolServer({
+      definition,
       ctx: {
         phone: "573000000000",
-        role,
-        agentId: agentIdForRole(role),
+        role: "customer",
+        agentId,
         conversationKey: "573000000000",
         turnKey: "msg:1",
       },
+      ports: fakePorts().ports,
     });
-    return { toolNames: toolNames.map((n) => n.replace(`mcp__${MCP_SERVER_NAME}__`, "")) };
+    // Back from what was served to the keys that produced it: an entry whose
+    // exposed name differs from its key (get_product_any_status) must still be
+    // traceable to the line in the YAML that asked for it.
+    return new Set(
+      definition.tools.filter((key, index) => TOOL_REGISTRY.get(key)?.name === tools[index]?.name),
+    );
   }
 
-  it("vitrina-inventario's tools[] equals what the owner role is served", () => {
-    const definition = loadDefinition(join(REPO_ROOT, "agents"), AGENT_IDS.owner);
-    expect(new Set(definition.tools)).toEqual(toolNamesFor("owner"));
-  });
+  for (const agentId of Object.values(AGENT_IDS)) {
+    it(`${agentId} is served exactly its tools[], in order`, () => {
+      const definition = loadDefinition(join(REPO_ROOT, "agents"), agentId);
+      expect(servedKeysFor(agentId)).toEqual(new Set(definition.tools));
+    });
+  }
 
-  it("vitrina-ventas' tools[] equals what the customer role is served", () => {
-    const definition = loadDefinition(join(REPO_ROOT, "agents"), AGENT_IDS.customer);
-    expect(new Set(definition.tools)).toEqual(toolNamesFor("customer"));
+  // Every name in a shipped definition exists in the registry — the check that
+  // used to be "equals what buildToolServer serves the role".
+  it("names only tools the registry can serve", () => {
+    for (const agentId of Object.values(AGENT_IDS)) {
+      const definition = loadDefinition(join(REPO_ROOT, "agents"), agentId);
+      for (const key of definition.tools) expect(TOOL_REGISTRY.has(key)).toBe(true);
+    }
   });
 });
 

@@ -1,0 +1,523 @@
+{
+  "vitrina-inventario": [
+    {
+      "name": "search_catalog",
+      "description": "Search the products that are FOR SALE. Returns products ranked by relevance, each with its variants, prices, live stock and a 'match' percentage. Text is matched loosely — spelling, accents and word breaks do not have to agree — so a result is a CANDIDATE, not proof the request was met: read the match percentage and judge whether it actually answers what was asked. 100% means every word asked for was found; anything under 80% is related, not equivalent. The percentage is for your judgement only, never mention it. An empty result means the catalog genuinely has nothing like it. Use this before answering any question about availability, price or sizes. Never answer product facts from memory.",
+      "params": {
+        "query": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Free-text search over title, description, type, tags, sizes and colours"
+          ]
+        },
+        "min_price": {
+          "type": "ZodNumber",
+          "optional": true,
+          "descriptions": [
+            "Minimum price"
+          ]
+        },
+        "max_price": {
+          "type": "ZodNumber",
+          "optional": true,
+          "descriptions": [
+            "Maximum price"
+          ]
+        },
+        "in_stock_only": {
+          "type": "ZodBoolean",
+          "optional": true,
+          "descriptions": [
+            "Only products with stock available right now"
+          ]
+        }
+      }
+    },
+    {
+      "name": "get_product",
+      "description": "Get one product by SKU, handle, or id — including drafts and archived products. Returns every variant with its price and live stock, the photo count, and the store URL when it is published.",
+      "params": {
+        "ref": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "The product's SKU, handle, or Shopify id"
+          ]
+        }
+      }
+    },
+    {
+      "name": "save_lead",
+      "description": "Save a lead for the current customer. Use 'back_in_stock' when they want to be told when something sold out returns, 'inquiry' for interest in something we do not have, and 'follow_up' when they simply want to be contacted. The phone number is taken from context automatically.",
+      "params": {
+        "type": {
+          "type": "ZodEnum",
+          "optional": false,
+          "descriptions": [
+            "Kind of lead"
+          ],
+          "values": [
+            "inquiry",
+            "back_in_stock",
+            "follow_up"
+          ]
+        },
+        "name": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Customer name if provided"
+          ]
+        },
+        "note": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Free-text note: what they wanted, size, budget, etc."
+          ]
+        },
+        "product_code": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "SKU or handle the lead is about, if any"
+          ]
+        }
+      }
+    },
+    {
+      "name": "build_cart",
+      "description": "Build a checkout link with specific products already in the cart. Give it the SKUs the customer chose and how many of each; it returns ONE link that opens Shopify's checkout with exactly those items. Use it once the customer has decided what they want — it is the fastest way to hand them a purchase without leaving WhatsApp. Send the link back EXACTLY as returned and never edit or rebuild it. Every SKU must come from a tool result in this conversation. This does NOT create an order, take payment or reserve stock: the customer completes the purchase on Shopify, and the cart reflects prices and availability at the moment they open it. Do not quote a total of your own — the checkout page is the authority on what they will pay.",
+      "params": {
+        "items_json": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "JSON array of what they chose: [{\"sku\":\"062AC-MZ\",\"quantity\":1}]"
+          ]
+        }
+      }
+    },
+    {
+      "name": "list_products",
+      "description": "The owner's inventory report, across ALL statuses including unpublished drafts and archived products. Filter by status, by text, or both; with no filter it returns the whole catalog. Use this — not search_catalog — whenever the owner asks what they have, because search_catalog only ever sees products that are for sale and a draft is still something they own. Never enumerate statuses to establish absence: an empty result is scoped to the filter you passed and says nothing about anything else.",
+      "params": {
+        "status": {
+          "type": "ZodEnum",
+          "optional": true,
+          "descriptions": [],
+          "values": [
+            "ACTIVE",
+            "DRAFT",
+            "ARCHIVED"
+          ]
+        },
+        "query": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Free-text search over title, description, type, tags, sizes and colours"
+          ]
+        }
+      }
+    },
+    {
+      "name": "create_product",
+      "description": "Create a NEW product in the store. Creates it as a DRAFT unless told otherwise, so the owner can review it before it is for sale. variants_json is a JSON ARRAY of the variants to create, e.g. [{\"sku\":\"CAM-NEG-M\",\"price\":80000,\"option_values\":[\"M\",\"Negro\"],\"quantity\":10}]. For a product with no sizes or colours, pass a single variant with no option_values and leave option_names empty. option_names lists the option axes in order (e.g. [\"Talla\",\"Color\"]) and EVERY variant must then give exactly that many option_values, in the same order. Only include facts the owner explicitly stated. If the product already exists, use update_product instead — this tool always creates a second one.",
+      "params": {
+        "title": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "Product name"
+          ]
+        },
+        "description": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Product description"
+          ]
+        },
+        "product_type": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "e.g. Camiseta, Zapato"
+          ]
+        },
+        "vendor": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Brand or supplier"
+          ]
+        },
+        "tags": {
+          "type": "ZodArray",
+          "optional": true,
+          "descriptions": [],
+          "element": {
+            "type": "ZodString",
+            "optional": false,
+            "descriptions": []
+          }
+        },
+        "status": {
+          "type": "ZodEnum",
+          "optional": true,
+          "descriptions": [
+            "Defaults to DRAFT"
+          ],
+          "values": [
+            "ACTIVE",
+            "DRAFT"
+          ]
+        },
+        "option_names": {
+          "type": "ZodArray",
+          "optional": true,
+          "descriptions": [
+            "Option axes in order, e.g. [\"Talla\",\"Color\"]. Empty for a single-variant product."
+          ],
+          "element": {
+            "type": "ZodString",
+            "optional": false,
+            "descriptions": []
+          }
+        },
+        "variants_json": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "JSON array of variants: [{\"sku\",\"price\",\"option_values\":[],\"quantity\"}]"
+          ]
+        },
+        "location": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Location name or id for the opening stock"
+          ]
+        }
+      }
+    },
+    {
+      "name": "update_product",
+      "description": "Update an EXISTING product, found by SKU, handle or id. This is a MERGE, not a rewrite: pass ONLY the fields you are actually changing, and everything you omit keeps its stored value. To publish, pass just ref and status ACTIVE. To change one variant's price or SKU, pass variant_sku plus the new price. Never rebuild a payload from what you remember of the conversation — re-sending regenerated fields is how correct data gets overwritten with a guess. To change stock, use adjust_inventory, not this tool.",
+      "params": {
+        "ref": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "The product's SKU, handle, or Shopify id"
+          ]
+        },
+        "title": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": []
+        },
+        "description": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": []
+        },
+        "product_type": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": []
+        },
+        "vendor": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": []
+        },
+        "tags": {
+          "type": "ZodArray",
+          "optional": true,
+          "descriptions": [
+            "REPLACES the whole tag list"
+          ],
+          "element": {
+            "type": "ZodString",
+            "optional": false,
+            "descriptions": []
+          }
+        },
+        "status": {
+          "type": "ZodEnum",
+          "optional": true,
+          "descriptions": [],
+          "values": [
+            "ACTIVE",
+            "DRAFT",
+            "ARCHIVED"
+          ]
+        },
+        "variant_sku": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Which variant price/new_sku apply to. Required when the product has more than one."
+          ]
+        },
+        "price": {
+          "type": "ZodNumber",
+          "optional": true,
+          "descriptions": [
+            "New price for that variant"
+          ]
+        },
+        "new_sku": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "New SKU for that variant"
+          ]
+        }
+      }
+    },
+    {
+      "name": "add_variant",
+      "description": "Add one or more NEW variants (size, colour, dimension…) to a product that ALREADY exists. This is the only way to extend a product's range: update_product changes a variant that is already there, and create_product would make a second product. variants_json is a JSON ARRAY, e.g. [{\"sku\":\"062AC-LV\",\"price\":13800,\"option_values\":[\"5 cm\",\"8 cm\"],\"quantity\":10}]. A variant is ONE combination of the product's option axes, and every variant must give exactly one value per axis, IN THE PRODUCT'S OWN ORDER — call get_product first to read the axes and the values they already use. Reuse an existing value EXACTLY as written (\"7,5 cm\" is not \"7.5 cm\"); a new value is allowed and the result says which ones were new. Only include facts the owner explicitly stated — never invent a price.",
+      "params": {
+        "ref": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "The product's SKU, handle, or Shopify id"
+          ]
+        },
+        "variants_json": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "JSON array: [{\"sku\",\"price\",\"option_values\":[],\"quantity\"}]"
+          ]
+        },
+        "location": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Location name or id for the opening stock"
+          ]
+        }
+      }
+    },
+    {
+      "name": "delete_product",
+      "description": "PERMANENTLY delete a product from the store, with all of its variants and photos. This cannot be undone and it is almost never what the owner wants — archiving (update_product with status ARCHIVED) hides a product while keeping its sales history, and is the right answer for 'ya no lo vendemos'. Only call this when the owner has explicitly confirmed deletion for THIS product after you told them it is permanent. You must pass the product's exact handle in confirm_handle, taken from a tool result in this conversation and never guessed.",
+      "params": {
+        "ref": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "The product's SKU, handle, or Shopify id"
+          ]
+        },
+        "confirm_handle": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "The product's exact handle, as proof the right product was identified"
+          ]
+        }
+      }
+    },
+    {
+      "name": "get_inventory",
+      "description": "Live stock for one product or one variant, broken down by location. Pass a SKU to ask about a single variant, or a handle to get every variant of a product. Always check here before telling the owner a number.",
+      "params": {
+        "ref": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "SKU, handle, or Shopify id"
+          ]
+        }
+      }
+    },
+    {
+      "name": "adjust_inventory",
+      "description": "Change how many units of ONE variant are in stock, at one location. Pass set_to when the owner states the resulting count ('quedan 11') and delta when they state a movement ('vendí 3', 'llegaron 20'). PREFER set_to whenever the owner's words give you the resulting number: it is checked against the current count and fails safely if someone else changed stock in the meantime, whereas a delta cannot tell a repeat from a real second movement. Pass exactly one of the two. sku is required — a product with several sizes has several counts, so never adjust a product as a whole.",
+      "params": {
+        "sku": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "The variant's SKU"
+          ]
+        },
+        "delta": {
+          "type": "ZodNumber",
+          "optional": true,
+          "descriptions": [
+            "Signed movement, e.g. -3 for a sale of 3"
+          ],
+          "checks": [
+            "int"
+          ]
+        },
+        "set_to": {
+          "type": "ZodNumber",
+          "optional": true,
+          "descriptions": [
+            "The resulting absolute count"
+          ],
+          "checks": [
+            "int",
+            "min=0"
+          ]
+        },
+        "location": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Location name or id; only needed with several locations"
+          ]
+        },
+        "reason": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "One of: correction, received, damaged, restock, shrinkage. Defaults to correction."
+          ]
+        }
+      }
+    },
+    {
+      "name": "attach_pending_photos",
+      "description": "Upload the photos this owner recently sent in this chat (not yet uploaded to any product) to the given product. Use after the owner sends a product's photos. They are uploaded in the order they arrived, so the first photo the owner sent becomes the product's main image.",
+      "params": {
+        "ref": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "SKU, handle, or Shopify id of the product to upload them to"
+          ]
+        }
+      }
+    },
+    {
+      "name": "list_locations",
+      "description": "The store's inventory locations. Use it when a stock question is ambiguous because the store has more than one, or when the owner asks where something is stocked.",
+      "params": {}
+    },
+    {
+      "name": "list_leads",
+      "description": "List captured leads (inquiries, back-in-stock requests and follow-ups), optionally limited to the last N days.",
+      "params": {
+        "since_days": {
+          "type": "ZodNumber",
+          "optional": true,
+          "descriptions": [
+            "Only leads from the last N days"
+          ]
+        }
+      }
+    }
+  ],
+  "vitrina-ventas": [
+    {
+      "name": "search_catalog",
+      "description": "Search the products that are FOR SALE. Returns products ranked by relevance, each with its variants, prices, live stock and a 'match' percentage. Text is matched loosely — spelling, accents and word breaks do not have to agree — so a result is a CANDIDATE, not proof the request was met: read the match percentage and judge whether it actually answers what was asked. 100% means every word asked for was found; anything under 80% is related, not equivalent. The percentage is for your judgement only, never mention it. An empty result means the catalog genuinely has nothing like it. Use this before answering any question about availability, price or sizes. Never answer product facts from memory.",
+      "params": {
+        "query": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Free-text search over title, description, type, tags, sizes and colours"
+          ]
+        },
+        "min_price": {
+          "type": "ZodNumber",
+          "optional": true,
+          "descriptions": [
+            "Minimum price"
+          ]
+        },
+        "max_price": {
+          "type": "ZodNumber",
+          "optional": true,
+          "descriptions": [
+            "Maximum price"
+          ]
+        },
+        "in_stock_only": {
+          "type": "ZodBoolean",
+          "optional": true,
+          "descriptions": [
+            "Only products with stock available right now"
+          ]
+        }
+      }
+    },
+    {
+      "name": "get_product",
+      "description": "Get one product that is for sale, by SKU or handle. Returns its variants, prices and live stock. Use this when the customer names a specific product or code.",
+      "params": {
+        "ref": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "The product's SKU, handle, or Shopify id"
+          ]
+        }
+      }
+    },
+    {
+      "name": "save_lead",
+      "description": "Save a lead for the current customer. Use 'back_in_stock' when they want to be told when something sold out returns, 'inquiry' for interest in something we do not have, and 'follow_up' when they simply want to be contacted. The phone number is taken from context automatically.",
+      "params": {
+        "type": {
+          "type": "ZodEnum",
+          "optional": false,
+          "descriptions": [
+            "Kind of lead"
+          ],
+          "values": [
+            "inquiry",
+            "back_in_stock",
+            "follow_up"
+          ]
+        },
+        "name": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Customer name if provided"
+          ]
+        },
+        "note": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Free-text note: what they wanted, size, budget, etc."
+          ]
+        },
+        "product_code": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "SKU or handle the lead is about, if any"
+          ]
+        }
+      }
+    },
+    {
+      "name": "build_cart",
+      "description": "Build a checkout link with specific products already in the cart. Give it the SKUs the customer chose and how many of each; it returns ONE link that opens Shopify's checkout with exactly those items. Use it once the customer has decided what they want — it is the fastest way to hand them a purchase without leaving WhatsApp. Send the link back EXACTLY as returned and never edit or rebuild it. Every SKU must come from a tool result in this conversation. This does NOT create an order, take payment or reserve stock: the customer completes the purchase on Shopify, and the cart reflects prices and availability at the moment they open it. Do not quote a total of your own — the checkout page is the authority on what they will pay.",
+      "params": {
+        "items_json": {
+          "type": "ZodString",
+          "optional": false,
+          "descriptions": [
+            "JSON array of what they chose: [{\"sku\":\"062AC-MZ\",\"quantity\":1}]"
+          ]
+        }
+      }
+    }
+  ]
+}

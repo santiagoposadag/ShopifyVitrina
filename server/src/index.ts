@@ -25,7 +25,10 @@ import { ShopifyClient } from "./shopify/client.js";
 import { registerWebhook, type WebhookDeps } from "./inbox/webhook.js";
 import { Responders } from "./egress/responder.js";
 import { agentIdForPhone, AGENT_IDS } from "./router.js";
-import { allToolNames } from "./agent/tools.js";
+import { toolUniverse } from "./tools/registry.js";
+import { shopifyCatalogPort } from "./shopify/catalog-port.js";
+import { sqliteLeadsPort, sqliteMediaPort } from "./data/tool-ports.js";
+import type { ToolPorts } from "./tools/ports.js";
 import { loadAndValidateDefinitions } from "./agent/definition.js";
 import type { TurnContext } from "./types.js";
 
@@ -71,10 +74,17 @@ async function main(): Promise<void> {
   // agent.yaml or a prompt naming a tool it was never given is a deploy-time
   // mistake, not a transient one, so unlike the credential check below there
   // is nothing to gain by letting the process come up anyway.
-  const toolUniverse = new Set(allToolNames({ db, config, shopify, cache }));
   const definitions = Object.fromEntries(
-    loadAndValidateDefinitions(config.agentDefinitionsDir, Object.values(AGENT_IDS), toolUniverse),
+    loadAndValidateDefinitions(config.agentDefinitionsDir, Object.values(AGENT_IDS), toolUniverse()),
   );
+  // What the tools may reach, assembled here and nowhere else: the packs state
+  // policy, these three decide what performs it. The catalog adapter is the one
+  // that holds the client and the shared cache.
+  const ports: ToolPorts = {
+    catalog: shopifyCatalogPort({ client: shopify, cache, config }),
+    leads: sqliteLeadsPort(db),
+    media: sqliteMediaPort(db),
+  };
   const queue = new PerConversationQueue();
   const rateLimiter = new RateLimiter({
     perPhonePerHour: config.rateLimitPerPhonePerHour,
@@ -275,7 +285,7 @@ async function main(): Promise<void> {
       // agent turn, which is the cheaper mistake and is what ctx.turnKey makes
       // safe against on the Shopify side.
       const reply = await runAgentTurn(
-        { db, config, shopify, cache, definitions, log: app.log },
+        { db, config, ports, definitions, log: app.log },
         ctx,
         envelope.text,
       );

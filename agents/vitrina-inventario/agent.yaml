@@ -1,7 +1,7 @@
-# The owner's inventory assistant. `tools:` must equal exactly what
-# buildToolServer serves the "owner" role today — pinned by set-equality in
-# server/test/definition.test.ts, derived from buildToolServer itself, not
-# copied out by hand.
+# The owner's inventory assistant. `tools:` IS the tool set now: the registry
+# (server/src/tools/registry.ts) serves exactly these keys and nothing else,
+# and server/test/tools.test.ts pins the result against the owner list it used
+# to be selected by. Every name here must exist in the registry or boot fails.
 id: vitrina-inventario
 roles:
   - owner
@@ -10,7 +10,11 @@ model:
   maxTurns: 12
 tools:
   - search_catalog
-  - get_product
+  # The any-status reader, exposed to the model as `get_product` like the
+  # customer's. Two registry entries, one name: this one sees drafts and
+  # archived products, and the sales agent's must not — which is why the
+  # difference is a tool a definition chooses and not a branch inside one.
+  - get_product_any_status
   - save_lead
   - build_cart
   - list_products
@@ -41,10 +45,10 @@ session:
   #
   # create_product and update_product CAN trigger a reset, but only through the
   # publish TRANSITION each evaluates for itself (isPublishTransition in
-  # agent/tools.ts) — a product becoming ACTIVE when it was not before, signalled
-  # through ctx.sessionAfterTurn. This list is NOT "reset whenever one of these
-  # tools is called": update_product changing a price resets nothing today, and
-  # a Phase 3 reading that treats tool names here as the trigger itself would
+  # tools/packs/catalog.ts) — a product becoming ACTIVE when it was not before,
+  # signalled through ctx.sessionAfterTurn. This list is NOT "reset whenever one
+  # of these tools is called": update_product changing a price resets nothing
+  # today, and a reading that treats tool names here as the trigger itself would
   # reset the owner's session on an ordinary edit — the exact mid-listing data
   # loss the transition check exists to prevent. Not yet read by the runtime.
   resetOn:

@@ -3,9 +3,8 @@ import type { FastifyBaseLogger } from "fastify";
 import type { Config } from "../config.js";
 import type { DB } from "../data/db.js";
 import { clearSessionId, getSessionId, setSessionId } from "../data/repo.js";
-import type { CatalogCache } from "../shopify/cache.js";
-import type { ShopifyClient } from "../shopify/client.js";
-import { buildToolServer, MCP_SERVER_NAME } from "./tools.js";
+import { buildToolServer, MCP_SERVER_NAME } from "../tools/registry.js";
+import type { ToolPorts } from "../tools/ports.js";
 import type { AgentDefinition } from "./definition.js";
 import { composePrompt } from "./prompt.js";
 import type { TurnContext } from "../types.js";
@@ -30,14 +29,18 @@ export const NO_ANSWER_FALLBACK =
 export interface AgentDeps {
   db: DB;
   config: Config;
-  /** The catalog. Built once at the composition root and shared by every turn. */
-  shopify: ShopifyClient;
   /**
-   * Shared across turns on purpose: its whole value is that a burst of messages
-   * from one owner, and two customers asking at the same time, do not each pay
-   * for a full catalog fetch.
+   * What the tools may reach: the catalog, the leads store, the inbound photos.
+   * Built once at the composition root, because the catalog adapter carries the
+   * shared cache whose whole value is that a burst of messages from one owner,
+   * and two customers asking at the same time, do not each pay for a full
+   * catalog fetch.
+   *
+   * The runtime never calls a port itself. It holds them only to hand them to
+   * the tool server, which is what keeps the loop indifferent to the domain it
+   * is answering about.
    */
-  cache: CatalogCache;
+  ports: ToolPorts;
   /**
    * Every agent this runtime can serve, keyed by `agentId` — loaded and
    * validated once at boot (see index.ts and agent/definition.ts), so a broken
@@ -229,8 +232,10 @@ async function runQuery(
   incomingText: string,
   resumeId: string | undefined,
 ): Promise<TurnResult> {
-  const { db, config, shopify, cache, log } = deps;
-  const { server, toolNames } = buildToolServer({ db, config, shopify, cache, ctx });
+  const { config, ports, log } = deps;
+  // Exactly `definition.tools[]`, in the order the definition lists them. The
+  // role on the context selects nothing here any more.
+  const { server, toolNames } = buildToolServer({ definition, ctx, ports });
   // Names in call order. The turn summary reports them, because "it took 52
   // seconds" is not actionable and "it called search_catalog nine times" is.
   const toolsUsed: string[] = [];

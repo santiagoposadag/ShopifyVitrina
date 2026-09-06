@@ -10,7 +10,10 @@ import { whatsappPrincipal } from "../src/inbox/envelope.js";
 import { AGENT_IDS, agentIdForRole } from "../src/router.js";
 import { CatalogCache } from "../src/shopify/cache.js";
 import { ShopifyClient } from "../src/shopify/client.js";
-import { allToolNames } from "../src/agent/tools.js";
+import { toolUniverse } from "../src/tools/registry.js";
+import { shopifyCatalogPort } from "../src/shopify/catalog-port.js";
+import { sqliteLeadsPort, sqliteMediaPort } from "../src/data/tool-ports.js";
+import type { ToolPorts } from "../src/tools/ports.js";
 import { loadAndValidateDefinitions, type AgentDefinition } from "../src/agent/definition.js";
 import type { Role, TurnContext } from "../src/types.js";
 
@@ -100,17 +103,25 @@ const SHOPIFY = new ShopifyClient(CONFIG, () => {
 const CACHE = new CatalogCache(SHOPIFY, 0);
 
 // The real, shipped definitions, loaded and validated once — exactly what
-// index.ts does at boot. A throwaway db is enough for `allToolNames`: it only
-// builds the MCP tool server to read its name list, never calling a closure
-// that would touch it.
-const universeDb = openDb(":memory:");
-const TOOL_UNIVERSE = new Set(
-  allToolNames({ db: universeDb, config: CONFIG, shopify: SHOPIFY, cache: CACHE }),
-);
-universeDb.close();
+// index.ts does at boot, against the registry's own universe.
 const DEFINITIONS: Record<string, AgentDefinition> = Object.fromEntries(
-  loadAndValidateDefinitions(CONFIG.agentDefinitionsDir, Object.values(AGENT_IDS), TOOL_UNIVERSE),
+  loadAndValidateDefinitions(CONFIG.agentDefinitionsDir, Object.values(AGENT_IDS), toolUniverse()),
 );
+
+/**
+ * The ports, assembled as the composition root does.
+ *
+ * Structural here: `query` is mocked in every test below, so no tool handler
+ * ever runs and no port is ever called. They are built anyway because the tool
+ * server is — that is what pins that the shipped definitions still produce a
+ * servable set through the real registry.
+ */
+const portsDb = openDb(":memory:");
+const PORTS: ToolPorts = {
+  catalog: shopifyCatalogPort({ client: SHOPIFY, cache: CACHE, config: CONFIG }),
+  leads: sqliteLeadsPort(portsDb),
+  media: sqliteMediaPort(portsDb),
+};
 
 /**
  * A WhatsApp channel that records what was sent. Typed as the interface with no
@@ -228,8 +239,7 @@ describe("runAgentTurn session fallback", () => {
         },
         info: () => undefined,
       } as never,
-      shopify: SHOPIFY,
-      cache: CACHE,
+      ports: PORTS,
       definitions: DEFINITIONS,
     };
   });
@@ -338,8 +348,7 @@ describe("runAgentTurn session reset after publish", () => {
       db,
       config: CONFIG,
       log: { warn: () => undefined, info: () => undefined } as never,
-      shopify: SHOPIFY,
-      cache: CACHE,
+      ports: PORTS,
       definitions: DEFINITIONS,
     };
   });
@@ -436,8 +445,7 @@ describe("runAgentTurn tool accounting", () => {
         warn: () => undefined,
         error: () => undefined,
       },
-      shopify: SHOPIFY,
-      cache: CACHE,
+      ports: PORTS,
       definitions: DEFINITIONS,
     } as never;
   });
@@ -485,8 +493,7 @@ describe("runAgentTurn tool surface", () => {
       db,
       config: CONFIG,
       log: { warn: () => undefined, info: () => undefined, error: () => undefined },
-      shopify: SHOPIFY,
-      cache: CACHE,
+      ports: PORTS,
       definitions: DEFINITIONS,
     } as never as Parameters<typeof runAgentTurn>[0];
 
@@ -504,8 +511,7 @@ describe("runAgentTurn tool surface", () => {
       db,
       config: CONFIG,
       log: { warn: () => undefined, info: () => undefined, error: () => undefined },
-      shopify: SHOPIFY,
-      cache: CACHE,
+      ports: PORTS,
       definitions: DEFINITIONS,
     } as never as Parameters<typeof runAgentTurn>[0];
 
@@ -539,8 +545,7 @@ describe("runAgentTurn tool surface", () => {
       db,
       config: CONFIG,
       log: { warn: () => undefined, info: () => undefined, error: () => undefined },
-      shopify: SHOPIFY,
-      cache: CACHE,
+      ports: PORTS,
       definitions: overridden,
     } as never as Parameters<typeof runAgentTurn>[0];
 
@@ -559,8 +564,7 @@ describe("runAgentTurn tool surface", () => {
       db,
       config: CONFIG,
       log: { warn: () => undefined, info: () => undefined, error: () => undefined },
-      shopify: SHOPIFY,
-      cache: CACHE,
+      ports: PORTS,
       definitions: DEFINITIONS,
     } as never as Parameters<typeof runAgentTurn>[0];
 
@@ -594,8 +598,7 @@ describe("runAgentTurn never answers with silence", () => {
           errors.push(o);
         },
       } as never,
-      shopify: SHOPIFY,
-      cache: CACHE,
+      ports: PORTS,
       definitions: DEFINITIONS,
     };
   });
@@ -656,8 +659,7 @@ describe("runAgentTurn returns the reply", () => {
       db,
       config: CONFIG,
       log: { warn: () => undefined, info: () => undefined, error: () => undefined } as never,
-      shopify: SHOPIFY,
-      cache: CACHE,
+      ports: PORTS,
       definitions: DEFINITIONS,
     };
   });
@@ -712,8 +714,7 @@ describe("runAgentTurn session key", () => {
       db,
       config: CONFIG,
       log: { warn: () => undefined, info: () => undefined, error: () => undefined } as never,
-      shopify: SHOPIFY,
-      cache: CACHE,
+      ports: PORTS,
       definitions: DEFINITIONS,
     };
   });
@@ -767,8 +768,7 @@ describe("runAgentTurn session.maxAgeDays override", () => {
       db,
       config: CONFIG, // sessionMaxAgeDays: 7
       log: { warn: () => undefined, info: () => undefined, error: () => undefined } as never,
-      shopify: SHOPIFY,
-      cache: CACHE,
+      ports: PORTS,
       definitions: DEFINITIONS,
     };
   });

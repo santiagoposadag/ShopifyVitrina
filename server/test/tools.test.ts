@@ -1,24 +1,25 @@
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { Config } from "../src/config.js";
-import { openDb } from "../src/data/db.js";
+import { REPO_ROOT } from "../src/config.js";
+import { loadDefinition, type AgentDefinition } from "../src/agent/definition.js";
+import { AGENT_IDS } from "../src/router.js";
+import { buildToolServer, MCP_SERVER_NAME, TOOL_REGISTRY, toolUniverse } from "../src/tools/registry.js";
+import { newToolContext, renderDescription } from "../src/tools/factory.js";
 import {
-  buildToolServer,
   describeProduct,
   isPublishTransition,
-  MCP_SERVER_NAME,
+  newOptionValues,
   renderProductList,
   renderSearchHits,
   whyVariantsCannotBeAdded,
-  newOptionValues,
-  storefrontHost,
-  cartPermalink,
-} from "../src/agent/tools.js";
-import { CatalogCache } from "../src/shopify/cache.js";
-import { ShopifyClient } from "../src/shopify/client.js";
+} from "../src/tools/packs/catalog.js";
+import { cartPermalink, storefrontHost } from "../src/shopify/catalog-port.js";
 import type { SearchHit } from "../src/shopify/rank.js";
 import type { ShopifyProduct } from "../src/shopify/types.js";
-import type { Role } from "../src/types.js";
-import { agentIdForRole } from "../src/router.js";
+import type { TurnContext } from "../src/types.js";
+import { callsTo, fakePorts, fakeProduct } from "./helpers/fake-ports.js";
+
+const AGENTS_DIR = join(REPO_ROOT, "agents");
 
 const CUSTOMER_TOOLS = ["search_catalog", "get_product", "save_lead", "build_cart"];
 const OWNER_ONLY_TOOLS = [
@@ -34,67 +35,508 @@ const OWNER_ONLY_TOOLS = [
   "list_leads",
 ];
 
-const TEST_CONFIG = {
-  shopifyStoreDomain: "tienda.myshopify.com",
-  shopifyAdminToken: "shpat_x",
-  shopifyApiVersion: "2026-01",
-  shopifyLocationId: "",
-} as Config;
+function turnContext(overrides: Partial<TurnContext> = {}): TurnContext {
+  return {
+    phone: "573000000000",
+    role: "customer",
+    agentId: AGENT_IDS.customer,
+    conversationKey: "573000000000",
+    turnKey: "msg:1",
+    ...overrides,
+  };
+}
 
-function toolNamesFor(role: Role): string[] {
-  const db = openDb(":memory:");
-  const shopify = new ShopifyClient(TEST_CONFIG);
-  const { toolNames } = buildToolServer({
-    db,
-    config: TEST_CONFIG,
-    shopify,
-    cache: new CatalogCache(shopify, 0),
-    ctx: {
-      phone: "573000000000",
-      role,
-      agentId: agentIdForRole(role),
-      conversationKey: "573000000000",
-      turnKey: "msg:1",
+/** One tool, ready to call, from a definition that declares exactly these keys. */
+function build(definition: AgentDefinition, ctx: TurnContext = turnContext()) {
+  const fake = fakePorts();
+  const { tools, toolNames } = buildToolServer({ definition, ctx, ports: fake.ports });
+  return {
+    fake,
+    toolNames,
+    names: tools.map((t) => t.name),
+    tool: (name: string) => {
+      const found = tools.find((t) => t.name === name);
+      if (!found) throw new Error(`no tool named ${name} was served`);
+      return found;
     },
-  });
-  db.close();
-  return toolNames.map((n) => n.replace(`mcp__${MCP_SERVER_NAME}__`, ""));
+  };
+}
+
+/** The text a tool handed back to the model. */
+async function callTool(
+  tool: { handler: (args: never, extra: never) => Promise<{ content: { text?: string }[] }> },
+  args: Record<string, unknown>,
+): Promise<string> {
+  const result = await tool.handler(args as never, undefined as never);
+  return result.content.map((block) => block.text ?? "").join("");
+}
+
+function definitionWith(tools: string[], overrides: Partial<AgentDefinition> = {}): AgentDefinition {
+  return {
+    id: "fixture-agent",
+    roles: ["owner"],
+    model: { maxTurns: 12 },
+    tools,
+    prompt: { base: "grounding", persona: "prompt.md", slots: {} },
+    knowledge: { inline: [], searchable: [], maxInlineTokens: 0 },
+    session: { resetOn: [], keyedBy: "principal" },
+    reach: [],
+    personaText: "A persona.",
+    ...overrides,
+  };
 }
 
 // This is the privilege boundary of the whole system. It matters more here than
 // it did over a read-only storefront: an owner tool reaching a customer is a
 // stranger repricing a live store, or deleting a product out of it.
-describe("buildToolServer privilege boundary", () => {
-  it("gives customers exactly the customer tools — no owner tool leaks", () => {
-    const names = toolNamesFor("customer");
+//
+// The boundary is now DATA — the served set is `definition.tools[]` — so these
+// pins read the shipped definitions rather than a role switch. The literal
+// lists above are what a bad edit to a yaml file has to get past.
+describe("the privilege boundary, per definition", () => {
+  it("gives the customer agent exactly the customer tools — no owner tool leaks", () => {
+    const names = build(loadDefinition(AGENTS_DIR, AGENT_IDS.customer)).names;
     expect(names.sort()).toEqual([...CUSTOMER_TOOLS].sort());
     for (const ownerTool of OWNER_ONLY_TOOLS) {
       expect(names).not.toContain(ownerTool);
     }
   });
 
-  it("gives owners the customer tools plus the owner tools", () => {
-    const names = toolNamesFor("owner");
+  it("gives the owner agent the customer tools plus the owner tools", () => {
+    const names = build(loadDefinition(AGENTS_DIR, AGENT_IDS.owner)).names;
     expect(names.sort()).toEqual([...CUSTOMER_TOOLS, ...OWNER_ONLY_TOOLS].sort());
   });
 
   // Nothing may write to the catalog from the customer path, whatever it is
   // called. Pinned by prefix rather than by name so a future create_variant or
   // set_price cannot slip in unnoticed.
-  it("gives customers no tool that can write to the store", () => {
-    const names = toolNamesFor("customer");
-    for (const name of names) {
+  it("gives the customer agent no tool that can write to the store", () => {
+    for (const name of build(loadDefinition(AGENTS_DIR, AGENT_IDS.customer)).names) {
       expect(name).not.toMatch(/^(create|update|delete|adjust|set|attach|publish)_/);
     }
   });
 
   // The tool server has no WhatsApp client at all, so this is structural — but
   // pin it anyway: a tool that could push media back would be a silent
-  // regression of a product decision, in either role.
-  it("gives NO role a way to send media into the chat", () => {
-    for (const role of ["customer", "owner"] as const) {
-      expect(toolNamesFor(role)).not.toContain("send_product_photos");
+  // regression of a product decision, for any agent.
+  it("gives NO agent a way to send media into the chat", () => {
+    for (const agentId of Object.values(AGENT_IDS)) {
+      expect(build(loadDefinition(AGENTS_DIR, agentId)).names).not.toContain("send_product_photos");
     }
+    // Including one nobody has declared yet: the registry is the whole universe.
+    expect([...TOOL_REGISTRY.keys()]).not.toContain("send_product_photos");
+  });
+
+  // The role used to choose the tool set. It must not be able to any more —
+  // otherwise the definition is decoration and the boundary is still a switch.
+  it("serves the same set whatever role the turn context carries", () => {
+    for (const agentId of Object.values(AGENT_IDS)) {
+      const definition = loadDefinition(AGENTS_DIR, agentId);
+      const asOwner = build(definition, turnContext({ role: "owner", agentId })).names;
+      const asCustomer = build(definition, turnContext({ role: "customer", agentId })).names;
+      expect(asOwner).toEqual(asCustomer);
+    }
+  });
+});
+
+/**
+ * The served set IS `definition.tools[]` — §2.3's first rule.
+ *
+ * The set-equality is per definition and against the DECLARED list, so a tool
+ * added to a pack reaches nobody until a definition names it, and a name in a
+ * definition that the registry cannot serve fails loudly rather than silently
+ * serving thirteen of fourteen tools.
+ */
+describe("buildToolServer serves exactly what the definition declares", () => {
+  for (const agentId of Object.values(AGENT_IDS)) {
+    it(`${agentId}: the served keys equal its tools[]`, () => {
+      const definition = loadDefinition(AGENTS_DIR, agentId);
+      const { tools } = buildToolServer({
+        definition,
+        ctx: turnContext({ agentId }),
+        ports: fakePorts().ports,
+      });
+      const served = definition.tools.map((key) => TOOL_REGISTRY.get(key)?.name);
+      expect(tools.map((t) => t.name)).toEqual(served);
+      expect(tools).toHaveLength(definition.tools.length);
+    });
+  }
+
+  it("serves one tool for a definition that declares one, and nothing else", () => {
+    expect(build(definitionWith(["search_catalog"])).names).toEqual(["search_catalog"]);
+  });
+
+  it("refuses to build a definition naming a tool the registry does not have", () => {
+    expect(() => build(definitionWith(["teleport_product"]))).toThrow(/teleport_product/);
+  });
+
+  // Two registry entries may share one exposed name (get_product does), and an
+  // MCP server with two tools of the same name is a coin flip over which one
+  // the model reaches. Refused where it is still a definition error.
+  it("refuses a definition whose tools resolve to the same exposed name twice", () => {
+    expect(() => build(definitionWith(["get_product", "get_product_any_status"]))).toThrow(
+      /get_product/,
+    );
+  });
+
+  it("allowedTools names every served tool, mcp-prefixed", () => {
+    const { toolNames, names } = build(loadDefinition(AGENTS_DIR, AGENT_IDS.owner));
+    expect(toolNames).toEqual(names.map((n) => `mcp__${MCP_SERVER_NAME}__${n}`));
+  });
+
+  // The universe the boot validator checks definitions against comes from the
+  // registry itself — there is no second list to keep in sync with it.
+  it("the tool universe is the registry's own keys", () => {
+    expect([...toolUniverse().keys].sort()).toEqual([...TOOL_REGISTRY.keys()].sort());
+  });
+});
+
+/**
+ * `get_product` is two registry entries under one exposed name.
+ *
+ * The customer's answers "no product found" for anything not ACTIVE, because
+ * confirming that a hidden product exists is itself a leak; the owner's sees
+ * drafts and archived products. Which one an agent gets is decided by its
+ * definition, never by the role on the turn — the pin below builds the
+ * customer's entry with an OWNER role in the context.
+ */
+describe("get_product, the two entries", () => {
+  const draft = fakeProduct({ status: "DRAFT", handle: "vela-borrador" });
+
+  it("the customer's entry hides a draft behind the same answer as a genuine miss", async () => {
+    const { fake, tool } = build(
+      definitionWith(["get_product"]),
+      turnContext({ role: "owner" }),
+    );
+    fake.products.set("vela-borrador", { product: draft });
+
+    expect(await callTool(tool("get_product"), { ref: "vela-borrador" })).toBe(
+      'No product found for "vela-borrador".',
+    );
+    expect(await callTool(tool("get_product"), { ref: "nada" })).toBe(
+      'No product found for "nada".',
+    );
+  });
+
+  it("the customer's entry answers normally for a product that IS for sale", async () => {
+    const { fake, tool } = build(definitionWith(["get_product"]));
+    const active = fakeProduct();
+    fake.products.set("062AC-MZ", { product: active });
+
+    expect(await callTool(tool("get_product"), { ref: "062AC-MZ" })).toBe(describeProduct(active));
+  });
+
+  it("the owner's entry sees the draft, under the same name the model calls", async () => {
+    const { fake, tool } = build(
+      definitionWith(["get_product_any_status"]),
+      turnContext({ role: "customer" }),
+    );
+    fake.products.set("vela-borrador", { product: draft });
+
+    // Same exposed name: both personas name get_product in prose.
+    expect(TOOL_REGISTRY.get("get_product_any_status")?.name).toBe("get_product");
+    expect(await callTool(tool("get_product"), { ref: "vela-borrador" })).toBe(
+      describeProduct(draft),
+    );
+  });
+});
+
+/**
+ * The stock idempotency key.
+ *
+ * `ctx.turnKey` is stable across retries of the same batch, which is what makes
+ * a replayed delta safe. Two adjustments in ONE turn would then share it and
+ * Shopify would discard the second as a duplicate — the owner sold three and
+ * two more, and only three left the count. The counter that separates them
+ * lives on the turn's context, shared by every tool the turn builds.
+ */
+describe("adjust_inventory idempotency keys", () => {
+  const definition = definitionWith(["adjust_inventory"]);
+
+  async function adjustTwice(ctx: TurnContext): Promise<string[]> {
+    const { fake, tool } = build(definition, ctx);
+    fake.products.set("062AC-MZ", {
+      product: fakeProduct(),
+      variant: fakeProduct().variants[0],
+    });
+    await callTool(tool("adjust_inventory"), { sku: "062AC-MZ", delta: -3 });
+    await callTool(tool("adjust_inventory"), { sku: "062AC-MZ", delta: -2 });
+    return callsTo(fake, "adjustInventory").map(
+      ([input]) => (input as { idempotencyKey: string }).idempotencyKey,
+    );
+  }
+
+  it("gives two adjustments in ONE turn different keys", async () => {
+    const keys = await adjustTwice(turnContext({ turnKey: "inbox:41" }));
+    expect(keys).toEqual(["inbox:41:1", "inbox:41:2"]);
+    expect(new Set(keys).size).toBe(2);
+  });
+
+  it("gives the SAME keys when the batch is replayed", async () => {
+    // A retry re-runs the turn from the same inbox rows, so turnKey is the same
+    // and the counter starts over — which is exactly what makes Shopify discard
+    // the replay instead of removing the units twice.
+    const first = await adjustTwice(turnContext({ turnKey: "inbox:41" }));
+    const replay = await adjustTwice(turnContext({ turnKey: "inbox:41" }));
+    expect(replay).toEqual(first);
+  });
+
+  it("gives a different turn different keys", async () => {
+    const first = await adjustTwice(turnContext({ turnKey: "inbox:41" }));
+    const later = await adjustTwice(turnContext({ turnKey: "inbox:42" }));
+    expect(first.some((key) => later.includes(key))).toBe(false);
+  });
+
+  // One counter per TURN, not per pack and not per tool: a second pack that
+  // moves stock would otherwise start its own sequence at 1 and collide with
+  // the first tool's key on the very first call.
+  it("counts once per turn, whichever tool asks", () => {
+    const ctx = newToolContext(turnContext({ turnKey: "inbox:41" }), {});
+    expect([ctx.nextInventoryKey(), ctx.nextInventoryKey(), ctx.nextInventoryKey()]).toEqual([
+      "inbox:41:1",
+      "inbox:41:2",
+      "inbox:41:3",
+    ]);
+  });
+
+  // set_to is a compare-and-set against the count that was just read, so it
+  // carries no key — and must not consume one either.
+  it("does not spend a key on a set_to, which is idempotent by construction", async () => {
+    const { fake, tool } = build(definition, turnContext({ turnKey: "inbox:41" }));
+    fake.products.set("062AC-MZ", {
+      product: fakeProduct(),
+      variant: fakeProduct().variants[0],
+    });
+    await callTool(tool("adjust_inventory"), { sku: "062AC-MZ", set_to: 11 });
+    await callTool(tool("adjust_inventory"), { sku: "062AC-MZ", delta: -3 });
+
+    expect(callsTo(fake, "setInventory")).toHaveLength(1);
+    expect(
+      callsTo(fake, "adjustInventory").map(([i]) => (i as { idempotencyKey: string }).idempotencyKey),
+    ).toEqual(["inbox:41:1"]);
+  });
+});
+
+/**
+ * The guards that stand between the model and an irreversible write. Each one
+ * is checked before any mutation is sent, and the recorded calls are what prove
+ * nothing was sent.
+ */
+describe("write guards reach the port only when they should", () => {
+  it("delete_product refuses when the echoed handle is not the one that resolved", async () => {
+    const { fake, tool } = build(definitionWith(["delete_product"]));
+    fake.products.set("062AC-MZ", { product: fakeProduct() });
+
+    const out = await callTool(tool("delete_product"), {
+      ref: "062AC-MZ",
+      confirm_handle: "vela-lavanda",
+    });
+
+    expect(out).toMatch(/Refused/);
+    expect(callsTo(fake, "remove")).toEqual([]);
+  });
+
+  it("delete_product deletes when the handle matches exactly", async () => {
+    const { fake, tool } = build(definitionWith(["delete_product"]));
+    fake.products.set("062AC-MZ", { product: fakeProduct() });
+
+    await callTool(tool("delete_product"), { ref: "062AC-MZ", confirm_handle: "vela-citronela" });
+
+    expect(callsTo(fake, "remove")).toEqual([["gid://shopify/Product/1"]]);
+  });
+
+  it("update_product sends only the fields it was given", async () => {
+    const { fake, tool } = build(definitionWith(["update_product"]));
+    fake.products.set("062AC-MZ", { product: fakeProduct() });
+
+    await callTool(tool("update_product"), { ref: "062AC-MZ", vendor: "Luminiere" });
+
+    expect(callsTo(fake, "update")).toEqual([
+      [
+        "gid://shopify/Product/1",
+        {
+          title: undefined,
+          description: undefined,
+          status: undefined,
+          productType: undefined,
+          vendor: "Luminiere",
+          tags: undefined,
+        },
+      ],
+    ]);
+  });
+
+  it("build_cart refuses a sold-out variant before a link exists", async () => {
+    const { fake, tool } = build(definitionWith(["build_cart"]));
+    const product = fakeProduct();
+    product.variants[0]!.inventoryQuantity = 0;
+    fake.products.set("062AC-MZ", { product, variant: product.variants[0] });
+
+    const out = await callTool(tool("build_cart"), {
+      items_json: '[{"sku":"062AC-MZ","quantity":1}]',
+    });
+
+    expect(out).toMatch(/SOLD OUT/);
+    expect(callsTo(fake, "cartUrl")).toEqual([]);
+  });
+
+  it("build_cart refuses an unpublished product before a link exists", async () => {
+    const { fake, tool } = build(definitionWith(["build_cart"]));
+    const product = fakeProduct({ onlineStoreUrl: null });
+    fake.products.set("062AC-MZ", { product, variant: product.variants[0] });
+
+    const out = await callTool(tool("build_cart"), {
+      items_json: '[{"sku":"062AC-MZ","quantity":1}]',
+    });
+
+    expect(out).toMatch(/not published/);
+    expect(callsTo(fake, "cartUrl")).toEqual([]);
+  });
+
+  // Photos go up in the order they arrived, and only the ids that actually
+  // landed are marked — a partial failure leaves the rest claimable.
+  it("attach_pending_photos uploads in arrival order and marks only what landed", async () => {
+    const { fake, tool } = build(definitionWith(["attach_pending_photos"]));
+    fake.products.set("062AC-MZ", { product: fakeProduct() });
+    fake.pending = [
+      { id: 1, path: "/staging/a.jpg", caption: "primera" },
+      { id: 2, path: "/staging/b.jpg", caption: null },
+    ];
+
+    await callTool(tool("attach_pending_photos"), { ref: "062AC-MZ" });
+
+    expect(callsTo(fake, "uploadPhotos")).toEqual([
+      [
+        "gid://shopify/Product/1",
+        [
+          { path: "/staging/a.jpg", alt: "primera" },
+          { path: "/staging/b.jpg", alt: null },
+        ],
+      ],
+    ]);
+    expect(callsTo(fake, "markAttached")).toEqual([[[1, 2], "gid://shopify/Product/1"]]);
+  });
+});
+
+/**
+ * Descriptions are templates, and the definition fills the business literals.
+ *
+ * The golden fixture proves today's descriptions did not change. It cannot
+ * prove the templating is wired: a build that dropped slot rendering entirely
+ * would still render every shipped description correctly, because neither
+ * shipped definition sets a slot. These pin the seam itself.
+ */
+describe("templated descriptions", () => {
+  const CART_EXAMPLE = '[{"sku":"062AC-MZ","quantity":1}]';
+
+  it("falls back to the pack's own literal when the definition sets no slot", () => {
+    const { tool } = build(definitionWith(["build_cart"]));
+    expect(tool("build_cart").inputSchema.items_json.description).toBe(
+      `JSON array of what they chose: ${CART_EXAMPLE}`,
+    );
+  });
+
+  it("lets a definition replace the business literal without touching the code", () => {
+    const { tool } = build(
+      definitionWith(["build_cart"], {
+        prompt: {
+          base: "grounding",
+          persona: "prompt.md",
+          slots: { example_cart_items_json: '[{"sku":"VEL-01","quantity":2}]' },
+        },
+      }),
+    );
+    expect(tool("build_cart").inputSchema.items_json.description).toBe(
+      'JSON array of what they chose: [{"sku":"VEL-01","quantity":2}]',
+    );
+  });
+
+  // A slot nothing fills would reach the model as literal braces inside an
+  // otherwise plausible sentence — it renders, it deploys, and only a reading
+  // of the prompt would catch it.
+  it("refuses to render a description with a slot nothing fills", () => {
+    expect(() => renderDescription("Use {{example_sku}} exactly.", {})).toThrow(/example_sku/);
+    expect(renderDescription("Use {{example_sku}}.", { example_sku: "062AC-MZ" })).toBe(
+      "Use 062AC-MZ.",
+    );
+  });
+});
+
+/**
+ * `status: ACTIVE` does not publish. A flow that sets ACTIVE, reports success
+ * and leaves the product invisible is the most plausible wrong-but-plausible
+ * bug here, so the tool reports which of the two actually happened.
+ */
+describe("publishing is a second operation, and says which half happened", () => {
+  it("publishes a product created directly as ACTIVE, and resets the session", async () => {
+    const ctx = turnContext();
+    const { fake, tool } = build(definitionWith(["create_product"]), ctx);
+
+    const out = await callTool(tool("create_product"), {
+      title: "Vela citronela",
+      status: "ACTIVE",
+      variants_json: '[{"sku":"062AC-MZ","price":13800}]',
+    });
+
+    expect(callsTo(fake, "publish")).toEqual([["gid://shopify/Product/1"]]);
+    expect(out).toContain(" Published to the online store.");
+    expect(ctx.sessionAfterTurn).toBe("reset");
+  });
+
+  it("does not publish a draft, and leaves the session alone", async () => {
+    const ctx = turnContext();
+    const { fake, tool } = build(definitionWith(["create_product"]), ctx);
+
+    await callTool(tool("create_product"), {
+      title: "Vela citronela",
+      variants_json: '[{"sku":"062AC-MZ","price":13800}]',
+    });
+
+    expect(callsTo(fake, "publish")).toEqual([]);
+    expect(ctx.sessionAfterTurn).toBeUndefined();
+  });
+
+  it("warns when the status changed but the publish did not happen", async () => {
+    // publish() returns false rather than throwing: the status change already
+    // succeeded, and an ACTIVE product nobody can see must be said out loud.
+    const { fake, tool } = build(definitionWith(["update_product"]));
+    fake.products.set("062AC-MZ", { product: fakeProduct({ status: "DRAFT" }) });
+    fake.ports.catalog.publish = async () => false;
+
+    const out = await callTool(tool("update_product"), { ref: "062AC-MZ", status: "ACTIVE" });
+
+    expect(out).toContain("WARNING: status is ACTIVE but it could not be published");
+    expect(out).toContain("NOT visible to customers");
+  });
+});
+
+/**
+ * Publishing ends a unit of work, and only a TRANSITION to ACTIVE counts. The
+ * signal still travels through ctx.sessionAfterTurn — `session.resetOn` stays
+ * declared and unread, because a reset at tool-name granularity would drop the
+ * owner's session on an ordinary price edit.
+ */
+describe("the publish transition still signals through the turn context", () => {
+  it("asks for a session reset when an update publishes the product", async () => {
+    const ctx = turnContext();
+    const { fake, tool } = build(definitionWith(["update_product"]), ctx);
+    fake.products.set("062AC-MZ", { product: fakeProduct({ status: "DRAFT" }) });
+
+    await callTool(tool("update_product"), { ref: "062AC-MZ", status: "ACTIVE" });
+
+    expect(callsTo(fake, "publish")).toEqual([["gid://shopify/Product/1"]]);
+    expect(ctx.sessionAfterTurn).toBe("reset");
+  });
+
+  it("leaves the session alone when an already-active product is edited", async () => {
+    const ctx = turnContext();
+    const { fake, tool } = build(definitionWith(["update_product"]), ctx);
+    fake.products.set("062AC-MZ", { product: fakeProduct({ status: "ACTIVE" }) });
+
+    await callTool(tool("update_product"), { ref: "062AC-MZ", vendor: "Luminiere" });
+
+    expect(callsTo(fake, "publish")).toEqual([]);
+    expect(ctx.sessionAfterTurn).toBeUndefined();
   });
 });
 

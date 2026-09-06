@@ -57,7 +57,7 @@ const SessionPolicySchema = z
      * Tool names that MAY trigger a session reset — NOT a literal "this tool
      * call resets the session" mapping. Today's actual condition is a STATE
      * TRANSITION a tool evaluates for itself (`isPublishTransition` in
-     * tools.ts: a product becomes ACTIVE and was not before) and signals
+     * tools/packs/catalog.ts: a product becomes ACTIVE and was not before) and signals
      * through `ctx.sessionAfterTurn = "reset"`; `update_product` appears here
      * because it CAN cause that transition, not because every call to it
      * resets anything. A future implementation that reads this field at
@@ -109,13 +109,26 @@ export interface AgentDefinition {
 }
 
 /**
- * The set of tool names this BUILD can serve, independent of any one
- * definition — what `validateDefinition` checks `tools[]` and
- * `session.resetOn` against. A `Set` rather than an enum because Phase 3's
- * registry is what eventually produces it; nothing here should need to change
- * on that day, only the caller that builds one.
+ * What this BUILD can serve, independent of any one definition — the shape
+ * `tools/registry.ts` produces and `validateDefinition` checks `tools[]`,
+ * `session.resetOn` and the persona's prose against.
+ *
+ * TWO sets, and they are not interchangeable. `keys` is what a definition may
+ * NAME; `exposedNames` is what the MODEL sees, and the two differ wherever one
+ * exposed name has more than one implementation behind it (`get_product`:
+ * ACTIVE-only for the customer, any status for the owner). A persona writes
+ * prose for the model, so its mentions are checked against exposed names —
+ * checking them against keys would reject the owner persona for saying
+ * `get_product` while correctly declaring `get_product_any_status`.
+ *
+ * Structural rather than the registry type itself: this module must stay
+ * loadable, and testable, without importing the tool layer it validates.
  */
-export type ToolUniverse = ReadonlySet<string>;
+export interface ToolUniverse {
+  keys: ReadonlySet<string>;
+  /** Registry key → the name the model is given for it. */
+  exposedNames: ReadonlyMap<string, string>;
+}
 
 /**
  * A prompt "mentions" a tool when the tool's exact name appears as a whole
@@ -183,19 +196,37 @@ export function validateDefinition(definition: AgentDefinition, universe: ToolUn
   const declaredTools = new Set(definition.tools);
 
   for (const toolName of definition.tools) {
-    if (!universe.has(toolName)) {
+    if (!universe.keys.has(toolName)) {
       errors.push(`tools[] names "${toolName}", which is not a tool this build serves`);
     }
   }
 
-  for (const toolName of universe) {
-    if (mentionsTool(definition.personaText, toolName) && !declaredTools.has(toolName)) {
-      errors.push(`prompt.md mentions "${toolName}", which is not in tools[]`);
+  // What this agent's model will actually see. Only the tools that exist are
+  // mapped: an unknown key is already an error above, and reporting it twice
+  // buries the one line that names the typo.
+  const declaredExposed = new Set(
+    definition.tools.map((key) => universe.exposedNames.get(key)).filter((name) => name !== undefined),
+  );
+  const seenExposed = new Set<string>();
+  for (const key of definition.tools) {
+    const exposed = universe.exposedNames.get(key);
+    if (exposed === undefined) continue;
+    if (seenExposed.has(exposed)) {
+      // Two tools of one name on one MCP server is a coin flip over which one
+      // the model reaches, decided by nothing a reader of the YAML can see.
+      errors.push(`tools[] declares two tools exposed to the model as "${exposed}"`);
+    }
+    seenExposed.add(exposed);
+  }
+
+  for (const exposed of new Set(universe.exposedNames.values())) {
+    if (mentionsTool(definition.personaText, exposed) && !declaredExposed.has(exposed)) {
+      errors.push(`prompt.md mentions "${exposed}", which is not in tools[]`);
     }
   }
 
   for (const toolName of definition.session.resetOn) {
-    if (!universe.has(toolName)) {
+    if (!universe.keys.has(toolName)) {
       errors.push(`session.resetOn names "${toolName}", which is not a tool this build serves`);
     } else if (!declaredTools.has(toolName)) {
       errors.push(`session.resetOn names "${toolName}", which this agent does not have in tools[]`);

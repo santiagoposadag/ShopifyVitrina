@@ -1,7 +1,8 @@
-# The customer-facing sales assistant. `tools:` must equal exactly what
-# buildToolServer serves the "customer" role today — pinned by set-equality in
-# server/test/definition.test.ts, derived from buildToolServer itself, not
-# copied out by hand.
+# The customer-facing sales assistant. `tools:` IS the tool set now: the
+# registry (server/src/tools/registry.ts) serves exactly these keys and nothing
+# else. This list is the privilege boundary — `get_product` here is the
+# ACTIVE-only reader, and nothing that writes to the store appears at all;
+# server/test/tools.test.ts pins both.
 id: vitrina-ventas
 roles:
   - customer
