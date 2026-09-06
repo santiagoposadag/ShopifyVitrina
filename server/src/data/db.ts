@@ -247,6 +247,37 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
       rotated_at TEXT
     );
 
+    -- WHO is an owner, and therefore which assistant answers them.
+    --
+    -- THIS TABLE IS THE ROLE BOUNDARY. It replaces OWNER_PHONE_NUMBERS as the
+    -- authority (router.ts reads it for every inbound message); the variable
+    -- survives as a SEED, copied in at boot for phones that have no row yet
+    -- (data/assignments.ts seedOwnerAssignments). A deployment that sets the
+    -- variable and knows nothing about this table keeps working unchanged.
+    --
+    -- A MISSING ROW IS A CUSTOMER, never an error and never an owner. That is
+    -- today's behaviour and the only safe default: an unknown phone repricing a
+    -- live store is the failure this whole boundary exists to prevent.
+    --
+    -- phone is normalizePhone's output — bare E.164 digits — because that is
+    -- what the WhatsApp door produces and what every lookup normalises to.
+    -- ONE normalisation, or an owner who wrote their number with a '+' reads as
+    -- a customer for the life of the deployment. A LID is NOT a phone number
+    -- (see CLAUDE.md); its digits would land here looking like one, so the
+    -- lookup is exact equality and nothing else.
+    --
+    -- The CHECK lists the roles this build actually serves. A third role would
+    -- be dead configuration that reads, to whoever writes it, like a privilege
+    -- somebody honours — and nothing does.
+    --
+    -- A new table, so IF NOT EXISTS IS the migration for a database that
+    -- predates it: nothing here alters an existing table.
+    CREATE TABLE IF NOT EXISTS assignments (
+      phone TEXT PRIMARY KEY,
+      role TEXT NOT NULL CHECK (role IN ('owner','customer')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
     -- Every batch flush claims one CONVERSATION's un-settled rows. The index
     -- that serves that claim is created in migrate() below, not here: on a

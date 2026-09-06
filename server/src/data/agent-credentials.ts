@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { loadDotEnv, loadOwnerPhoneNumbers, resolveDataPath } from "../config.js";
-import { agentIdForPhone } from "../router.js";
+import { refusingLegacyAgentIdFor } from "../router.js";
 import {
   deleteAgentCredential,
   findAgentByToken,
@@ -141,24 +141,23 @@ async function main(): Promise<void> {
   const agentsDir = resolveDataPath(process.env["AGENT_DEFINITIONS_DIR"]?.trim() || "agents");
   const ownerPhoneNumbers = loadOwnerPhoneNumbers();
 
-  // BEFORE opening the database. Opening it runs the schema migration, and a
-  // database from an older build has its sessions keyed by phone alone — the
-  // migration is where those rows are assigned to an agent, using this
-  // allowlist. With an empty one every session, the owner's included, would be
-  // filed under the customer agent, and an owner mid-listing would lose it.
-  // Managing a credential must not cost that; the same refusal guards the purge
-  // tool (data/purge.ts), for the same reason.
-  if (ownerPhoneNumbers.size === 0) {
-    throw new Error(
-      "OWNER_PHONE_NUMBERS is empty — refusing to open the database, since doing so may migrate " +
-        "sessions and would file the owner's under the customer agent. Set the allowlist and retry.",
-    );
-  }
-
   const db = openDb(dbPath, {
     // The server's own mapping: a session migrated here must be one the server
     // will still find.
-    legacyAgentIdFor: (phone: string) => agentIdForPhone({ ownerPhoneNumbers }, phone),
+    //
+    // REFUSING when it cannot answer. Opening the database runs the schema
+    // migration, and a database from an older build has its sessions keyed by
+    // phone alone — the migration is where those rows are assigned to an agent,
+    // using this allowlist. With an empty one every session, the owner's
+    // included, would be filed under the customer agent, and an owner
+    // mid-listing would lose it. Managing a credential must not cost that.
+    //
+    // Asked ONLY when such rows exist, which is the difference from the blanket
+    // pre-open refusal this replaces: since Phase 6 the owner allowlist can
+    // legitimately live entirely in the assignments table with the variable
+    // unset, and refusing every command in that deployment would be a guard
+    // firing on a question that is no longer the right one.
+    legacyAgentIdFor: refusingLegacyAgentIdFor(ownerPhoneNumbers),
   });
   try {
     if (command === "list") return list(db);

@@ -11,6 +11,7 @@ import { agentConversationKey } from "../src/inbox/envelope.js";
 import type { WhatsAppChannel } from "../src/whatsapp/channel.js";
 import type { Envelope } from "../src/inbox/envelope.js";
 import type { TurnContext } from "../src/types.js";
+import { AGENT_IDS } from "../src/router.js";
 
 /**
  * One agent asking another, in process, through the whole pipeline.
@@ -92,7 +93,7 @@ function chain(options: ChainOptions): Chain {
     maxWaitMs: 45000,
     mediaDebounceMs: 45000,
     mediaMaxWaitMs: 120000,
-    roleFor: () => "owner",
+    route: () => ({ role: "owner", agentId: AGENT_IDS.owner }),
     onMessage: async (envelope, ctx) => {
       turns.push({
         agentId: envelope.agentId,

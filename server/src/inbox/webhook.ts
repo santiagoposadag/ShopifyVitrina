@@ -88,7 +88,20 @@ export interface WebhookDeps {
   channel: WhatsAppChannel;
   /** Coalesces each phone's burst into a single agent turn, off the ACK path. */
   batcher: InboxBatcher;
-  /** Maps a phone number to its role (owner vs customer). */
+  /**
+   * Maps a phone number to its role (owner vs customer) — the assignments
+   * table, through router.ts.
+   *
+   * Read HERE for one decision only: whether an inbound photo is a listing to
+   * keep or a stranger's image to drop. The batcher asks again when the burst
+   * flushes, so an assignment changed mid-burst can be answered one way here
+   * and the other way there. That window is seconds long and it fails in the
+   * harmless direction: a promotion mid-burst costs the photos that arrived
+   * before it (never fetched, so never leaked), and a demotion leaves staged
+   * files the customer agent cannot attach, which housekeeping collects.
+   * Deciding both here would mean freezing a role onto a row and answering a
+   * burst by what was true when its first message landed.
+   */
   roleFor: (phone: string) => Role;
 }
 

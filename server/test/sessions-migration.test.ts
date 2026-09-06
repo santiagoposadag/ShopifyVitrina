@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createSchema, openDb, type DB } from "../src/data/db.js";
 import { getSessionId, listSessions, setSessionId } from "../src/data/repo.js";
+import { refusingLegacyAgentIdFor } from "../src/router.js";
 
 /**
  * The sessions key change, against a database that already exists.
@@ -154,5 +155,71 @@ describe("sessions migration to (agent_id, conversation_key)", () => {
         .all() as { name: string }[]
     ).map((t) => t.name);
     expect(tables).toEqual(["sessions"]);
+  });
+});
+
+/**
+ * The resolver an OPS ENTRY POINT passes (router.ts refusingLegacyAgentIdFor).
+ *
+ * Opening the database is what runs this migration, so a command cannot check
+ * first — the check has to be the resolver itself. Since Phase 6 the owner
+ * allowlist may legitimately live only in the assignments table, so refusing
+ * every command on an empty variable would be the wrong question; refusing only
+ * when a legacy row must actually be placed is the right one.
+ */
+describe("the refusing resolver an ops entry point passes", () => {
+  let db: DB;
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("leaves the legacy table untouched when it cannot tell owner from customer", () => {
+    db = legacyDb();
+    insertLegacyRow(db, OWNER, "session-owner", NOW);
+
+    expect(() =>
+      createSchema(db, { legacyAgentIdFor: refusingLegacyAgentIdFor(new Set()) }),
+    ).toThrow(/OWNER_PHONE_NUMBERS is empty/);
+
+    // Rolled back whole: the rebuild runs in one transaction, so the row is
+    // still there, still under the old key, and a later run with an allowlist
+    // migrates it correctly. A half-migrated database is the one outcome that
+    // could not be recovered from.
+    const columns = db.prepare(`PRAGMA table_info(sessions)`).all() as { name: string }[];
+    expect(columns.map((c) => c.name)).toContain("phone");
+    expect(columns.some((c) => c.name === "conversation_key")).toBe(false);
+    expect(
+      db.prepare(`SELECT agent_session_id FROM sessions WHERE phone = ?`).get(OWNER),
+    ).toEqual({ agent_session_id: "session-owner" });
+    // And the half-built copy is gone with it, rather than left behind for the
+    // next boot to trip over.
+    expect(() => db.prepare(`SELECT 1 FROM sessions_rekeyed`).get()).toThrow(/no such table/);
+  });
+
+  // ONE axis from the case above: the same empty allowlist, no legacy row to
+  // place. Nothing is at risk, so the command must run — this is the deployment
+  // whose owners live in the assignments table with the variable unset.
+  it("migrates an empty legacy table with no allowlist at all", () => {
+    db = legacyDb();
+
+    expect(() =>
+      createSchema(db, { legacyAgentIdFor: refusingLegacyAgentIdFor(new Set()) }),
+    ).not.toThrow();
+
+    const columns = db.prepare(`PRAGMA table_info(sessions)`).all() as { name: string }[];
+    expect(columns.some((c) => c.name === "conversation_key")).toBe(true);
+  });
+
+  // And an already-migrated database never reaches the resolver at all, which
+  // is what makes every routine run of an ops command unaffected by this.
+  it("never asks about a database that has already been re-keyed", () => {
+    db = openDb(":memory:");
+    setSessionId(db, "vitrina-inventario", OWNER, "session-owner");
+
+    expect(() =>
+      createSchema(db, { legacyAgentIdFor: refusingLegacyAgentIdFor(new Set()) }),
+    ).not.toThrow();
+    expect(getSessionId(db, "vitrina-inventario", OWNER)).toBe("session-owner");
   });
 });

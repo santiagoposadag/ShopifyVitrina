@@ -9,6 +9,7 @@
     "backup": "tsx src/data/backup.ts",
     "purge:sessions": "tsx src/data/purge-sessions.ts",
     "agent:credentials": "tsx src/data/agent-credentials.ts",
+    "roles": "tsx src/data/role-assignments.ts",
     "build": "tsc --noEmit && tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:live": "LIVE_PROVIDER_TESTS=1 vitest run --config vitest.live.config.ts"

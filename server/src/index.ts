@@ -5,9 +5,14 @@ import { checkAgentCredential } from "./agent/preflight.js";
 import { transcribe, transcriptionEnabled } from "./agent/transcribe.js";
 import { ConsecutiveFailureAlert } from "./inbox/alerts.js";
 import { InboxBatcher } from "./inbox/batcher.js";
-import { isOwner, loadConfig, loadDotEnv } from "./config.js";
+import { loadConfig, loadDotEnv } from "./config.js";
 import { openDb } from "./data/db.js";
 import { countAgentCredentials } from "./data/agent-registry.js";
+import {
+  countAssignedOwners,
+  listPhonesWithRole,
+  seedOwnerAssignments,
+} from "./data/assignments.js";
 import { BridgeChannel, sweepStagedMedia } from "./whatsapp/bridge.js";
 import type { WhatsAppChannel } from "./whatsapp/channel.js";
 import { CloudApiChannel } from "./whatsapp/cloud.js";
@@ -29,7 +34,7 @@ import { inProcessAgentsPort } from "./inbox/agents-port.js";
 import { principalId } from "./inbox/envelope.js";
 import { AgentReplies } from "./egress/agent-reply.js";
 import { Responders } from "./egress/responder.js";
-import { agentIdForPhone, AGENT_IDS } from "./router.js";
+import { AGENT_IDS, createRouter, legacySessionAgentId } from "./router.js";
 import { toolUniverse } from "./tools/registry.js";
 import { shopifyCatalogPort } from "./shopify/catalog-port.js";
 import { sqliteLeadsPort, sqliteMediaPort } from "./data/tool-ports.js";
@@ -59,11 +64,22 @@ async function main(): Promise<void> {
     // every conversation restarting on the upgrade; with it, an owner's
     // in-progress listing survives.
     //
-    // Same rule the router applies to live traffic, deliberately: a session
-    // migrated under an id the router never produces is a row nothing will ever
-    // read again.
-    legacyAgentIdFor: (phone: string) => agentIdForPhone(config, phone),
+    // The VARIABLE, not the assignments table, and router.ts says why at
+    // length: this runs while the schema is still being created, before the
+    // seed below has put a single row in that table — and it is also what was
+    // authoritative when those rows were written.
+    legacyAgentIdFor: (phone: string) => legacySessionAgentId(config.ownerPhoneNumbers, phone),
   });
+  // OWNER_PHONE_NUMBERS, honoured as a SEED: a deployment that sets it and
+  // knows nothing about the assignments table keeps working with no operator
+  // action. Insert-if-absent and NEVER a reconciliation — a phone removed from
+  // the variable keeps its row, because the way that variable actually goes
+  // missing is a .env loadDotEnv silently swallowed, and syncing to it would
+  // then revoke the owner of the store on a restart. See data/assignments.ts.
+  //
+  // Reported, not silent: the log line below names every phone the variable and
+  // the table disagree about.
+  const seededOwners = seedOwnerAssignments(db, config.ownerPhoneNumbers);
   // The composition root is the only place that names the transport. Everything
   // below takes the WhatsAppChannel interface, which is what lets the pipeline
   // be tested without an HTTP client or a paired device anywhere in sight — and
@@ -83,6 +99,11 @@ async function main(): Promise<void> {
   const definitions = Object.fromEntries(
     loadAndValidateDefinitions(config.agentDefinitionsDir, Object.values(AGENT_IDS), toolUniverse()),
   );
+  // Who reaches which of them: the assignments table for the role, the
+  // definitions' own `roles` for the agent. Built here, from what was just
+  // loaded, so a role no agent serves — or two agents claiming one — fails the
+  // boot instead of a live message.
+  const router = createRouter({ db, definitions: Object.values(definitions) });
   // Fails BOOT for the same reasons the definitions above do: a knowledge path
   // that does not exist, a document nothing declares, a document naming a tool
   // this agent was not given, or inline documents that do not fit their
@@ -225,6 +246,41 @@ async function main(): Promise<void> {
     );
   }
 
+  // Said once at boot, because who is an owner is no longer visible in the
+  // deployment's environment alone. "0 owners" is the state in which every
+  // phone — including the person who owns the store — reads as a customer.
+  const ownerCount = countAssignedOwners(db);
+  app.log.info(
+    {
+      owners: ownerCount,
+      seededFromEnv: seededOwners.inserted.length,
+      alreadyAssigned: seededOwners.unchanged.length,
+    },
+    "role assignments ready",
+  );
+  if (ownerCount === 0) {
+    // Not fatal — a deployment with no owner is legal, and refusing to boot
+    // would take the customer path down with it. But it is the state in which
+    // the person who owns the store writes in and reaches the SALES assistant,
+    // which looks like the agent having lost its memory rather than like a
+    // missing row, so it cannot be left to be inferred from "owners: 0".
+    app.log.warn(
+      "No owner is assigned: every phone reads as a customer, the store's owner included. " +
+        "Set OWNER_PHONE_NUMBERS (seeded at boot) or run role-assignments set <phone> owner.",
+    );
+  }
+  for (const conflict of seededOwners.disagreed) {
+    // A DISAGREEMENT between the variable and the table, and the table won.
+    // Loud because it is the one case where OWNER_PHONE_NUMBERS says something
+    // that is not true of this deployment: someone demoted this phone through
+    // the ops entry point and the variable was never updated.
+    app.log.warn(
+      { phone: conflict.phone, assigned: conflict.role },
+      "OWNER_PHONE_NUMBERS names a phone the assignments table records as a " +
+        `${conflict.role}; the table wins. Use role-assignments to change it, or drop it from the variable.`,
+    );
+  }
+
   if (config.echoMode) {
     app.log.warn(
       "ECHO_MODE IS ON — every inbound message gets a canned test reply. No agent turn, " +
@@ -267,7 +323,11 @@ async function main(): Promise<void> {
   registerMediaRoutes(app, config);
 
   const notifyOwnersOfFailures = async (): Promise<void> => {
-    for (const owner of config.ownerPhoneNumbers) {
+    // The TABLE's owners, not the variable's: an owner assigned through the ops
+    // entry point is an owner, and alerting the seed list instead would leave
+    // exactly that person unaware their store stopped answering. Re-read per
+    // alert for the same reason the router does not cache.
+    for (const owner of listPhonesWithRole(db, "owner")) {
       try {
         await channel.sendText(owner, OWNER_FAILURE_ALERT);
       } catch {
@@ -276,7 +336,11 @@ async function main(): Promise<void> {
     }
   };
 
-  const roleFor = (phone: string): Role => (isOwner(config, phone) ? "owner" : "customer");
+  // The role half of the router, for the two consumers that need only that: the
+  // webhook (which files an owner's photos and drops a stranger's) and the
+  // contacts row. Read per message — an assignment made through the ops entry
+  // point takes effect on the next message, with no restart.
+  const roleFor = (phone: string): Role => router.roleFor(phone);
 
   const batcher = new InboxBatcher({
     db,
@@ -302,7 +366,7 @@ async function main(): Promise<void> {
     maxWaitMs: config.batchMaxWaitMs,
     mediaDebounceMs: config.batchMediaDebounceMs,
     mediaMaxWaitMs: config.batchMediaMaxWaitMs,
-    roleFor,
+    route: (phone: string) => router.routeWhatsApp(phone),
     // Runs on the worker, never in the webhook — see transcribe.ts. With no
     // TRANSCRIPTION_API_KEY this returns null and a voice note gets a reply
     // asking for text, rather than the silence it used to get.

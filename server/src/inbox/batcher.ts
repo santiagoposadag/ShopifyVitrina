@@ -14,7 +14,6 @@ import {
   setInboxTranscript,
   type InboxRow,
 } from "../data/repo.js";
-import { agentIdForRole } from "../router.js";
 import type { MessageKind, Role, TurnContext } from "../types.js";
 import { agentPrincipal, whatsappPrincipal, type Envelope } from "./envelope.js";
 
@@ -160,11 +159,18 @@ export interface InboxBatcherDeps {
    */
   onMessage: (envelope: Envelope, ctx: TurnContext) => Promise<void>;
   /**
-   * The WhatsApp allowlist, as a function. Returns a role for every phone and
-   * is asked about NOTHING ELSE: an agent caller has no phone for it to judge,
-   * and its role is absent rather than defaulted (see TurnContext).
+   * phone → role → which agent answers, in ONE call (router.ts).
+   *
+   * One dependency rather than two, because the two halves are one decision:
+   * a caller that could supply a role and a mapping separately could make them
+   * disagree, and the disagreement would be a person routed to the assistant
+   * their role does not belong to.
+   *
+   * Asked about a PHONE and nothing else: an agent caller has none, and its
+   * target agent is stamped on the row by the door that authenticated it (see
+   * identify below, and TurnContext for why its role is absent, not defaulted).
    */
-  roleFor: (phone: string) => Role;
+  route: (phone: string) => { role: Role; agentId: string };
   /**
    * Turn a stored voice note into words. Optional: with no transcription
    * provider configured, audio rows fall back to a reply asking for text.
@@ -594,11 +600,14 @@ export class InboxBatcher {
     // back into one field: a door whose caller has no phone still has
     // conversations.
     const phone = first.phone;
-    const role = this.deps.roleFor(phone);
+    // Resolved HERE, at flush time, from the phone the door authenticated —
+    // never re-derived from anything in the text. The role and the agent come
+    // back together so one burst cannot be judged one way and delivered the
+    // other.
+    const { role, agentId } = this.deps.route(phone);
     return {
       principal: whatsappPrincipal(phone),
-      // Derived from the role for now; the definition router replaces this call.
-      agentId: agentIdForRole(role),
+      agentId,
       phone,
       role,
       hop: 0,

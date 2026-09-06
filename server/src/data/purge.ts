@@ -1,6 +1,7 @@
 import type { Config } from "../config.js";
 import { isOwner } from "../config.js";
 import { isAgentConversationKey } from "../inbox/envelope.js";
+import { countAssignedOwners, roleForPhone } from "./assignments.js";
 import type { DB } from "./db.js";
 import { clearSessionId, listSessions } from "./repo.js";
 import { deleteTranscript, sweepOrphanedTranscripts } from "./transcripts.js";
@@ -30,10 +31,19 @@ export interface PurgeResult {
  *
  * OWNER SESSIONS ARE PRESERVED: an owner mid-listing has a session that
  * upsert_product's merge semantics depend on, and dropping it loses in-progress
- * work. Role comes from the OWNER_PHONE_NUMBERS allowlist (config.isOwner) —
- * never from the contacts table, which only records what we last saw.
+ * work. Role comes from the `assignments` table — what the ROUTER reads — plus
+ * OWNER_PHONE_NUMBERS, and never from the contacts table, which only records
+ * what we last saw.
  *
- * The allowlist is consulted with the session's CONVERSATION KEY, which on the
+ * EITHER SOURCE SPARES A SESSION, deliberately, and the two can disagree in
+ * exactly one direction: a phone the ops tool demoted while the variable still
+ * names it. This tool then keeps a session the router would treat as a
+ * customer's — the conservative error, and the only one available, because the
+ * damage here is unrecoverable and the damage of keeping one history too many
+ * is a history that expires on its own sliding window. Deciding it the other
+ * way would mean a destructive tool acting on a disagreement it noticed.
+ *
+ * Both sources are consulted with the session's CONVERSATION KEY, which on the
  * WhatsApp door is the phone — so this decides exactly what it decided when
  * sessions were keyed by phone alone.
  *
@@ -57,32 +67,47 @@ export interface PurgeResult {
 /**
  * The condition under which this tool must not run at all.
  *
- * An empty allowlist makes EVERY phone a customer, including the owner's, whose
- * session this must never touch. The server treats no-owners as a valid
+ * KNOWING NO OWNERS makes EVERY session look like a customer's, including the
+ * owner's, which this must never touch. The server treats no-owners as a valid
  * deployment; a destructive tool cannot, because the likeliest cause is a
  * missing variable rather than a real intent — and the damage is silent and
  * unrecoverable. Refuse instead of guessing.
  *
- * Exported because the check has to happen BEFORE the database is opened as
- * well as here: opening it runs the schema migration, which re-keys legacy
- * sessions using the same allowlist, so an empty one would file the owner's
- * session under the customer agent before this function ever sees it.
+ * WHAT "EMPTY" MEANS NOW. The router reads the `assignments` table, and
+ * OWNER_PHONE_NUMBERS is only the seed that fills it. So this asks BOTH: a
+ * deployment whose owners were assigned through the ops entry point, with the
+ * variable never set, can tell an owner from a customer perfectly well, and
+ * refusing it would be a guard firing on the wrong question. Only when neither
+ * source names a single owner is the answer genuinely unknowable.
+ *
+ * `db` is optional because the check also runs where there is no database to
+ * ask — before one is opened, and in a unit test. Without it the variable is
+ * all there is, which is the strictly more conservative half: it can refuse a
+ * deployment that would have been fine, never permit one that is not.
  */
-export function assertOwnerAllowlist(config: PurgeConfig): void {
-  if (config.ownerPhoneNumbers.size === 0) {
-    throw new Error(
-      "OWNER_PHONE_NUMBERS is empty — refusing to purge, since every session would look like a customer's. Set it to the owner allowlist and retry.",
-    );
-  }
+export function assertOwnerAllowlist(config: PurgeConfig, db?: DB): void {
+  if (config.ownerPhoneNumbers.size > 0) return;
+  if (db && countAssignedOwners(db) > 0) return;
+  throw new Error(
+    "OWNER_PHONE_NUMBERS is empty and no owner is assigned in the assignments table — " +
+      "refusing to purge, since every session would look like a customer's. Assign an owner " +
+      "(role-assignments set <phone> owner) or set the allowlist, and retry.",
+  );
 }
 
 export function purgeCustomerSessions(db: DB, config: PurgeConfig, root?: string): PurgeResult {
-  assertOwnerAllowlist(config);
+  // With the database in hand, so the refusal judges what the router judges.
+  assertOwnerAllowlist(config, db);
+
+  // The table first, the seed variable second, and EITHER answer spares the
+  // session. See the header comment for why the disagreement resolves this way.
+  const isOwnerKey = (key: string): boolean =>
+    roleForPhone(db, key) === "owner" || isOwner(config, key);
 
   const sessions = listSessions(db);
   const agents = sessions.filter((s) => isAgentConversationKey(s.conversation_key));
   const customers = sessions.filter(
-    (s) => !isAgentConversationKey(s.conversation_key) && !isOwner(config, s.conversation_key),
+    (s) => !isAgentConversationKey(s.conversation_key) && !isOwnerKey(s.conversation_key),
   );
 
   for (const session of customers) {

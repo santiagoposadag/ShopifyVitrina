@@ -9,7 +9,8 @@ import {
   purgeCustomerSessions,
   type PurgeConfig,
 } from "../src/data/purge.js";
-import { agentIdForRole } from "../src/router.js";
+import { AGENT_IDS } from "../src/router.js";
+import { assignRole } from "../src/data/assignments.js";
 import { agentConversationKey } from "../src/inbox/envelope.js";
 
 /**
@@ -18,8 +19,8 @@ import { agentConversationKey } from "../src/inbox/envelope.js";
  * the decision — and these fixtures use the real one for each role so the
  * fixture cannot pass by accident under a mapping that no longer matches.
  */
-const INVENTORY = agentIdForRole("owner");
-const SALES = agentIdForRole("customer");
+const INVENTORY = AGENT_IDS.owner;
+const SALES = AGENT_IDS.customer;
 
 const OWNER = "573001110000";
 const CUSTOMER = "573002220000";
@@ -150,12 +151,12 @@ describe("purgeCustomerSessions transcript sweep", () => {
 /**
  * The refusal, on its own.
  *
- * It is exported and called a second time by the ops entry point BEFORE it
- * opens the database, because opening the database now runs the session
- * migration — which asks this same allowlist which agent owned each legacy row.
- * An empty one there would file the owner's session under the customer agent,
- * and the check inside purgeCustomerSessions would then be guarding a decision
- * that had already been made.
+ * It is exported and called a second time by the ops entry point, which passes
+ * the open database so the check sees the assignments table as well. The
+ * legacy-session half of the same danger — opening the database runs the
+ * migration, which asks who owned each phone-keyed row — is guarded by the
+ * resolver that entry point passes (router.ts refusingLegacyAgentIdFor), since
+ * there is no moment before the open at which the table could be consulted.
  */
 describe("assertOwnerAllowlist", () => {
   it("refuses an empty allowlist", () => {
@@ -208,5 +209,69 @@ describe("agent-to-agent sessions are not customer histories", () => {
 
     expect(getSessionId(db, SALES, "super-agent:corr-1")).toBeUndefined();
     expect(result).toMatchObject({ keptAgent: 0 });
+  });
+});
+
+/**
+ * The refusal and the role decision, once the ASSIGNMENTS TABLE is what the
+ * router reads and OWNER_PHONE_NUMBERS is only its seed.
+ *
+ * A guard that keeps checking the variable alone has quietly stopped guarding:
+ * it would refuse a deployment that can tell owner from customer perfectly
+ * well, and — worse — it would let this tool delete the session of an owner the
+ * table names and the variable does not.
+ */
+describe("purge with owners in the assignments table", () => {
+  const NO_VARIABLE: PurgeConfig = { ...CONFIG, ownerPhoneNumbers: new Set() };
+
+  it("refuses when neither the variable nor the table names an owner", () => {
+    expect(() => assertOwnerAllowlist(NO_VARIABLE, db)).toThrow(/OWNER_PHONE_NUMBERS is empty/);
+    expect(() => purgeCustomerSessions(db, NO_VARIABLE, root)).toThrow(
+      /OWNER_PHONE_NUMBERS is empty/,
+    );
+    expect(getSessionId(db, INVENTORY, OWNER)).toBe(OWNER_SESSION); // nothing was touched
+  });
+
+  // ONE axis from the case above: the same empty variable, one owner row.
+  it("runs with an empty variable once the table names an owner", () => {
+    assignRole(db, OWNER, "owner");
+    expect(() => assertOwnerAllowlist(NO_VARIABLE, db)).not.toThrow();
+  });
+
+  // A customer row is not an owner. The refusal is about whether an OWNER can
+  // be recognised, not about whether the table has rows in it.
+  it("still refuses when the table holds only customers", () => {
+    assignRole(db, CUSTOMER, "customer");
+    expect(() => assertOwnerAllowlist(NO_VARIABLE, db)).toThrow(/OWNER_PHONE_NUMBERS is empty/);
+  });
+
+  // The destructive half of the same question: an owner the ops tool assigned,
+  // whose phone the variable never named, must keep their session.
+  it("keeps the session of an owner only the table knows about", () => {
+    assignRole(db, OWNER, "owner");
+
+    const result = purgeCustomerSessions(db, NO_VARIABLE, root);
+
+    expect(getSessionId(db, INVENTORY, OWNER)).toBe(OWNER_SESSION);
+    expect(transcriptExists(OWNER_SESSION)).toBe(true);
+    expect(result).toMatchObject({ purged: 1, kept: 1 });
+  });
+
+  // The one direction in which the two sources can disagree: demoted in the
+  // table, still named by the variable. A destructive tool resolves that the
+  // conservative way — it keeps the history rather than acting on a
+  // disagreement it noticed.
+  it("keeps a session the table demoted while the variable still names it", () => {
+    assignRole(db, OWNER, "customer");
+
+    expect(purgeCustomerSessions(db, CONFIG, root)).toMatchObject({ purged: 1, kept: 1 });
+    expect(getSessionId(db, INVENTORY, OWNER)).toBe(OWNER_SESSION);
+  });
+
+  // Without a database there is no table to ask, so the variable is all there
+  // is — the strictly more conservative half of the check.
+  it("judges the variable alone when it is called without a database", () => {
+    assignRole(db, OWNER, "owner");
+    expect(() => assertOwnerAllowlist(NO_VARIABLE)).toThrow(/OWNER_PHONE_NUMBERS is empty/);
   });
 });

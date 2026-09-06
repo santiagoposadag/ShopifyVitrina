@@ -8,6 +8,7 @@ import { PerConversationQueue } from "../src/inbox/queue.js";
 import { agentConversationKey } from "../src/inbox/envelope.js";
 import { MAX_HOP, registerAgentDoor } from "../src/inbox/a2a.js";
 import { registerWebhook } from "../src/inbox/webhook.js";
+import { AGENT_IDS } from "../src/router.js";
 import { AgentReplies } from "../src/egress/agent-reply.js";
 import { Responders } from "../src/egress/responder.js";
 import type { WhatsAppChannel } from "../src/whatsapp/channel.js";
@@ -93,7 +94,7 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     maxWaitMs: 45000,
     mediaDebounceMs: 45000,
     mediaMaxWaitMs: 120000,
-    roleFor: () => "customer",
+    route: () => ({ role: "customer", agentId: AGENT_IDS.customer }),
     onMessage: async (envelope, ctx) => {
       turns.push({ envelope, ctx });
       const reply = options.onTurn

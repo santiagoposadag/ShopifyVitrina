@@ -15,7 +15,8 @@ import { openDb, type DB } from "../src/data/db.js";
 import { PerConversationQueue } from "../src/inbox/queue.js";
 import { getInboxRow, insertInboxMessage, listPendingMedia } from "../src/data/repo.js";
 import type { Envelope } from "../src/inbox/envelope.js";
-import type { TurnContext } from "../src/types.js";
+import type { Role, TurnContext } from "../src/types.js";
+import { AGENT_IDS } from "../src/router.js";
 
 const DEBOUNCE_MS = 8000;
 const MAX_WAIT_MS = 45000;
@@ -39,7 +40,16 @@ interface Harness {
   failures: { phone: TurnContext["phone"]; final: boolean; attempts: number }[];
 }
 
-function harness(overrides: Partial<InboxBatcherDeps> = {}): Harness {
+/**
+ * `roleFor` is the harness's own knob, not the batcher's: the batcher takes ONE
+ * routing dependency (phone → role → agent), and every test here is about which
+ * ROLE a phone has. The role → agent half is the shipped mapping, so a test that
+ * asserts an agent id is asserting the real one; router.test.ts pins that
+ * mapping against the definitions themselves.
+ */
+type HarnessOptions = Partial<InboxBatcherDeps> & { roleFor?: (phone: string) => Role };
+
+function harness({ roleFor, ...overrides }: HarnessOptions = {}): Harness {
   const db = openDb(":memory:");
   const turns: Harness["turns"] = [];
   const envelopes: Envelope[] = [];
@@ -53,7 +63,10 @@ function harness(overrides: Partial<InboxBatcherDeps> = {}): Harness {
     maxWaitMs: MAX_WAIT_MS,
     mediaDebounceMs: MEDIA_DEBOUNCE_MS,
     mediaMaxWaitMs: MEDIA_MAX_WAIT_MS,
-    roleFor: () => "customer",
+    route: (phone: string) => {
+      const role = roleFor?.(phone) ?? "customer";
+      return { role, agentId: AGENT_IDS[role] };
+    },
     onMessage: async (envelope, ctx) => {
       envelopes.push(envelope);
       // The text comes off the ENVELOPE, which is where the prompt lives now —

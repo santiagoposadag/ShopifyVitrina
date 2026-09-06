@@ -4,6 +4,9 @@
 # ACTIVE-only reader, and nothing that writes to the store appears at all;
 # server/test/tools.test.ts pins both.
 id: vitrina-ventas
+# WHO reaches this agent. router.ts builds the phone -> role -> agent decision
+# out of these lists plus the assignments table, and "customer" is every phone
+# that has no owner assignment — which is the default for anyone who writes in.
 roles:
   - customer
 model:

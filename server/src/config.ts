@@ -85,6 +85,15 @@ export interface Config {
    * through a media ref (see whatsapp/bridge.ts).
    */
   bridgeStagingDir: string;
+  /**
+   * The owner allowlist as an env variable — now a SEED, not the authority.
+   *
+   * Who is an owner lives in the `assignments` table (data/assignments.ts), which
+   * this is copied into at boot for phones that have no row yet. That keeps a
+   * deployment which sets only this variable working exactly as before, while an
+   * assignment made through the ops entry point survives a restart. Nothing on
+   * the message path reads this: `router.ts` asks the table.
+   */
   ownerPhoneNumbers: Set<string>;
   dbPath: string;
   mediaDir: string;
@@ -301,6 +310,9 @@ export function normalizePhone(raw: string): string {
  * The OWNER_PHONE_NUMBERS allowlist, parsed. Exported so one-off tools can
  * resolve roles without loadConfig's required secrets — deleting a session
  * should not depend on a WhatsApp key being present.
+ *
+ * The SEED for the assignments table, and the resolver for sessions written
+ * before that table existed. It is not what live traffic is judged by.
  */
 export function loadOwnerPhoneNumbers(): Set<string> {
   return new Set(
@@ -437,6 +449,16 @@ export function loadConfig(): Config {
   };
 }
 
+/**
+ * Whether the SEED VARIABLE names this phone. NOT the live role check.
+ *
+ * The role a message is served with comes from the assignments table, through
+ * router.ts — this answers a narrower question, and only two callers still ask
+ * it: the seeding path and the purge tool, which spares a session that EITHER
+ * source calls an owner's. Reaching for this on the message path would restore
+ * the exact coupling this phase removed, and would ignore every assignment made
+ * after boot.
+ */
 export function isOwner(config: Pick<Config, "ownerPhoneNumbers">, phone: string): boolean {
   return config.ownerPhoneNumbers.has(normalizePhone(phone));
 }

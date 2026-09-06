@@ -7,7 +7,7 @@ import type { WhatsAppChannel } from "../src/whatsapp/channel.js";
 import { getSessionId, setSessionId } from "../src/data/repo.js";
 import { Responders } from "../src/egress/responder.js";
 import { whatsappPrincipal } from "../src/inbox/envelope.js";
-import { AGENT_IDS, agentIdForRole } from "../src/router.js";
+import { AGENT_IDS } from "../src/router.js";
 import { CatalogCache } from "../src/shopify/cache.js";
 import { ShopifyClient } from "../src/shopify/client.js";
 import { toolUniverse } from "../src/tools/registry.js";
@@ -41,7 +41,7 @@ function ctxFor(role: Role): TurnContext {
     principal: whatsappPrincipal(PHONE),
     phone: PHONE,
     role,
-    agentId: agentIdForRole(role),
+    agentId: AGENT_IDS[role],
     conversationKey: PHONE,
     turnKey: "msg:1",
     hop: 0,
@@ -562,9 +562,9 @@ describe("runAgentTurn tool surface", () => {
     const DISTINCT_MAX_TURNS = 3;
     const overridden: Record<string, AgentDefinition> = {
       ...DEFINITIONS,
-      [agentIdForRole("owner")]: {
-        ...DEFINITIONS[agentIdForRole("owner")]!,
-        model: { ...DEFINITIONS[agentIdForRole("owner")]!.model, maxTurns: DISTINCT_MAX_TURNS },
+      [AGENT_IDS.owner]: {
+        ...DEFINITIONS[AGENT_IDS.owner]!,
+        model: { ...DEFINITIONS[AGENT_IDS.owner]!.model, maxTurns: DISTINCT_MAX_TURNS },
       },
     };
     queryMock.mockReturnValueOnce(successStream("s1", "Hola"));
@@ -600,7 +600,7 @@ describe("runAgentTurn tool surface", () => {
     await runAgentTurn(deps, ctxFor("owner"), "hola");
 
     const [{ options }] = queryMock.mock.calls[0] as [{ options: { maxTurns?: number } }];
-    expect(options.maxTurns).toBe(DEFINITIONS[agentIdForRole("owner")]!.model.maxTurns);
+    expect(options.maxTurns).toBe(DEFINITIONS[AGENT_IDS.owner]!.model.maxTurns);
   });
 });
 
@@ -756,7 +756,7 @@ describe("runAgentTurn session key", () => {
   });
 
   it("does not resume another agent's session for the same phone", async () => {
-    setSessionId(db, agentIdForRole("owner"), PHONE, "session-inventario");
+    setSessionId(db, AGENT_IDS.owner, PHONE, "session-inventario");
     queryMock.mockReturnValueOnce(successStream("session-ventas", "Hola"));
 
     await runAgentTurn(deps, ctxFor("customer"), "hola");
@@ -765,7 +765,7 @@ describe("runAgentTurn session key", () => {
   });
 
   it("resumes the session stored for its own agent", async () => {
-    setSessionId(db, agentIdForRole("customer"), PHONE, "session-ventas");
+    setSessionId(db, AGENT_IDS.customer, PHONE, "session-ventas");
     queryMock.mockReturnValueOnce(successStream("session-ventas", "Hola"));
 
     await runAgentTurn(deps, ctxFor("customer"), "hola");
@@ -774,13 +774,13 @@ describe("runAgentTurn session key", () => {
   });
 
   it("persists the new id under its own agent and leaves the other alone", async () => {
-    setSessionId(db, agentIdForRole("owner"), PHONE, "session-inventario");
+    setSessionId(db, AGENT_IDS.owner, PHONE, "session-inventario");
     queryMock.mockReturnValueOnce(successStream("session-ventas", "Hola"));
 
     await runAgentTurn(deps, ctxFor("customer"), "hola");
 
-    expect(getSessionId(db, agentIdForRole("customer"), PHONE)).toBe("session-ventas");
-    expect(getSessionId(db, agentIdForRole("owner"), PHONE)).toBe("session-inventario");
+    expect(getSessionId(db, AGENT_IDS.customer, PHONE)).toBe("session-ventas");
+    expect(getSessionId(db, AGENT_IDS.owner, PHONE)).toBe("session-inventario");
   });
 });
 
@@ -813,10 +813,10 @@ describe("runAgentTurn session.maxAgeDays override", () => {
   it("falls back to config.sessionMaxAgeDays when the definition sets none", async () => {
     // Both shipped definitions leave maxAgeDays unset — pins that the fallback
     // is actually reached, not merely present in the type.
-    setSessionId(db, agentIdForRole("owner"), PHONE, "session-old");
+    setSessionId(db, AGENT_IDS.owner, PHONE, "session-old");
     db.prepare(
       "UPDATE sessions SET updated_at = datetime('now', '-3 days') WHERE agent_id = ?",
-    ).run(agentIdForRole("owner"));
+    ).run(AGENT_IDS.owner);
     queryMock.mockReturnValueOnce(successStream("session-new", "Hola"));
 
     await runAgentTurn(deps, ctxFor("owner"), "hola");
@@ -828,17 +828,17 @@ describe("runAgentTurn session.maxAgeDays override", () => {
   it("uses the definition's own window instead of config's when one is declared", async () => {
     const overridden: Record<string, AgentDefinition> = {
       ...DEFINITIONS,
-      [agentIdForRole("owner")]: {
-        ...DEFINITIONS[agentIdForRole("owner")]!,
-        session: { ...DEFINITIONS[agentIdForRole("owner")]!.session, maxAgeDays: 1 },
+      [AGENT_IDS.owner]: {
+        ...DEFINITIONS[AGENT_IDS.owner]!,
+        session: { ...DEFINITIONS[AGENT_IDS.owner]!.session, maxAgeDays: 1 },
       },
     };
     const overriddenDeps = { ...deps, definitions: overridden };
 
-    setSessionId(db, agentIdForRole("owner"), PHONE, "session-old");
+    setSessionId(db, AGENT_IDS.owner, PHONE, "session-old");
     db.prepare(
       "UPDATE sessions SET updated_at = datetime('now', '-3 days') WHERE agent_id = ?",
-    ).run(agentIdForRole("owner"));
+    ).run(AGENT_IDS.owner);
     queryMock.mockReturnValueOnce(successStream("session-new", "Hola"));
 
     await runAgentTurn(overriddenDeps, ctxFor("owner"), "hola");
@@ -851,17 +851,19 @@ describe("runAgentTurn session.maxAgeDays override", () => {
 });
 
 /**
- * The temporary role → agent id mapping.
+ * The two agent ids, pinned by literal.
  *
- * Pinned by literal because these two ids are written into the database by the
- * legacy-session migration and read back by every resume. Phase 2 replaces the
- * function with a definition-backed router; the ids themselves must not drift
- * in the meantime, or every stored session becomes unreachable in silence.
+ * They are written into the database by the legacy-session migration and read
+ * back by every resume, so they are durable data rather than a naming choice:
+ * renaming one makes every session stored under it unreachable, in silence.
+ * The router now derives role → agent from each definition's own `roles[]`,
+ * and `router.test.ts` pins that map against these literals so the two can
+ * never become separate opinions.
  */
-describe("agentIdForRole", () => {
-  it("routes the owner to the inventory agent and everyone else to sales", () => {
-    expect(agentIdForRole("owner")).toBe("vitrina-inventario");
-    expect(agentIdForRole("customer")).toBe("vitrina-ventas");
+describe("the agent ids are durable data", () => {
+  it("names the inventory agent for the owner and the sales agent for everyone else", () => {
+    expect(AGENT_IDS.owner).toBe("vitrina-inventario");
+    expect(AGENT_IDS.customer).toBe("vitrina-ventas");
   });
 });
 

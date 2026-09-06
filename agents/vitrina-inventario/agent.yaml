@@ -3,6 +3,11 @@
 # and server/test/tools.test.ts pins the result against the owner list it used
 # to be selected by. Every name here must exist in the registry or boot fails.
 id: vitrina-inventario
+# WHO reaches this agent. router.ts builds the phone -> role -> agent decision
+# out of these lists plus the assignments table (which phone holds which role),
+# so this is the only place that says the owner's messages land here. Two
+# definitions claiming one role fails the boot rather than being decided by
+# whichever file loaded first.
 roles:
   - owner
 model:

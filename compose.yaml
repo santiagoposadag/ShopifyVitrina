@@ -280,6 +280,33 @@ services:
       - vitrina-data:/data
     profiles: ["ops"]
 
+  # WHO IS AN OWNER of this store. The assignments table is what the router reads
+  # for every inbound message (server/src/router.ts); OWNER_PHONE_NUMBERS is
+  # copied into it at boot as a SEED, for phones that have no row yet.
+  #
+  # A SEED IS NOT A SYNC. Removing a phone from the variable does NOT revoke it —
+  # `set <phone> customer` or `remove <phone>` does, and only the table survives a
+  # boot. That asymmetry is deliberate: the observed failure of the variable is
+  # EMPTY (loadDotEnv swallows a missing .env), and a sync would turn that into a
+  # restart quietly revoking the owner of a live store.
+  #   ./scripts/with-secrets.sh docker compose --profile ops run --rm role-assignments list
+  #   ./scripts/with-secrets.sh docker compose --profile ops run --rm role-assignments set 573001112233 owner
+  #
+  # `entrypoint` rather than `command` so `run --rm role-assignments set ...`
+  # APPENDS its arguments instead of replacing the whole command.
+  role-assignments:
+    image: vitrina-server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      <<: *data-env
+      OWNER_PHONE_NUMBERS: ${OWNER_PHONE_NUMBERS:-}
+    entrypoint: ["node", "server/dist/data/role-assignments.js"]
+    volumes:
+      - vitrina-data:/data
+    profiles: ["ops"]
+
 volumes:
   # A named volume (not a host bind mount): the image already creates /data
   # owned by the non-root `node` user (see the Dockerfiles). A named volume

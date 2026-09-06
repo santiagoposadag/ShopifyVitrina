@@ -1,5 +1,5 @@
 import { loadDotEnv, loadOwnerPhoneNumbers, resolveDataPath } from "../config.js";
-import { agentIdForPhone } from "../router.js";
+import { refusingLegacyAgentIdFor } from "../router.js";
 import { openDb } from "./db.js";
 import { assertOwnerAllowlist, purgeCustomerSessions } from "./purge.js";
 import { transcriptsDir } from "./transcripts.js";
@@ -32,21 +32,29 @@ async function main(): Promise<void> {
   };
   const root = transcriptsDir();
 
-  // BEFORE opening the database, not after. Opening it runs the schema
-  // migration, and a database from an older build has its sessions keyed by
-  // phone alone — so the migration is where those rows are assigned to an
-  // agent, using this same allowlist. With an empty one it would file the
-  // owner's session under the customer agent, and the refusal inside
-  // purgeCustomerSessions would then be guarding a decision already made.
-  assertOwnerAllowlist(config);
-
   // Resolved, not dropped: this tool's entire contract is that owner sessions
   // survive it, and opening the database without a resolver would delete every
   // legacy session — the owner's included — before the purge ran at all. The
   // mapping is the server's own, so a session migrated here is one the server
   // will still find.
-  const db = openDb(dbPath, { legacyAgentIdFor: (phone) => agentIdForPhone(config, phone) });
+  //
+  // REFUSING, because opening the database is what runs that migration: there
+  // is no earlier moment at which this tool could check. So the resolver itself
+  // refuses when it is asked to place a legacy row with an empty allowlist, and
+  // the transaction the rebuild runs in rolls back with the legacy table
+  // intact. It is asked only when legacy rows actually exist, which is what
+  // lets a deployment whose owners live in the assignments table — with the
+  // variable never set — still run this command. The refusal that matters for
+  // THAT deployment is assertOwnerAllowlist below, which asks the table too.
+  const db = openDb(dbPath, {
+    legacyAgentIdFor: refusingLegacyAgentIdFor(config.ownerPhoneNumbers),
+  });
   try {
+    // Before anything is deleted, and with the database open so it can see the
+    // assignments table — the source the router itself reads. purgeCustomerSessions
+    // repeats it; this one is here so the message names the right cause before a
+    // single row is touched.
+    assertOwnerAllowlist(config, db);
     const { purged, kept, keptAgent, swept } = purgeCustomerSessions(db, config, root);
     console.log(`Purged ${purged} customer session(s); kept ${kept} owner session(s).`);
     // Said out loud rather than folded into "kept": these are exchanges with
