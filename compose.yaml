@@ -38,6 +38,12 @@ x-whatsapp-env: &whatsapp-env
   # reply a day after the deploy, in the middle of live conversations.
   WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN:-}
   WHATSAPP_GRAPH_VERSION: ${WHATSAPP_GRAPH_VERSION:-}
+  # Graph API origin. Empty falls back to Meta's own host in config.ts, which is
+  # what a normal deploy wants. Forwarded anyway: left out it is not a default,
+  # it is a knob that silently does nothing in every containerised deploy — so a
+  # value set to point at a proxy or a fake would be obeyed on a developer's
+  # machine and quietly ignored the moment it ran in a container.
+  WHATSAPP_GRAPH_BASE_URL: ${WHATSAPP_GRAPH_BASE_URL:-}
 
 # Absolute paths inside the containers. server/src/config.ts short-circuits on
 # isAbsolute(), so these override anything set in .env.
@@ -46,12 +52,24 @@ x-data-env: &data-env
   MEDIA_DIR: /data/media
 
 # The Shopify store IS the catalog: there is no local products table and no
-# storefront container any more. Without these the server refuses to boot,
-# which is deliberate — every product tool would otherwise fail on its first
-# call and the owner would get an apology instead of a startup error.
+# storefront container any more. Without a credential the server refuses to
+# boot, which is deliberate — every product tool would otherwise fail on its
+# first call and the owner would get an apology instead of a startup error.
+#
+# TWO credential shapes, and config.ts requires exactly one of them:
+#   - CLIENT_ID + CLIENT_SECRET — the CURRENT path. Shopify stopped allowing
+#     new admin-created custom apps in January 2026, so a new store has Dev
+#     Dashboard credentials and the server mints a 24h token from them.
+#   - ADMIN_TOKEN — legacy, or hand-minted and dead in 24 hours.
+# All three are interpolated WITH a default so that neither shape makes compose
+# warn about the other's absence. The "one of them must be set" rule is enforced
+# once, in config.ts, where it can name the alternatives; a no-default here
+# would move half that rule into YAML and report it as a blank string.
 x-shopify-env: &shopify-env
   SHOPIFY_STORE_DOMAIN: ${SHOPIFY_STORE_DOMAIN}
-  SHOPIFY_ADMIN_TOKEN: ${SHOPIFY_ADMIN_TOKEN}
+  SHOPIFY_ADMIN_TOKEN: ${SHOPIFY_ADMIN_TOKEN:-}
+  SHOPIFY_CLIENT_ID: ${SHOPIFY_CLIENT_ID:-}
+  SHOPIFY_CLIENT_SECRET: ${SHOPIFY_CLIENT_SECRET:-}
   # Pinned, not "latest": Shopify ships quarterly and deprecates on a rolling
   # schedule, so an unpinned version is a silently-changing agent. Empty falls
   # back to the pin in server/src/config.ts.
