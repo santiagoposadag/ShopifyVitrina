@@ -325,6 +325,39 @@ services:
       - vitrina-data:/data
     profiles: ["ops"]
 
+  # TEMPORARY. Who may flip their OWN role from the test console, and the ONLY
+  # way onto that roster — see server/src/data/test-roster.ts and
+  # docs/test-console.md. The test_roster table IS the switch: with no rows the
+  # console authenticates nobody, same shape as agent-credentials above.
+  #   ./scripts/with-secrets.sh docker compose --profile ops run --rm test-console list
+  #   ./scripts/with-secrets.sh docker compose --profile ops run --rm test-console add 573001112233 --label "owner's phone"
+  #
+  # `entrypoint` rather than `command` so `run --rm test-console add ...`
+  # APPENDS its arguments instead of replacing the whole command.
+  #
+  # Needs OWNER_PHONE_NUMBERS for the same reason as its neighbours: opening
+  # the database may migrate legacy sessions, and an empty allowlist would file
+  # the owner's session under the customer agent. Also needs PUBLIC_BASE_URL to
+  # print a working link rather than a bare path — see test-console-credentials.ts.
+  #
+  # The token is printed ONCE, inside a link, and only its SHA-256 is stored,
+  # so a lost link is replaced with `rotate`, never looked up. REMOVING THE
+  # FEATURE means deleting this service along with the files docs/test-console.md
+  # names — see that doc's removal checklist.
+  test-console:
+    image: vitrina-server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      <<: *data-env
+      OWNER_PHONE_NUMBERS: ${OWNER_PHONE_NUMBERS:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+    entrypoint: ["node", "server/dist/data/test-console-credentials.js"]
+    volumes:
+      - vitrina-data:/data
+    profiles: ["ops"]
+
 volumes:
   # A named volume (not a host bind mount): the image already creates /data
   # owned by the non-root `node` user (see the Dockerfiles). A named volume
