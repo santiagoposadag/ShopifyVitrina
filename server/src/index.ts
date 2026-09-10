@@ -8,6 +8,11 @@ import { InboxBatcher } from "./inbox/batcher.js";
 import { loadConfig, loadDotEnv } from "./config.js";
 import { openDb } from "./data/db.js";
 import { countAgentCredentials } from "./data/agent-registry.js";
+// TEMPORARY, and the only two lines in this file that reference it. Removing
+// the test console is deleting this import, the registration below and
+// src/admin/test-console.ts.
+import { registerTestConsole } from "./admin/test-console.js";
+import { countRosterEntries } from "./data/test-roster.js";
 import {
   countAssignedOwners,
   listPhonesWithRole,
@@ -546,6 +551,30 @@ async function main(): Promise<void> {
       ? "Agent door: CLOSED (no rows in agent_registry). POST /agents/:id/messages refuses every request."
       : `Agent door: open to ${registeredCallers} registered caller(s) at POST /agents/:id/messages`,
   );
+
+  // The TEMPORARY test console (src/admin/test-console.ts). Registered
+  // unconditionally and CLOSED until an operator adds a roster row, exactly
+  // like the agent door above: an empty `test_roster` answers 404 on every path
+  // under /test-console, the unauthenticated shell included. There is no
+  // enabling flag, because two switches for one thing is how one of them ends
+  // up in the wrong position.
+  registerTestConsole(app, { db });
+  const testNumbers = countRosterEntries(db);
+  if (testNumbers > 0) {
+    // WARN, next to ECHO_MODE and for the same reason: this is a door that
+    // grants OWNER role over a live store, and a feature that announces itself
+    // on every restart is harder to forget than one that does not.
+    app.log.warn(
+      `TEST CONSOLE IS OPEN to ${testNumbers} registered test number(s) at GET /test-console — ` +
+        "each of them can give ITSELF the owner role, with full inventory access, without a " +
+        "terminal. This feature is TEMPORARY: delete the test_roster rows when manual testing " +
+        "is done, and the whole feature with them.",
+    );
+  } else {
+    app.log.info(
+      "Test console: CLOSED (no rows in test_roster). Every path under /test-console answers 404.",
+    );
+  }
 
   // Un-flushed bursts must not hold the process open on shutdown; their rows
   // stay pending and are replayed on the next boot.
