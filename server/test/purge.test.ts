@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb, type DB } from "../src/data/db.js";
-import { getSessionId, setSessionId } from "../src/data/repo.js";
+import { getSessionId, listConversationMessages, recordOutboundMessage, setSessionId } from "../src/data/repo.js";
 import {
   assertOwnerAllowlist,
   purgeCustomerSessions,
@@ -49,6 +49,19 @@ function seedTranscript(sessionId: string, ageDays = 0): void {
 
 function transcriptExists(sessionId: string): boolean {
   return existsSync(join(root, `${sessionId}.jsonl`)) || existsSync(join(root, sessionId));
+}
+
+let turnCounter = 0;
+
+/** One durable message row, filed under whichever conversation key the caller names. */
+function seedMessage(agentId: string, conversationKey: string, body = "hola"): void {
+  turnCounter += 1;
+  recordOutboundMessage(db, {
+    conversationKey,
+    agentId,
+    turnKey: `turn-${turnCounter}`,
+    body,
+  });
 }
 
 beforeEach(() => {
@@ -209,6 +222,82 @@ describe("agent-to-agent sessions are not customer histories", () => {
 
     expect(getSessionId(db, SALES, "super-agent:corr-1")).toBeUndefined();
     expect(result).toMatchObject({ keptAgent: 0 });
+  });
+});
+
+/**
+ * The durable half of a conversation. `conversation_messages` holds the actual
+ * words in both directions, and it is a SEPARATE table from `sessions` — a
+ * purge that only drops the session row and leaves this behind has not purged
+ * the conversation, it has only made it unresumable.
+ */
+describe("purgeCustomerSessions durable message deletion", () => {
+  it("deletes the purged customer's conversation messages", () => {
+    seedMessage(SALES, CUSTOMER, "quiero una remera");
+    seedMessage(SALES, CUSTOMER, "talle M");
+
+    const result = purgeCustomerSessions(db, CONFIG, root);
+
+    expect(result).toMatchObject({ purged: 1, purgedMessages: 2 });
+    expect(listConversationMessages(db, CUSTOMER)).toHaveLength(0);
+  });
+
+  it("keeps an owner's conversation messages", () => {
+    seedMessage(INVENTORY, OWNER, "subí el stock a 10");
+
+    purgeCustomerSessions(db, CONFIG, root);
+
+    expect(listConversationMessages(db, OWNER)).toHaveLength(1);
+  });
+
+  it("keeps an agent-to-agent conversation's messages", () => {
+    const AGENT_KEY = agentConversationKey("super-agent", INVENTORY, "corr-msg");
+    const AGENT_SESSION = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    setSessionId(db, INVENTORY, AGENT_KEY, AGENT_SESSION);
+    seedMessage(INVENTORY, AGENT_KEY, "consulta de otro agente");
+
+    purgeCustomerSessions(db, CONFIG, root);
+
+    expect(listConversationMessages(db, AGENT_KEY)).toHaveLength(1);
+  });
+
+  it("reports a count that matches what was actually deleted, across several customers", () => {
+    const second = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    setSessionId(db, SALES, OTHER_CUSTOMER, second);
+    seedMessage(SALES, CUSTOMER, "uno");
+    seedMessage(SALES, CUSTOMER, "dos");
+    seedMessage(SALES, OTHER_CUSTOMER, "tres");
+
+    const result = purgeCustomerSessions(db, CONFIG, root);
+
+    expect(result.purgedMessages).toBe(3);
+    expect(listConversationMessages(db, CUSTOMER)).toHaveLength(0);
+    expect(listConversationMessages(db, OTHER_CUSTOMER)).toHaveLength(0);
+  });
+
+  // The hard case: a session can expire and be swept (or be cleared by an
+  // earlier purge) while its messages persist by design — deleteConversationMessages
+  // never runs on a timer. The loop this tool runs iterates SESSIONS
+  // (listSessions), so a conversation with no session row is invisible to it.
+  //
+  // Reaching these belongs here in principle — the whole point of this slice is
+  // that a purge's name should match what it does — but repo.ts exposes no way
+  // to enumerate conversation_keys that have messages independently of the
+  // sessions table, and hacking that up with raw SQL from outside repo.ts would
+  // bypass the one seam every other caller in this codebase goes through. So
+  // this case is documented as a KNOWN GAP rather than silently patched: it
+  // requires a new repo.ts function (see purge.ts's comment at the loop) before
+  // it can close.
+  it("cannot reach a customer's messages once its session row is gone (documented gap)", () => {
+    const ORPHAN_KEY = "573009990000";
+    seedMessage(SALES, ORPHAN_KEY, "nadie me va a leer");
+    // No setSessionId for ORPHAN_KEY: this conversation has messages but no
+    // session row, exactly like one whose session already expired and was swept.
+
+    const result = purgeCustomerSessions(db, CONFIG, root);
+
+    expect(listConversationMessages(db, ORPHAN_KEY)).toHaveLength(1); // NOT purged — see comment above
+    expect(result.purged).toBe(1); // only CUSTOMER, the one with a session row
   });
 });
 

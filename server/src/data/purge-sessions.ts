@@ -55,8 +55,16 @@ async function main(): Promise<void> {
     // repeats it; this one is here so the message names the right cause before a
     // single row is touched.
     assertOwnerAllowlist(config, db);
-    const { purged, kept, keptAgent, swept } = purgeCustomerSessions(db, config, root);
+    const { purged, kept, keptAgent, purgedMessages, swept } = purgeCustomerSessions(
+      db,
+      config,
+      root,
+    );
     console.log(`Purged ${purged} customer session(s); kept ${kept} owner session(s).`);
+    // Said out loud rather than folded into "purged": a session count alone
+    // does not tell the operator whether the actual conversation content — the
+    // words, both directions — went with it.
+    console.log(`Deleted ${purgedMessages} conversation message(s) belonging to purged customers.`);
     // Said out loud rather than folded into "kept": these are exchanges with
     // another agent, they are kept on purpose (see purge.ts), and an operator
     // who expected this command to empty the sessions table should see why it

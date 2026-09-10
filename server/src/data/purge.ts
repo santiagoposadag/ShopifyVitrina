@@ -3,7 +3,7 @@ import { isOwner } from "../config.js";
 import { isAgentConversationKey } from "../inbox/envelope.js";
 import { countAssignedOwners, roleForPhone } from "./assignments.js";
 import type { DB } from "./db.js";
-import { clearSessionId, listSessions } from "./repo.js";
+import { clearSessionId, deleteConversationMessages, listSessions } from "./repo.js";
 import { deleteTranscript, sweepOrphanedTranscripts } from "./transcripts.js";
 
 /**
@@ -21,13 +21,21 @@ export interface PurgeResult {
   kept: number;
   /** Agent-to-agent exchanges left alone. Reported, never silently skipped. */
   keptAgent: number;
+  /**
+   * Durable `conversation_messages` rows deleted for purged customers — both
+   * directions, summed across every session purged this run. See the loop
+   * below: this is the count that makes "purged" mean what it says, since the
+   * session row alone is not where a customer's words live.
+   */
+  purgedMessages: number;
   /** Orphaned transcripts collected, or null when no root was configured. */
   swept: number | null;
 }
 
 /**
- * Drop every CUSTOMER conversation history — the session rows and the
- * transcripts behind them — then sweep orphans left by earlier resets.
+ * Drop every CUSTOMER conversation history — the session rows, the durable
+ * `conversation_messages` behind them, and the transcripts behind THOSE —
+ * then sweep orphans left by earlier resets.
  *
  * OWNER SESSIONS ARE PRESERVED: an owner mid-listing has a session that
  * upsert_product's merge semantics depend on, and dropping it loses in-progress
@@ -110,11 +118,35 @@ export function purgeCustomerSessions(db: DB, config: PurgeConfig, root?: string
     (s) => !isAgentConversationKey(s.conversation_key) && !isOwnerKey(s.conversation_key),
   );
 
+  // MESSAGES BEFORE THE SESSION ROW, deliberately, and not the other way round.
+  // clearSessionId does not null a column, it DELETES the row — so once it has
+  // run for this conversation_key, listSessions (which this loop is driven by)
+  // can never surface that customer again. If deleteConversationMessages threw
+  // AFTER clearSessionId, the durable words would be stranded forever: no
+  // future purge run would ever revisit a conversation_key it no longer sees.
+  // Deleting the messages first means a mid-loop failure here leaves the
+  // session row untouched, so the NEXT purge run picks this customer back up
+  // through listSessions and retries — deleteConversationMessages is a single
+  // idempotent DELETE, safe to repeat, so a retry after a partial run costs
+  // nothing on a conversation already cleared.
+  let purgedMessages = 0;
   for (const session of customers) {
+    purgedMessages += deleteConversationMessages(db, session.conversation_key);
     clearSessionId(db, session.agent_id, session.conversation_key);
     if (root) deleteTranscript(root, session.agent_session_id);
   }
 
+  // KNOWN GAP, not silently patched: a conversation can hold
+  // `conversation_messages` rows with no `sessions` row at all — the session
+  // expired and was swept, or a purge from before this deletion existed
+  // already cleared it while the messages (which have no timer of their own,
+  // see db.ts) persisted. This loop is driven by listSessions, so such a
+  // conversation is invisible to it and its messages survive every future run
+  // of this tool. Closing that requires enumerating conversation_keys that
+  // have messages independently of the sessions table — repo.ts has no such
+  // function today, and reaching around it with raw SQL from here would break
+  // the one seam every other caller of this table goes through. Reported
+  // upstream rather than worked around.
   const swept = root
     ? sweepOrphanedTranscripts(
         root,
@@ -127,6 +159,7 @@ export function purgeCustomerSessions(db: DB, config: PurgeConfig, root?: string
     purged: customers.length,
     kept: sessions.length - customers.length - agents.length,
     keptAgent: agents.length,
+    purgedMessages,
     swept,
   };
 }
