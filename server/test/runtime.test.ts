@@ -173,6 +173,12 @@ function fakeChannel(sent: string[]): WhatsAppChannel {
  * delivery inside the turn would pin nothing at all; the guarantee only exists
  * end to end, and this is the smallest composition that has both halves.
  */
+// This file is about the runtime handing back a reply, not about the
+// conversation record — a no-op recorder keeps recording out of scope here,
+// the same way the fake channel keeps the transport out of scope elsewhere.
+const noopRecorder = { record: () => undefined };
+const silentResponderLog = { error: () => undefined };
+
 async function runAndRespond(
   deps: Parameters<typeof runAgentTurn>[0],
   ctx: TurnContext,
@@ -180,7 +186,9 @@ async function runAndRespond(
   channel: WhatsAppChannel,
 ): Promise<string> {
   const reply = await runAgentTurn(deps, ctx, text);
-  await new Responders(channel).for(ctx.principal).deliver(reply);
+  await new Responders({ channel, recorder: noopRecorder, log: silentResponderLog })
+    .for(ctx.principal, { agentId: ctx.agentId, turnKey: ctx.turnKey })
+    .deliver(reply);
   return reply;
 }
 
@@ -713,7 +721,9 @@ describe("runAgentTurn returns the reply", () => {
     expect(reply).toBe("Tenemos citronela");
     expect(sent).toEqual([]);
 
-    await new Responders(channel).for(whatsappPrincipal(PHONE)).deliver(reply);
+    await new Responders({ channel, recorder: noopRecorder, log: silentResponderLog })
+      .for(whatsappPrincipal(PHONE), { agentId: CTX.agentId, turnKey: CTX.turnKey })
+      .deliver(reply);
     expect(sent).toEqual(["Tenemos citronela"]);
   });
 

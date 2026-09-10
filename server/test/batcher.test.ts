@@ -13,7 +13,12 @@ import {
 } from "../src/inbox/batcher.js";
 import { openDb, type DB } from "../src/data/db.js";
 import { PerConversationQueue } from "../src/inbox/queue.js";
-import { getInboxRow, insertInboxMessage, listPendingMedia } from "../src/data/repo.js";
+import {
+  getInboxRow,
+  insertInboxMessage,
+  listConversationMessages,
+  listPendingMedia,
+} from "../src/data/repo.js";
 import type { Envelope } from "../src/inbox/envelope.js";
 import type { Role, TurnContext } from "../src/types.js";
 import { AGENT_IDS } from "../src/router.js";
@@ -633,6 +638,116 @@ describe("InboxBatcher", () => {
     expect(h.turns).toHaveLength(0);
     expect(h.batcher.pendingPhones).toBe(0);
     expect(getInboxRow(h.db, id)?.status).toBe("pending"); // replayed on next boot
+    h.db.close();
+  });
+});
+
+/**
+ * The write half of the inbound side: every claimed message a batch turns
+ * into a prompt is also recorded to the durable conversation record
+ * (repo.ts recordInboundMessages), independent of whether the turn that
+ * answers it succeeds.
+ */
+describe("recording inbound messages", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("records one row per claimed message, keyed by the turn that answered them", async () => {
+    const h = harness();
+    const first = receive(h, "573001", "Hola");
+    const second = receive(h, "573001", "vendo apartamento");
+
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+
+    const recorded = listConversationMessages(h.db, "573001");
+    expect(recorded).toHaveLength(2);
+    expect(recorded.map((m) => m.body)).toEqual(["Hola", "vendo apartamento"]);
+    expect(recorded.every((m) => m.direction === "inbound")).toBe(true);
+    expect(recorded.every((m) => m.agent_id === AGENT_IDS.customer)).toBe(true);
+    expect(recorded.every((m) => m.turn_key === getInboxRow(h.db, first)!.dedupe_key)).toBe(true);
+    expect(recorded[0]!.source_inbox_id).toBe(first);
+    expect(recorded[1]!.source_inbox_id).toBe(second);
+    h.db.close();
+  });
+
+  // Mirrors the existing "nothing for the agent to answer" branch: a batch
+  // settled done without a turn has nothing worth recording either — every row
+  // in it was neither media (buildBatchText always renders a photo line for
+  // those) nor real text, i.e. an unsupported event kind.
+  it("records nothing when the batch has no agent-worthy text", async () => {
+    const h = harness();
+    receive(h, "573001", "", "text"); // e.g. an unsupported event kind
+
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+
+    expect(h.turns).toHaveLength(0); // settled without a turn
+    expect(listConversationMessages(h.db, "573001")).toEqual([]);
+    h.db.close();
+  });
+
+  it("still records a burst that is only photos", async () => {
+    const h = harness();
+    receive(h, "573001", PHOTO, "media");
+
+    await vi.advanceTimersByTimeAsync(MEDIA_DEBOUNCE_MS);
+
+    expect(listConversationMessages(h.db, "573001")).toHaveLength(1);
+    h.db.close();
+  });
+
+  it("does not duplicate inbound rows when a retried batch is claimed again", async () => {
+    let failuresLeft = 1;
+    const h = harness({
+      onMessage: async () => {
+        if (failuresLeft > 0) {
+          failuresLeft -= 1;
+          throw new Error("transient blip");
+        }
+      },
+    });
+    receive(h, "573001", "uno");
+
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); // attempt 1 fails
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS); // attempt 2 succeeds
+
+    expect(listConversationMessages(h.db, "573001")).toHaveLength(1); // not two
+    h.db.close();
+  });
+
+  // A recording failure is not a message-processing failure: it must not
+  // behave like one. Breaking only the INSERT recordInboundMessages issues —
+  // rather than db.transaction wholesale, which claimInboxBatch and
+  // markInboxBatchDone also depend on — stands in for whatever real failure
+  // that one write might hit (disk full, a locked file), leaving everything
+  // else the batch does untouched; the guarantee under test is what
+  // processBatch does with that failure, not what causes it.
+  it("a broken inbound record does not fail the batch or burn an attempt", async () => {
+    const h = harness();
+    const originalPrepare = h.db.prepare.bind(h.db);
+    Object.defineProperty(h.db, "prepare", {
+      value: (sql: string) => {
+        if (sql.includes("conversation_messages")) {
+          return {
+            run: () => {
+              throw new Error("record boom");
+            },
+          };
+        }
+        return originalPrepare(sql);
+      },
+    });
+    const id = receive(h, "573001", "hola");
+
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+
+    expect(h.turns).toHaveLength(1); // the message still reached the agent
+    expect(getInboxRow(h.db, id)?.status).toBe("done"); // and settled normally
+    expect(getInboxRow(h.db, id)?.attempts).toBe(1); // no attempt burned on the failure
+    expect(h.failures).toEqual([]); // not treated as a processing failure
     h.db.close();
   });
 });

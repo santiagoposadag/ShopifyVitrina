@@ -62,7 +62,15 @@ function chain(options: ChainOptions): Chain {
   const queue = new PerConversationQueue();
   const turns: Chain["turns"] = [];
   const replies = new AgentReplies({ log: silentLog, syncTimeoutMs: 5000 });
-  const responders = new Responders(forbiddenChannel, replies);
+  // This suite is about the chain terminating, not about the conversation
+  // record — a no-op recorder keeps it out of scope, the same way
+  // forbiddenChannel keeps WhatsApp out of scope.
+  const responders = new Responders({
+    channel: forbiddenChannel,
+    recorder: { record: () => undefined },
+    log: silentLog,
+    agentReplies: replies,
+  });
 
   const agents = inProcessAgentsPort({
     db,
@@ -108,7 +116,11 @@ function chain(options: ChainOptions): Chain {
         body = `${envelope.agentId} heard [${heard}]`;
       }
       await responders
-        .for(envelope.principal, { conversationKey: envelope.conversationKey })
+        .for(
+          envelope.principal,
+          { agentId: envelope.agentId, turnKey: envelope.turnKey },
+          { conversationKey: envelope.conversationKey },
+        )
         .deliver(body);
     },
   });

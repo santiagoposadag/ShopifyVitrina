@@ -23,6 +23,7 @@ import {
   deleteStaleInboxRows,
   deleteStalePendingMedia,
   listSessions,
+  recordOutboundMessage,
   upsertContact,
 } from "./data/repo.js";
 import { sweepOrphanedTranscripts, transcriptsDir } from "./data/transcripts.js";
@@ -33,7 +34,7 @@ import { registerAgentDoor } from "./inbox/a2a.js";
 import { inProcessAgentsPort } from "./inbox/agents-port.js";
 import { principalId } from "./inbox/envelope.js";
 import { AgentReplies } from "./egress/agent-reply.js";
-import { Responders } from "./egress/responder.js";
+import { Responders, type ConversationRecorder } from "./egress/responder.js";
 import { AGENT_IDS, createRouter, legacySessionAgentId } from "./router.js";
 import { toolUniverse } from "./tools/registry.js";
 import { shopifyCatalogPort } from "./shopify/catalog-port.js";
@@ -172,10 +173,22 @@ async function main(): Promise<void> {
       return { ok: response.ok, status: response.status };
     },
   });
+  // The write half of the conversation record: wraps recordOutboundMessage
+  // (data/repo.ts) as the narrow port Responders asks for, rather than
+  // handing it the whole database — see ConversationRecorder's own doc
+  // comment for why.
+  const conversationRecorder: ConversationRecorder = {
+    record: (input) => recordOutboundMessage(db, input),
+  };
   // Where a turn's reply goes. The runtime returns the reply and this decides
   // who receives it, from the principal that asked — which is what lets a
   // second kind of caller be answered without touching the agent loop.
-  const responders = new Responders(channel, agentReplies);
+  const responders = new Responders({
+    channel,
+    recorder: conversationRecorder,
+    log: app.log,
+    agentReplies,
+  });
 
   // Housekeeping on boot and hourly: purge unattached inbound media older than
   // 48h, settled inbox rows past their TTL, and agent transcripts no session row
@@ -382,11 +395,16 @@ async function main(): Promise<void> {
       const person = envelope.principal.kind === "whatsapp" ? envelope.principal : undefined;
       // Where this turn's reply goes, decided by the door that authenticated
       // the caller and not by anything below. Built once, up front, so echo
-      // mode and a real turn answer through exactly the same route.
-      const respond = responders.for(envelope.principal, {
-        conversationKey: envelope.conversationKey,
-        ...(envelope.replyTo !== undefined ? { replyTo: envelope.replyTo } : {}),
-      });
+      // mode and a real turn answer through exactly the same route — and are
+      // recorded through exactly the same seam.
+      const respond = responders.for(
+        envelope.principal,
+        { agentId: envelope.agentId, turnKey: envelope.turnKey },
+        {
+          conversationKey: envelope.conversationKey,
+          ...(envelope.replyTo !== undefined ? { replyTo: envelope.replyTo } : {}),
+        },
+      );
 
       // `contacts` is a table of PEOPLE — phone primary key, last seen, role
       // from the allowlist. An agent caller has none of those: it is not a

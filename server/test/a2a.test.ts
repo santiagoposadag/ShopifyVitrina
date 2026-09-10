@@ -84,7 +84,15 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     },
     syncTimeoutMs: options.syncTimeoutMs ?? 5000,
   });
-  const responders = new Responders(forbiddenChannel, replies);
+  // This suite is about the agent door's admission and routing, not about the
+  // conversation record — a no-op recorder keeps it out of scope here the same
+  // way forbiddenChannel keeps WhatsApp out of scope.
+  const responders = new Responders({
+    channel: forbiddenChannel,
+    recorder: { record: () => undefined },
+    log: silentLog,
+    agentReplies: replies,
+  });
 
   const batcher = new InboxBatcher({
     db,
@@ -102,10 +110,14 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
         : `respuesta a: ${envelope.text}`;
       if (options.deliver === false) return;
       await responders
-        .for(envelope.principal, {
-          conversationKey: envelope.conversationKey,
-          ...(envelope.replyTo !== undefined ? { replyTo: envelope.replyTo } : {}),
-        })
+        .for(
+          envelope.principal,
+          { agentId: envelope.agentId, turnKey: envelope.turnKey },
+          {
+            conversationKey: envelope.conversationKey,
+            ...(envelope.replyTo !== undefined ? { replyTo: envelope.replyTo } : {}),
+          },
+        )
         .deliver(reply);
     },
     onBatchFailure: async (ctx, { final, error }) => {

@@ -10,6 +10,7 @@ import {
   markInboxBatchDone,
   markInboxBatchFailed,
   markInboxBatchPending,
+  recordInboundMessages,
   setInboxAudioPath,
   setInboxTranscript,
   type InboxRow,
@@ -726,6 +727,31 @@ export class InboxBatcher {
     if (text.length === 0) {
       markInboxBatchDone(db, ids);
       return;
+    }
+
+    // Recorded HERE, before the turn runs rather than after it answers: this
+    // is "the message arrived", independent of whether the turn that answers
+    // it succeeds — unlike the outbound half (Responders.recordSafely), which
+    // waits on a successful SEND because sending is the very thing it is
+    // recording. recordInboundMessages is idempotent per inbox.id, so a
+    // retried batch calling this again over the same rows writes nothing new.
+    //
+    // Only reached once both `identity` and a non-empty `text` exist: the two
+    // earlier give-up branches above (no target agent, attempt cap exceeded)
+    // abandon their rows before an agent or a prompt exist to record them
+    // under, and the empty-text branch just above never had real content — a
+    // media row always renders a non-empty photo line via buildBatchText, so
+    // this point is never reached with an uncaptioned photo silently dropped.
+    //
+    // A failure here must not read as a message-processing failure: it must
+    // not return this batch to 'pending' or count against its attempt budget,
+    // because the turn itself may well go on to succeed. Logged loudly
+    // instead — the same reasoning as Responders.recordSafely for the
+    // outbound half.
+    try {
+      recordInboundMessages(db, { agentId: ctx.agentId, turnKey, rows });
+    } catch (err) {
+      log.error({ err, conversationKey, inboxIds: ids }, "inbound messages not recorded");
     }
 
     // The envelope is assembled HERE, at the point the prompt exists, and its
