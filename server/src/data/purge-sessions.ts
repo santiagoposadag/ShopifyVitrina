@@ -3,6 +3,7 @@ import { refusingLegacyAgentIdFor } from "../router.js";
 import { openDb } from "./db.js";
 import { assertOwnerAllowlist, purgeCustomerSessions } from "./purge.js";
 import { transcriptsDir } from "./transcripts.js";
+import { isEntryPoint } from "./entry-point.js";
 
 /**
  * Ops lever: drop every customer conversation history, so customers start fresh
@@ -84,7 +85,12 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
-  console.error("Purge failed:", err);
-  process.exit(1);
-});
+// Runs ONLY when this file is the process entry point. In ESM the call below
+// executes on IMPORT too, so without this a module that imports anything from
+// here runs the whole CLI against the real database. See entry-point.ts.
+if (isEntryPoint(import.meta.url)) {
+  main().catch((err: unknown) => {
+    console.error("Purge failed:", err);
+    process.exit(1);
+  });
+}

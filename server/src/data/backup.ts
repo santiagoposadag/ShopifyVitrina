@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { mkdirSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { loadDotEnv, resolveDataPath } from "../config.js";
+import { isEntryPoint } from "./entry-point.js";
 
 /**
  * Consistent SQLite snapshot via the online backup API — safe while the server
@@ -54,7 +55,12 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
-  console.error("Backup failed:", err);
-  process.exit(1);
-});
+// Runs ONLY when this file is the process entry point. In ESM the call below
+// executes on IMPORT too, so without this a module that imports anything from
+// here runs the whole CLI against the real database. See entry-point.ts.
+if (isEntryPoint(import.meta.url)) {
+  main().catch((err: unknown) => {
+    console.error("Backup failed:", err);
+    process.exit(1);
+  });
+}

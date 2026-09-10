@@ -8,6 +8,7 @@ import {
   unassignPhone,
 } from "./assignments.js";
 import { openDb, type DB } from "./db.js";
+import { isEntryPoint } from "./entry-point.js";
 
 /**
  * Ops lever: who is an owner of this store, and who is a customer.
@@ -207,7 +208,12 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
-  console.error("role-assignments failed:", err instanceof Error ? err.message : err);
-  process.exit(1);
-});
+// Runs ONLY when this file is the process entry point. In ESM the call below
+// executes on IMPORT too, so without this a module that imports anything from
+// here runs the whole CLI against the real database. See entry-point.ts.
+if (isEntryPoint(import.meta.url)) {
+  main().catch((err: unknown) => {
+    console.error("role-assignments failed:", err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+}
