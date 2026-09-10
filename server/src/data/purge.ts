@@ -1,6 +1,7 @@
 import type { Config } from "../config.js";
 import { isOwner } from "../config.js";
 import { isAgentConversationKey } from "../inbox/envelope.js";
+import { AGENT_IDS } from "../router.js";
 import { countAssignedOwners, roleForPhone } from "./assignments.js";
 import type { DB } from "./db.js";
 import { clearSessionId, deleteConversationMessages, listSessions } from "./repo.js";
@@ -17,7 +18,11 @@ export type PurgeConfig = Pick<Config, "ownerPhoneNumbers" | "sessionMaxAgeDays"
 export interface PurgeResult {
   /** Customer sessions dropped. */
   purged: number;
-  /** Owner sessions deliberately left alone. */
+  /**
+   * Owner sessions deliberately left alone — a phone that currently reads as
+   * owner, OR a session recorded under the owner agent for a phone that no
+   * longer does. See purgeCustomerSessions for why both count.
+   */
   kept: number;
   /** Agent-to-agent exchanges left alone. Reported, never silently skipped. */
   keptAgent: number;
@@ -55,6 +60,16 @@ export interface PurgeResult {
  * WhatsApp door is the phone — so this decides exactly what it decided when
  * sessions were keyed by phone alone.
  *
+ * A THIRD SOURCE ALSO SPARES A SESSION: its own agent_id. `sessions` is keyed
+ * `(agent_id, conversation_key)`, so one phone can hold a row under BOTH
+ * router.ts's AGENT_IDS at once — used the inventory agent, then got
+ * demoted or reassigned, all while keeping the same conversation_key. The two
+ * checks above answer "what is this phone NOW"; agent_id answers "what was
+ * this conversation HAD as", and a demoted phone's owner-mode history is an
+ * owner conversation regardless of what the phone reads as today. Same
+ * conservative direction as above: this only ever widens what is spared.
+ *
+
  * AGENT-TO-AGENT EXCHANGES ARE KEPT, and that is this door's answer to the
  * question the phase before it left open. Their key is a correlation id, which
  * no allowlist can ever contain, so `isOwner` would read every one of them as a
@@ -112,10 +127,27 @@ export function purgeCustomerSessions(db: DB, config: PurgeConfig, root?: string
   const isOwnerKey = (key: string): boolean =>
     roleForPhone(db, key) === "owner" || isOwner(config, key);
 
+  // A SESSION ROW'S agent_id RECORDS THE ROLE THAT CONVERSATION WAS HAD AS,
+  // which is a different fact from isOwnerKey above (the phone's CURRENT
+  // role). sessions is keyed (agent_id, conversation_key), so one phone can
+  // hold a row under BOTH AGENT_IDS.owner and AGENT_IDS.customer — a phone
+  // demoted after using the inventory agent, or promoted after starting as a
+  // customer. isOwnerKey alone would judge the owner-agent row by the phone's
+  // present role and delete it as a customer's. Sparing on EITHER signal only
+  // ever widens what survives — it can turn a purge into a no-op for a
+  // session, never turn a spared session into a purged one — which matches
+  // the rest of this function's conservative-by-construction stance: a purge
+  // that deletes too little costs an operator a second run, a purge that
+  // deletes too much is unrecoverable.
+  const isOwnerAgentSession = (agentId: string): boolean => agentId === AGENT_IDS.owner;
+
   const sessions = listSessions(db);
   const agents = sessions.filter((s) => isAgentConversationKey(s.conversation_key));
   const customers = sessions.filter(
-    (s) => !isAgentConversationKey(s.conversation_key) && !isOwnerKey(s.conversation_key),
+    (s) =>
+      !isAgentConversationKey(s.conversation_key) &&
+      !isOwnerKey(s.conversation_key) &&
+      !isOwnerAgentSession(s.agent_id),
   );
 
   // MESSAGES BEFORE THE SESSION ROW, deliberately, and not the other way round.
@@ -129,9 +161,16 @@ export function purgeCustomerSessions(db: DB, config: PurgeConfig, root?: string
   // through listSessions and retries — deleteConversationMessages is a single
   // idempotent DELETE, safe to repeat, so a retry after a partial run costs
   // nothing on a conversation already cleared.
+  //
+  // deleteConversationMessages is scoped to session.agent_id, not just the
+  // conversation_key: a phone spared under one agent (above) can still have a
+  // PURGED session under the other, on the SAME conversation_key. An unscoped
+  // delete here would remove that spared session's messages out from under
+  // it, even though its row and its transcript survive — a session with no
+  // history is not what "spared" is supposed to mean.
   let purgedMessages = 0;
   for (const session of customers) {
-    purgedMessages += deleteConversationMessages(db, session.conversation_key);
+    purgedMessages += deleteConversationMessages(db, session.conversation_key, session.agent_id);
     clearSessionId(db, session.agent_id, session.conversation_key);
     if (root) deleteTranscript(root, session.agent_session_id);
   }

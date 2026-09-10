@@ -737,10 +737,24 @@ export function listConversationMessages(
  * conversation that starts talking is a new conversation, and the inbox rows
  * that could have re-minted the old keys are long gone by then.
  */
-export function deleteConversationMessages(db: DB, conversationKey: string): number {
+/**
+ * `agentId` is REQUIRED, not optional with a "delete everything" default: one
+ * conversation_key (a phone) can hold a row under EACH agent — router.ts's
+ * AGENT_IDS map one phone to two possible personas — and an unscoped DELETE
+ * over conversation_key alone would remove one agent's messages while purging
+ * the other's session, which is exactly the data loss purge.ts's
+ * purgeCustomerSessions was found to have caused. Making the scope mandatory
+ * means that mistake cannot be reintroduced by a future caller forgetting an
+ * optional argument; there is no unscoped form left to fall back to.
+ */
+export function deleteConversationMessages(
+  db: DB,
+  conversationKey: string,
+  agentId: string,
+): number {
   return db
-    .prepare(`DELETE FROM conversation_messages WHERE conversation_key = ?`)
-    .run(conversationKey).changes;
+    .prepare(`DELETE FROM conversation_messages WHERE conversation_key = ? AND agent_id = ?`)
+    .run(conversationKey, agentId).changes;
 }
 
 /** An inbound message is identified by the inbox row it came from. */

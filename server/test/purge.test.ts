@@ -364,3 +364,54 @@ describe("purge with owners in the assignments table", () => {
     expect(() => assertOwnerAllowlist(NO_VARIABLE)).toThrow(/OWNER_PHONE_NUMBERS is empty/);
   });
 });
+
+/**
+ * The defect this scoping exists to fix. `sessions` is keyed
+ * (agent_id, conversation_key), so ONE phone can hold a row under BOTH
+ * AGENT_IDS.owner and AGENT_IDS.customer — used the inventory agent once,
+ * then the phone's CURRENT role reads as customer (never in the allowlist
+ * for that role, or demoted from it). isOwnerKey alone judges the phone, not
+ * the session, and would classify BOTH rows as a customer's — destroying the
+ * owner-agent conversation along with the real customer one. agent_id records
+ * what the conversation WAS HAD as, a fact isOwnerKey cannot see.
+ */
+describe("purgeCustomerSessions spares a session by its own agent_id, not just the phone's current role", () => {
+  const DUAL_SESSION = "11111111-1111-4111-8111-111111111111";
+
+  beforeEach(() => {
+    // CUSTOMER already has a SALES session from the top-level beforeEach.
+    // This adds an owner-agent session under the SAME phone — CUSTOMER is not
+    // in CONFIG's allowlist, so isOwnerKey(CUSTOMER) is false, yet this
+    // session is owner-mode history.
+    setSessionId(db, INVENTORY, CUSTOMER, DUAL_SESSION);
+    seedTranscript(DUAL_SESSION);
+    seedMessage(INVENTORY, CUSTOMER, "cargué 10 remeras");
+    seedMessage(SALES, CUSTOMER, "quiero una remera");
+  });
+
+  it("keeps the owner-agent session, its messages and its transcript", () => {
+    purgeCustomerSessions(db, CONFIG, root);
+
+    expect(getSessionId(db, INVENTORY, CUSTOMER)).toBe(DUAL_SESSION);
+    expect(transcriptExists(DUAL_SESSION)).toBe(true);
+    const kept = listConversationMessages(db, CUSTOMER);
+    expect(kept).toEqual([
+      expect.objectContaining({ agent_id: INVENTORY, body: "cargué 10 remeras" }),
+    ]);
+  });
+
+  it("still drops the customer-agent session under the very same phone", () => {
+    purgeCustomerSessions(db, CONFIG, root);
+
+    expect(getSessionId(db, SALES, CUSTOMER)).toBeUndefined();
+    expect(transcriptExists(CUSTOMER_SESSION)).toBe(false);
+  });
+
+  it("reports the spared session in kept, not purged, and a message count matching only what was removed", () => {
+    const result = purgeCustomerSessions(db, CONFIG, root);
+
+    // Sessions in play: OWNER's own inventory session and CUSTOMER's dual
+    // inventory session are both spared; only SALES/CUSTOMER is purged.
+    expect(result).toMatchObject({ purged: 1, kept: 2, purgedMessages: 1 });
+  });
+});

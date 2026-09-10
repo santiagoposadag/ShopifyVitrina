@@ -545,14 +545,40 @@ describe("forgetting a conversation", () => {
       rows: arrive(db, OTHER_PHONE, ["buenas"]),
     });
 
-    expect(deleteConversationMessages(db, PHONE)).toBe(3);
+    expect(deleteConversationMessages(db, PHONE, AGENT)).toBe(3);
 
     expect(listConversationMessages(db, PHONE)).toEqual([]);
     expect(listConversationMessages(db, OTHER_PHONE)).toHaveLength(1);
   });
 
   it("reports nothing deleted for a conversation with no record", () => {
-    expect(deleteConversationMessages(db, PHONE)).toBe(0);
+    expect(deleteConversationMessages(db, PHONE, AGENT)).toBe(0);
+  });
+
+  // The same conversation_key can hold rows under TWO agents — one phone that
+  // used both the inventory and the sales persona. Deleting one agent's
+  // messages must not touch the other's: purge.ts relies on this to spare a
+  // session's history while dropping its sibling under the same phone.
+  it("scopes the delete to one agent, leaving the same phone's other agent alone", () => {
+    const OTHER_AGENT = "vitrina-ventas";
+    recordOutboundMessage(db, {
+      agentId: AGENT,
+      conversationKey: PHONE,
+      turnKey: "t1",
+      body: "cargué 10 remeras",
+    });
+    recordOutboundMessage(db, {
+      agentId: OTHER_AGENT,
+      conversationKey: PHONE,
+      turnKey: "t2",
+      body: "quiero una remera",
+    });
+
+    expect(deleteConversationMessages(db, PHONE, OTHER_AGENT)).toBe(1);
+
+    const remaining = listConversationMessages(db, PHONE);
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]).toMatchObject({ agent_id: AGENT, body: "cargué 10 remeras" });
   });
 
   // A purged conversation that starts talking again is a NEW conversation, not
@@ -565,7 +591,7 @@ describe("forgetting a conversation", () => {
       turnKey: "t1",
       body: "Si.",
     });
-    deleteConversationMessages(db, PHONE);
+    deleteConversationMessages(db, PHONE, AGENT);
 
     recordOutboundMessage(db, {
       agentId: AGENT,
