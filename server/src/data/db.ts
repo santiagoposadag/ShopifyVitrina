@@ -278,6 +278,71 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- WHAT WAS SAID, in both directions, kept beyond the queue that carried it.
+    --
+    -- inbox is a WORK QUEUE and this is a RECORD, and the difference is a
+    -- deletion: deleteStaleInboxRows drops settled rows seven days on, hourly,
+    -- because their only remaining job by then is dedupe. That sweep is the
+    -- entire reason this table exists, so nothing here may ever be wired into
+    -- it. Outbound had no persistence at all before this — a reply the person
+    -- received existed nowhere once the process that sent it moved on.
+    --
+    -- ONE ROW PER MESSAGE, never per coalesced prompt. buildBatchText joins a
+    -- debounced burst into one string, and that string is an artifact of how
+    -- long the window happened to be; the messages are what the person sent.
+    -- turn_key is what puts the burst back together — every row answered by one
+    -- turn carries the same one.
+    --
+    -- source_inbox_id is DELIBERATELY NOT A FOREIGN KEY, and openDb runs with
+    -- foreign_keys = ON, so declaring one would be load-bearing: the sweep
+    -- above would then either be refused or cascade into here, which is exactly
+    -- the outcome this table is built to avoid. It points at a row that is
+    -- EXPECTED to be gone.
+    --
+    -- dedupe_key is what makes both directions safe to write twice, and each
+    -- direction mints it differently (see recordInboundMessages and
+    -- recordOutboundMessage in repo.ts for the reasoning behind each). It is
+    -- one UNIQUE column rather than two partial indexes so INSERT OR IGNORE is
+    -- the whole idempotency story, in one place, for both.
+    --
+    -- NO RETENTION IS IMPLEMENTED, on purpose. How long a customer's
+    -- conversation is kept is a business decision that has not been made, and a
+    -- number picked here would be that decision, silently. The shape is ready
+    -- for one — occurred_at is indexed alongside the conversation, so a sweep
+    -- by age reads the same index a conversation read does — but until someone
+    -- chooses, this table only ever grows. purgeCustomerSessions has
+    -- deleteConversationMessages to reach for; nothing runs on a timer.
+    --
+    -- A new table, so IF NOT EXISTS IS the migration for a database that
+    -- predates it: nothing here alters an existing table.
+    CREATE TABLE IF NOT EXISTS conversation_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      dedupe_key TEXT NOT NULL UNIQUE,
+      direction TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
+      -- The phone, or an 'a2a:' correlation key — the same string the inbox and
+      -- the sessions table are keyed by: one conversation is one thing
+      -- everywhere, so a purge that names a key reaches all three.
+      conversation_key TEXT NOT NULL,
+      -- Which assistant this belongs to. NOT NULL, unlike inbox.agent_id: by
+      -- the time anything is recorded the target has been resolved, and a
+      -- record that cannot say which persona answered answers no question.
+      agent_id TEXT NOT NULL,
+      body TEXT NOT NULL,
+      -- What the message WAS, carried over from the door rather than guessed
+      -- from the body. An uncaptioned photo has no text at all, so without this
+      -- it is indistinguishable from an empty row — which reads as a bug.
+      kind TEXT NOT NULL DEFAULT 'text' CHECK (kind IN ('text','media')),
+      turn_key TEXT NOT NULL,
+      -- The inbox row this message came from; NULL on every outbound row.
+      source_inbox_id INTEGER,
+      -- When it happened: the inbox row's own received_at for inbound, so a
+      -- burst reads in the order it was typed rather than collapsing onto the
+      -- instant the debounce window closed. Second resolution, like every other
+      -- timestamp here, so id breaks ties (see listConversationMessages).
+      occurred_at TEXT NOT NULL DEFAULT (datetime('now')),
+      recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
     -- Every batch flush claims one CONVERSATION's un-settled rows. The index
     -- that serves that claim is created in migrate() below, not here: on a
@@ -290,6 +355,13 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
     -- the table it belongs to.
     CREATE INDEX IF NOT EXISTS idx_inbox_phone_status ON inbox(phone, status);
     CREATE INDEX IF NOT EXISTS idx_leads_created_at ON leads(created_at);
+    -- Reading one conversation, deleting one conversation, and the retention
+    -- sweep nobody has authorised yet all narrow by conversation_key first and
+    -- then order by time — so the three of them are one index. Here rather than
+    -- in migrate(): the table it covers is created in this same block, so it
+    -- can never run against a table that does not have the columns yet.
+    CREATE INDEX IF NOT EXISTS idx_conversation_messages_key
+      ON conversation_messages(conversation_key, occurred_at, id);
     CREATE INDEX IF NOT EXISTS idx_pending_media_phone ON pending_media(phone);
   `);
 

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { unlinkSync } from "node:fs";
 import type { DB } from "./db.js";
 import type { Lead, LeadType, MessageKind } from "../types.js";
@@ -482,6 +483,282 @@ export function deleteStaleInboxRows(
   return done.changes + failed.changes;
 }
 
+
+// --- Conversation record ------------------------------------------------------
+
+// What was said, in both directions, kept beyond the queue that carried it.
+//
+// The inbox is a work queue: deleteStaleInboxRows above drops settled rows a
+// week on, and outbound was never persisted anywhere at all. Everything in this
+// section writes to `conversation_messages` instead, which that sweep does not
+// touch — see the table's own comment in db.ts for why the two are separate.
+//
+// EVERY WRITE HERE IS IDEMPOTENT, because every caller is on a retry path.
+// processBatch re-runs the same code over the same messages up to
+// MAX_BATCH_ATTEMPTS times, and a reply can be delivered twice when a crash
+// falls between the send and the batch settling. The two directions mint their
+// dedupe keys differently and each function says why.
+
+export type MessageDirection = "inbound" | "outbound";
+
+export interface ConversationMessage {
+  id: number;
+  /** How this row is recognised as already written. See the two recorders. */
+  dedupe_key: string;
+  direction: MessageDirection;
+  conversation_key: string;
+  agent_id: string;
+  /** The words: what the person sent, or what we delivered. */
+  body: string;
+  /** What the message was, as the door parsed it — never re-derived from body. */
+  kind: MessageKind;
+  /** Which turn this belongs to; every message answered together shares one. */
+  turn_key: string;
+  /**
+   * The inbox row this came from, on inbound rows only.
+   *
+   * EXPECTED TO DANGLE. Not a foreign key (db.ts says why): the row it names is
+   * deleted by the inbox TTL, and this record outliving that deletion is the
+   * whole point of the table.
+   */
+  source_inbox_id: number | null;
+  /** When it happened — arrival for inbound, delivery for outbound. */
+  occurred_at: string;
+  /** When we wrote it down. Differs from occurred_at on a replayed batch. */
+  recorded_at: string;
+}
+
+/**
+ * The fields the inbound recorder reads off a claimed inbox row.
+ *
+ * A structural subset rather than InboxRow itself, in the style of the
+ * batcher's BatchRow: it states exactly what is read, and it lets this be
+ * tested without building a whole row.
+ */
+export interface RecordableInboxRow {
+  id: number;
+  /**
+   * Which conversation this message belongs to, as the door that authenticated
+   * its sender wrote it. TAKEN FROM THE ROW rather than passed alongside it, on
+   * the same principle processBatch applies to the rest of the envelope: the
+   * row is the record of what was proven at the door, and a second source for
+   * the same fact is a second thing that can be wrong. A caller that passed the
+   * key separately could file one person's words under another's conversation,
+   * and the dedupe key — the inbox id — would then make the mistake permanent,
+   * since the correcting write is recognised as a duplicate and ignored.
+   */
+  conversation_key: string;
+  agent_text: string;
+  kind: MessageKind;
+  received_at: string;
+}
+
+/**
+ * Record one claimed batch's messages. Returns how many rows were newly
+ * written — 0 on a retry that had already recorded them.
+ *
+ * ONE ROW PER MESSAGE. The coalesced prompt buildBatchText produces is a
+ * derived artifact of the debounce window; the messages are the observable
+ * fact. `turnKey` is carried on each of them, so which ones were answered
+ * together is still visible.
+ *
+ * IDEMPOTENT PER SOURCE INBOX ROW, which is the only key that survives what
+ * this retries against. A failed batch returns its rows to 'pending' and the
+ * next flush claims them again — together with anything that arrived in the
+ * meantime, so the batch itself is not stable between attempts and neither is
+ * anything derived from the whole set. `inbox.id` is: the row keeps it across
+ * every attempt, and because `inbox` is AUTOINCREMENT rather than a plain
+ * rowid, SQLite never hands a deleted row's id to a new message — so a key
+ * written today cannot be re-minted by a different message after the TTL sweep.
+ *
+ * CALL THIS AFTER MEDIA AND AUDIO ARE RESOLVED. The batcher mutates its row
+ * objects in place, so a voice note's `agent_text` is its transcript only once
+ * resolveAudio has run; recording earlier would store an empty body and never
+ * correct it, since the retry that follows finds the key already written.
+ *
+ * One transaction: a batch is recorded whole or not at all, matching how the
+ * batch itself is settled.
+ */
+export function recordInboundMessages(
+  db: DB,
+  input: {
+    /** Which assistant answered. The rows cannot say: a WhatsApp row's agent_id
+     * is NULL by design, resolved once per burst when it flushes. */
+    agentId: string;
+    turnKey: string;
+    rows: readonly RecordableInboxRow[];
+  },
+): number {
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO conversation_messages
+       (dedupe_key, direction, conversation_key, agent_id, body, kind,
+        turn_key, source_inbox_id, occurred_at)
+     VALUES
+       (@dedupe_key, 'inbound', @conversation_key, @agent_id, @body, @kind,
+        @turn_key, @source_inbox_id, @occurred_at)`,
+  );
+  const tx = db.transaction((): number => {
+    let written = 0;
+    for (const row of input.rows) {
+      const info = insert.run({
+        dedupe_key: inboundDedupeKey(row.id),
+        conversation_key: row.conversation_key,
+        agent_id: input.agentId,
+        body: row.agent_text,
+        kind: row.kind,
+        turn_key: input.turnKey,
+        source_inbox_id: row.id,
+        // The row's OWN arrival stamp, not now(): a burst is recorded when the
+        // debounce window closes, and stamping it then would collapse messages
+        // typed a minute apart onto one instant.
+        occurred_at: row.received_at,
+      });
+      written += info.changes;
+    }
+    return written;
+  });
+  return tx();
+}
+
+/**
+ * Record a reply that was delivered. Returns false when this exact reply was
+ * already recorded for this turn.
+ *
+ * MUST BE CALLED AFTER A SUCCESSFUL SEND, by the caller. Nothing here can check
+ * that, and recording before would produce a record of a message the person
+ * never received — the failure this record exists to make visible.
+ *
+ * THE KEY IS THE CONVERSATION, THE TURN AND THE WORDS, hashed together. The
+ * turn alone is not enough and the reasoning cuts both ways:
+ *
+ *  - A crash between the send and markInboxBatchDone replays the batch, and the
+ *    replayed turn keeps the SAME turn key (it is the first row's dedupe key,
+ *    stable by construction). If it produces the same answer, the person was
+ *    told the same thing twice by an at-least-once transport, and one row is
+ *    the honest record of what was said.
+ *  - If that replay answers DIFFERENTLY — the store changed, the model chose
+ *    other words — the person received two different messages, and keying on
+ *    the turn alone would hide the second. A record missing a message the
+ *    person acted on is worse than a duplicate.
+ *
+ * Hashed rather than concatenated because a conversation key contains colons
+ * ('a2a:caller:target:correlation'): concatenating three fields with a
+ * separator that occurs inside one of them lets two different tuples produce
+ * one string, and the collision would silently drop a real message.
+ */
+export function recordOutboundMessage(
+  db: DB,
+  input: {
+    conversationKey: string;
+    agentId: string;
+    turnKey: string;
+    body: string;
+    /** Defaults to 'text'; nothing this build sends is anything else. */
+    kind?: MessageKind;
+    /**
+     * When it was delivered, if the caller knows better than now() — a
+     * transport's own stamp, or a replay reconstructing an earlier send.
+     * Defaults to now(), which is what every current caller means.
+     */
+    occurredAt?: string;
+  },
+): boolean {
+  const info = db
+    .prepare(
+      `INSERT OR IGNORE INTO conversation_messages
+         (dedupe_key, direction, conversation_key, agent_id, body, kind,
+          turn_key, source_inbox_id, occurred_at)
+       VALUES
+         (@dedupe_key, 'outbound', @conversation_key, @agent_id, @body, @kind,
+          @turn_key, NULL, COALESCE(@occurred_at, datetime('now')))`,
+    )
+    .run({
+      dedupe_key: outboundDedupeKey(input.conversationKey, input.turnKey, input.body),
+      conversation_key: input.conversationKey,
+      agent_id: input.agentId,
+      body: input.body,
+      kind: input.kind ?? "text",
+      turn_key: input.turnKey,
+      occurred_at: input.occurredAt ?? null,
+    });
+  return info.changes > 0;
+}
+
+/**
+ * One conversation's messages, oldest first, both directions interleaved.
+ *
+ * Ordered by occurred_at with id as the tie-break, because occurred_at has
+ * second resolution everywhere in this schema: a reply sent in the same second
+ * as the question would otherwise be free to sort ahead of it, and a transcript
+ * where the answer precedes the question is worse than no transcript.
+ *
+ * `limit` takes the MOST RECENT n and hands them back oldest-first. Taking the
+ * first n would answer "how did this start" to a caller asking what just
+ * happened — and with no retention policy in place (see db.ts) a conversation
+ * has no bound on how long it can get, so the unbounded read is the one that
+ * needs a caller to think.
+ */
+export function listConversationMessages(
+  db: DB,
+  conversationKey: string,
+  limit?: number,
+): ConversationMessage[] {
+  if (limit === undefined) {
+    return db
+      .prepare(
+        `SELECT * FROM conversation_messages
+         WHERE conversation_key = ?
+         ORDER BY occurred_at ASC, id ASC`,
+      )
+      .all(conversationKey) as ConversationMessage[];
+  }
+  return db
+    .prepare(
+      `SELECT * FROM (
+         SELECT * FROM conversation_messages
+         WHERE conversation_key = ?
+         ORDER BY occurred_at DESC, id DESC
+         LIMIT ?
+       ) ORDER BY occurred_at ASC, id ASC`,
+    )
+    .all(conversationKey, limit) as ConversationMessage[];
+}
+
+/**
+ * Forget one conversation's record entirely. Returns the number of rows
+ * deleted.
+ *
+ * The ops lever, for the purge tool — NOT a TTL, and nothing calls it on a
+ * timer. It deletes both directions, because half a conversation is a worse
+ * record than none: an outbound row with nothing that prompted it reads as the
+ * assistant messaging someone unbidden.
+ *
+ * The key becomes writable again afterwards, which is correct: a purged
+ * conversation that starts talking is a new conversation, and the inbox rows
+ * that could have re-minted the old keys are long gone by then.
+ */
+export function deleteConversationMessages(db: DB, conversationKey: string): number {
+  return db
+    .prepare(`DELETE FROM conversation_messages WHERE conversation_key = ?`)
+    .run(conversationKey).changes;
+}
+
+/** An inbound message is identified by the inbox row it came from. */
+function inboundDedupeKey(inboxId: number): string {
+  return `in:${inboxId}`;
+}
+
+/**
+ * An outbound message is identified by what was said, to whom, on which turn.
+ * JSON.stringify over an array, so no field's own punctuation can shift a
+ * boundary; the 'out:' prefix keeps the two directions' key spaces apart.
+ */
+function outboundDedupeKey(conversationKey: string, turnKey: string, body: string): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify([conversationKey, turnKey, body]))
+    .digest("hex");
+  return `out:${digest}`;
+}
 
 // --- Pending media ----------------------------------------------------------
 
