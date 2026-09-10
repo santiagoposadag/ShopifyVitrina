@@ -247,6 +247,58 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
       rotated_at TEXT
     );
 
+    -- TEMPORARY. Which phones may flip their OWN role from the test console.
+    --
+    -- REMOVING THE FEATURE IS: delete this block, delete data/test-roster.ts
+    -- and its test, delete whatever console routes reference them, and
+    -- DROP TABLE test_roster on the deployment (or just delete the rows — an
+    -- empty table already refuses everything). Nothing durable imports that
+    -- module; the dependency runs temporary -> durable and never back, so
+    -- deleting it cannot break the pipeline.
+    --
+    -- WHY IT EXISTS: the store owner has to experience both sides of the
+    -- assistant from their own phone, and today a role changes only from a
+    -- terminal. This is permission to ASK for a flip, kept small enough to
+    -- delete.
+    --
+    -- A SEPARATE TABLE FROM agent_registry, deliberately. Sharing one would
+    -- make a console token authenticate at POST /agents/:id/messages and an
+    -- agent-door token able to flip a role — two doors, one key, and neither
+    -- side of that would be visible from the code that opens either. Two
+    -- tables IS the containment.
+    --
+    -- phone is the PRIMARY KEY because it is the identity: one token, one test
+    -- phone. The console therefore needs no phone parameter anywhere in its
+    -- surface — the phone comes from the row the bearer token matched, so
+    -- there is no field a request could smuggle somebody else's number into.
+    -- normalizePhone's output, the same key space as the assignments table, or
+    -- a row written '+57 300…' would flip a role nobody has.
+    --
+    -- NO ROLE COLUMN AND NO EXPIRY, on purpose. The assignments table stays the
+    -- single authority on what role a phone has; a second copy is a second thing that
+    -- can disagree with the router. Revocation is deleting the row, which
+    -- takes effect on the next request with no restart.
+    --
+    -- token_hash is NOT NULL and UNIQUE. NOT NULL because the row IS the
+    -- credential and because a NULL would reach Buffer.from(null, 'hex') in
+    -- the scan and throw, taking the console down for every holder. UNIQUE
+    -- because two rows sharing a hash would make one token resolve to
+    -- whichever phone the scan saw last — silently the wrong person.
+    --
+    -- label is operator-typed, so somebody holding two phones can tell which
+    -- link is which. IT IS RENDERED WITH textContent, NEVER INTERPOLATED INTO
+    -- HTML: it is untrusted input that a later page displays.
+    --
+    -- A new table, so IF NOT EXISTS IS the migration for a database that
+    -- predates it: nothing here alters an existing table.
+    CREATE TABLE IF NOT EXISTS test_roster (
+      phone TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE,
+      label TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      rotated_at TEXT
+    );
+
     -- WHO is an owner, and therefore which assistant answers them.
     --
     -- THIS TABLE IS THE ROLE BOUNDARY. It replaces OWNER_PHONE_NUMBERS as the
