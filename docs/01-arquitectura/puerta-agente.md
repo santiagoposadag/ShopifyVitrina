@@ -80,7 +80,7 @@ a2a:{caller_id}:{target_id}:{correlation_id}
 
 A conversation is keyed by **both ends plus the correlation**. Two calls from the same caller asking the same target under different correlations hold separate transcripts. The namespace prevents collision with WhatsApp phone numbers, and `claimInboxBatch` serialises by key — one exchange at a time per agent pair and correlation.
 
-> ⚠️ If a caller could name a bare phone number as its correlation, it would claim and answer that person's pending WhatsApp messages, receiving their words in its own response body. The prefix is added here, in the door, and a caller cannot remove it. `server/src/inbox/envelope.ts:124`
+> ⚠️ If a caller could name a bare phone number as its correlation, it would claim and answer that person's pending WhatsApp messages, receiving their words in its own response body. The prefix is defined once, in the protocol module both the door and the purge tool read, and the door adds it — a caller cannot remove it. `server/src/a2a-protocol.ts:36`
 
 ## Idempotency and retries
 

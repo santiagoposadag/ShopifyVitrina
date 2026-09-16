@@ -11,7 +11,7 @@ import {
 } from "../src/data/purge.js";
 import { AGENT_IDS } from "../src/router.js";
 import { assignRole } from "../src/data/assignments.js";
-import { agentConversationKey } from "../src/inbox/envelope.js";
+import { agentConversationKey } from "../src/a2a-protocol.js";
 
 /**
  * The purge judges a session by its CONVERSATION KEY, which on the WhatsApp

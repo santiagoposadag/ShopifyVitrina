@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildToolServer } from "../src/tools/registry.js";
-import { MAX_HOP } from "../src/inbox/a2a.js";
+import { MAX_HOP } from "../src/a2a-protocol.js";
 import { whatsappPrincipal, agentPrincipal } from "../src/inbox/envelope.js";
 import { fakePorts } from "./helpers/fake-ports.js";
 import type { AgentDefinition } from "../src/agent/definition.js";

@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import type { AgentDefinition, ToolUniverse } from "../agent/definition.js";
-import { undeclaredToolMentions } from "../agent/definition.js";
 import type { DB } from "../data/db.js";
+import { undeclaredToolMentions } from "../tool-mentions.js";
 import type { KnowledgeHit, KnowledgePort } from "../tools/ports.js";
 
 /**

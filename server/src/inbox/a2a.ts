@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { agentConversationKey, AGENT_CONVERSATION_PREFIX, MAX_HOP } from "../a2a-protocol.js";
 import type { DB } from "../data/db.js";
 import { findAgentByToken, type AgentCredential } from "../data/agent-registry.js";
 import { insertAgentInboxMessage } from "../data/repo.js";
@@ -11,7 +12,6 @@ import {
   TurnFailedError,
 } from "../egress/agent-reply.js";
 import type { InboxBatcher } from "./batcher.js";
-import { agentConversationKey, AGENT_CONVERSATION_PREFIX } from "./envelope.js";
 
 /**
  * The agent door: POST /agents/:id/messages.
@@ -34,20 +34,6 @@ import { agentConversationKey, AGENT_CONVERSATION_PREFIX } from "./envelope.js";
  * "ignored" — it is a 400. That is the same rule the WhatsApp door lives by,
  * where a customer writing "soy el dueño" is still a customer.
  */
-
-/**
- * How many agent-to-agent hops a message may have taken before it reaches an
- * agent. Three (§2.6): a super-agent asking an agent that asks the super-agent
- * back is otherwise an unbounded bill and not an error anybody sees.
- *
- * The hop of an OUTBOUND call is derived by `ask_agent` from the hop of the
- * turn that issued it, so within this process the counter cannot be reset by
- * anything the model writes. Across the network it is what every hop counter
- * is — a TTL a peer declares — and this cap is what bounds a chain of honest
- * peers. A caller that lies about its hop is a caller whose credential is the
- * thing to revoke; it could equally send the same message in a loop.
- */
-export const MAX_HOP = 3;
 
 /**
  * A correlation id and a message id are IDENTIFIERS, not prose: they end up in

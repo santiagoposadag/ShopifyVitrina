@@ -5,8 +5,8 @@ import { mintAgentToken, upsertAgentCredential } from "../src/data/agent-registr
 import { getInboxRow, insertInboxMessage } from "../src/data/repo.js";
 import { InboxBatcher } from "../src/inbox/batcher.js";
 import { PerConversationQueue } from "../src/inbox/queue.js";
-import { agentConversationKey } from "../src/inbox/envelope.js";
-import { MAX_HOP, registerAgentDoor } from "../src/inbox/a2a.js";
+import { agentConversationKey, MAX_HOP } from "../src/a2a-protocol.js";
+import { registerAgentDoor } from "../src/inbox/a2a.js";
 import { registerWebhook } from "../src/inbox/webhook.js";
 import { AGENT_IDS } from "../src/router.js";
 import { AgentReplies } from "../src/egress/agent-reply.js";

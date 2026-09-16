@@ -1,6 +1,6 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { MAX_HOP } from "../../inbox/a2a.js";
+import { MAX_HOP } from "../../a2a-protocol.js";
 import { text, type ToolFactory } from "../factory.js";
 
 /**

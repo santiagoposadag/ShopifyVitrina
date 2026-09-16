@@ -81,7 +81,9 @@ export interface Envelope {
    * For a WhatsApp principal this IS the phone: one person, one running
    * conversation with that assistant. For an agent principal it will be a
    * correlation id, because two agents may have several independent exchanges
-   * in flight and threading them into one transcript would mix them.
+   * in flight and threading them into one transcript would mix them. How that
+   * key is spelled — namespace, minter and the predicate that recognises
+   * one — is the agent-to-agent protocol's, not this door's: a2a-protocol.ts.
    */
   conversationKey: string;
   /** The prompt for this turn — for WhatsApp, one debounced burst joined together. */
@@ -105,43 +107,4 @@ export interface Envelope {
    * super-agent back is otherwise an unbounded bill, not an error anyone sees.
    */
   hop: number;
-}
-
-/**
- * The namespace every agent-door conversation key carries.
- *
- * NOT decoration. The conversation key is what `claimInboxBatch` claims by and
- * what `sessions` is keyed on, and the correlation id inside it is chosen by
- * the CALLER — so without a namespace an agent could pass "573001112233" and
- * claim, answer and settle that person's pending WhatsApp messages, receiving
- * their words in its own response body. The prefix is added here, by us, and a
- * caller cannot remove it; a phone can never collide with it because
- * normalizePhone leaves nothing but digits.
- *
- * It is also the marker the purge tool reads: an agent-to-agent exchange is not
- * a customer's history, and `isOwner` would judge it as one (data/purge.ts).
- */
-export const AGENT_CONVERSATION_PREFIX = "a2a:";
-
-/**
- * The conversation key for one agent-to-agent exchange.
- *
- * BOTH ENDS PLUS THE CORRELATION. The caller is in it because two agents that
- * happen to choose the same correlation id must hold two conversations rather
- * than one shared transcript. The TARGET is in it because a batch is claimed by
- * conversation key and answered by ONE agent: a caller that asked two agents
- * under one correlation id would otherwise have both questions claimed together
- * and answered by whichever agent the first row named.
- */
-export function agentConversationKey(
-  callerAgentId: string,
-  targetAgentId: string,
-  correlationId: string,
-): string {
-  return `${AGENT_CONVERSATION_PREFIX}${callerAgentId}:${targetAgentId}:${correlationId}`;
-}
-
-/** Whether this conversation key was minted by the agent door. */
-export function isAgentConversationKey(conversationKey: string): boolean {
-  return conversationKey.startsWith(AGENT_CONVERSATION_PREFIX);
 }

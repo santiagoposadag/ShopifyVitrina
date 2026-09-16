@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { undeclaredToolMentions } from "../tool-mentions.js";
 import type { Role } from "../types.js";
 
 /**
@@ -140,19 +141,6 @@ export interface ToolUniverse {
 }
 
 /**
- * A prompt "mentions" a tool when the tool's exact name appears as a whole
- * word. This catches the failure the plan calls out — a persona naming a
- * tool that was renamed or was never added to `tools[]` — without flagging
- * ordinary prose: an underscore-joined lowercase identifier does not occur by
- * accident in English or Spanish sentences. It CANNOT catch a misspelled tool
- * name ("adjust_inventroy") or a paraphrase ("the stock tool") — those read as
- * prose, not as the literal the schema can compare against.
- */
-function mentionsTool(text: string, toolName: string): boolean {
-  return new RegExp(`\\b${toolName}\\b`).test(text);
-}
-
-/**
  * The registry key of the knowledge search tool.
  *
  * Declared HERE, not in the registry, because this module must stay loadable
@@ -170,32 +158,6 @@ export const SEARCH_KNOWLEDGE_TOOL = "search_knowledge";
  * loadable without importing the tool layer it validates.
  */
 export const ASK_AGENT_TOOL = "ask_agent";
-
-/**
- * Tool names a piece of prose mentions that this agent was NOT given.
- *
- * Shared by the persona check below and by the knowledge loader, because a
- * knowledge document reaches the model exactly as the prompt does — inline in
- * the system prompt, or as a tool result — and an instruction to call a tool
- * the agent does not have is the same hole either way.
- */
-export function undeclaredToolMentions(
-  text: string,
-  definition: AgentDefinition,
-  universe: ToolUniverse,
-): string[] {
-  // What this agent's model will actually see. Only the tools that EXIST are
-  // mapped: an unknown key in tools[] is already its own error, and reporting
-  // it twice buries the one line that names the typo.
-  const declaredExposed = new Set(
-    definition.tools
-      .map((key) => universe.exposedNames.get(key))
-      .filter((name): name is string => name !== undefined),
-  );
-  return [...new Set(universe.exposedNames.values())].filter(
-    (exposed) => mentionsTool(text, exposed) && !declaredExposed.has(exposed),
-  );
-}
 
 /**
  * Load one definition from `<agentsDir>/<id>/`. Throws with the offending

@@ -1,6 +1,6 @@
+import { isAgentConversationKey } from "../a2a-protocol.js";
 import type { Config } from "../config.js";
 import { isOwner } from "../config.js";
-import { isAgentConversationKey } from "../inbox/envelope.js";
 import { AGENT_IDS } from "../router.js";
 import { countAssignedOwners, roleForPhone } from "./assignments.js";
 import type { DB } from "./db.js";
