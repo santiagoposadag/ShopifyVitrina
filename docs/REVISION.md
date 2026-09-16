@@ -68,15 +68,15 @@ grep -oE '(query|mutation) [A-Z][A-Za-z]*' server/src/shopify/catalog.ts | sort 
 
 | Claim | Current value |
 |---|---|
-| SQLite tables | 5 |
-| Tools registered | 15 — 4 customer (vitrina-ventas), 13 owner (vitrina-inventario), get_product split into two registry entries |
+| SQLite tables | 10 |
+| Tools registered | 15 matched by the grep above (it misses two constant-keyed entries, `ask_agent` and `search_knowledge` — 17 total). The owner (`vitrina-inventario`) declares 15 tools, the customer (`vitrina-ventas`) 4; `get_product` is split into two registry entries |
 | Exported functions in `catalog.ts` | 17 |
 | Named GraphQL operations | 19 — 10 mutations, 9 queries |
-| Server tests | 483 across 24 files |
+| Server tests | 835 across 43 files |
 
 > ⚠️ The table count needs the trailing ` \(`. Without it the regex also matches the
 > sentence "CREATE TABLE IF NOT EXISTS never alters…" in the migration comment and reports
-> **6**. This wiki made that mistake first.
+> **11**. This wiki made that mistake first.
 
 ### 3b · Where this wiki is most likely wrong
 

@@ -30,8 +30,10 @@ sequenceDiagram
 
 | Role | Tools |
 |---|---|
-| Customer | `search_catalog`, `get_product`, `save_lead`, `build_cart` |
-| Owner | those four **plus** `list_products`, `create_product`, `update_product`, `add_variant`, `delete_product`, `get_inventory`, `adjust_inventory`, `attach_pending_photos`, `list_locations`, `list_leads` |
+| Customer (4) | `search_catalog`, `get_product`, `save_lead`, `build_cart` |
+| Owner (15) | `search_catalog`, `get_product_any_status` (exposed as `get_product`), `save_lead`, `build_cart`, `list_products`, `create_product`, `update_product`, `add_variant`, `delete_product`, `get_inventory`, `adjust_inventory`, `attach_pending_photos`, `list_locations`, `list_leads`, `search_knowledge` |
+
+`agents/vitrina-ventas/agent.yaml:15-19`, `agents/vitrina-inventario/agent.yaml:16-38`
 
 > ⚠️ `get_product` is now **two registry entries** (`get_product` and `get_product_any_status`),
 > both exposed to the model as `get_product`. The customer's returns "no product found" 
@@ -111,4 +113,4 @@ undefined keys. `server/src/agent/runtime.ts:77-117`
 
 **[← Shopify layer](capa-shopify.md)** · **[WhatsApp transport →](bridge-whatsapp.md)**
 
-<sub>Verified against `cda9ea9` — 2026-08-28</sub>
+<sub>Verified against `6c3cc83` — 2026-09-16</sub>

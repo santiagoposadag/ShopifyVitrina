@@ -56,9 +56,10 @@ graph TB
 |---|---|---|
 | 🏛 | **[01 · Architecture](01-arquitectura/)** | The two processes, the message pipeline, the Shopify layer, deployment |
 | 🔀 | **[02 · Flows](02-flujos/)** | One message end to end, the owner's inventory path, the customer's path, failure |
-| 🗄 | **[03 · Data](03-datos/)** | The five SQLite tables, the Shopify fields we read and write, who writes what |
+| 🗄 | **[03 · Data](03-datos/)** | The ten SQLite tables, the Shopify fields we read and write, who writes what |
 
 **[🧭 Reading path](ONBOARDING.md)** · **[🔍 How to audit this](REVISION.md)** · **[⚠️ Registered debt](DEUDA.md)** · **[Conventions](CONTRIBUTING.md)**
+· **[🗺 Architecture map](architecture.html)** — the visual map of the message path, module layers, and where state lives
 
 ---
 
@@ -66,14 +67,17 @@ graph TB
 
 ```mermaid
 graph LR
-    O["<b>Owner</b><br/>OWNER_PHONE_NUMBERS<br/>full inventory CRUD"]
-    C["<b>Customer</b><br/>everyone else<br/>search · ask · leave a lead"]
-    P["phone number"] --> O
-    P --> C
+    P["phone number"] --> T["assignments table<br/>role per phone"]
+    T -->|"owner"| O["<b>Owner</b><br/>full inventory CRUD"]
+    T -->|"no row → customer"| C["<b>Customer</b><br/>search · ask · leave a lead"]
+    SEED["OWNER_PHONE_NUMBERS<br/>seed at boot"] -.->|"copied for phones<br/>with no row yet"| T
 ```
 
-> ⚠️ Role is decided by the phone number and **never** by what the person says.
-> An owner tool reaching a customer is a stranger repricing a live store.
+> ⚠️ Role is decided by the `assignments` table, read fresh on every message —
+> **never** by what the person says. `OWNER_PHONE_NUMBERS` only seeds that table at
+> boot for phones it has never seen; it stops being authoritative the moment an
+> operator sets a row. An owner tool reaching a customer is a stranger repricing a
+> live store. `server/src/router.ts:120`
 
 ---
 
@@ -97,4 +101,4 @@ What lives elsewhere in this repo, and stays there:
 > ℹ️ `CLAUDE.md` at the repo root is the operating manual for coding agents. This wiki
 > is the same system explained to a person; where they disagree, the code decides.
 
-<sub>Verified against `36e95b2` — 2026-08-25</sub>
+<sub>Verified against `6c3cc83` — 2026-09-16</sub>

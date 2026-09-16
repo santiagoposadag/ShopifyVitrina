@@ -7,7 +7,8 @@ sequenceDiagram
     participant DB as inbox table
     participant BA as batcher.ts
     participant Q as queue.ts
-    participant A as agent.ts
+    participant A as agent/runtime.ts
+    participant R as egress/responder.ts
 
     B->>W: POST /webhook (signed; 1 event, or many)
     W->>W: verifySignature over the RAW body
@@ -19,7 +20,9 @@ sequenceDiagram
     Q->>DB: claimInboxBatch → 'processing'
     Note over Q: resolveMedia — fetch the files, THEN resolveAudio
     Q->>A: runAgentTurn(ctx, joined text)
-    A-->>B: POST /send
+    A-->>Q: reply (returned, not sent)
+    Q->>R: deliver(reply)
+    R-->>B: POST /send
     Q->>DB: markInboxBatchDone
 ```
 
@@ -107,4 +110,4 @@ graph LR
 
 **[Shopify layer →](capa-shopify.md)** · **[Flow: one inbound message →](../02-flujos/mensaje-entrante.md)**
 
-<sub>Verified against `36e95b2` — 2026-08-25</sub>
+<sub>Verified against `6c3cc83` — 2026-09-16</sub>

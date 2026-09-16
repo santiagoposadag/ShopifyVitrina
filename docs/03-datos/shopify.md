@@ -93,4 +93,4 @@ does not error — it silently changes which products are selected.
 
 **[← SQLite](sqlite.md)** · **[Ownership & retention →](propiedad-e-indices.md)**
 
-<sub>Verified against `6f9211b` — 2026-08-24</sub>
+<sub>Verified against `6c3cc83` — 2026-09-16</sub>

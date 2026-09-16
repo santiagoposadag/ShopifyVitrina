@@ -5,10 +5,10 @@ graph TB
     subgraph SRV["server — Node 20 · Fastify · ESM"]
         WH["inbox/webhook.ts<br/>HMAC · persist · fast ACK"]
         A2A["inbox/a2a.ts<br/>bearer token · sync|async"]
-        BA["inbox/batcher.ts<br/>adaptive debounce<br/>agents: none"]
+        BA["inbox/batcher.ts<br/>adaptive debounce for WhatsApp<br/>deliverNow for agents"]
         QU["inbox/queue.ts<br/>per-conversation serialization"]
-        AG["agent/agent.ts<br/>Agent SDK turn"]
-        TO["agent/tools.ts<br/>MCP tool server"]
+        AG["agent/runtime.ts<br/>Agent SDK turn"]
+        TO["tools/registry.ts<br/>MCP tool server"]
         SH["shopify/<br/>client · catalog · rank · cache"]
     end
 
@@ -32,7 +32,7 @@ graph TB
 
 > ℹ️ **Two transports, one seam.** `WHATSAPP_PROVIDER` decides which one runs and both
 > implement `WhatsAppChannel`. Only `index.ts` ever names either.
-> `server/src/index.ts:46`
+> `server/src/index.ts:95`
 
 | Process | Runtime | Port | Published | Loses on volume loss |
 |---|---|---|---|---|
@@ -41,7 +41,7 @@ graph TB
 
 > ⚠️ The bridge is deliberately unpublished — no `ports:`, no Coolify domain.
 > Anyone who can reach `/send` can send WhatsApp messages as the business.
-> `compose.yaml:141`
+> `compose.yaml:179`
 
 ## Pages
 
@@ -84,12 +84,13 @@ graph LR
 | Path | Referenced by |
 |---|---|
 | `server/dist/index.js` | image `CMD` |
-| `server/dist/data/backup.js` | `compose.yaml:194`, `server/package.json` |
-| `server/dist/data/purge-sessions.js` | `compose.yaml:218`, `server/package.json` |
-| `server/dist/data/agent-credentials.js` | `compose.yaml:278`, `server/package.json` |
-| `/bridge -healthcheck` | `compose.yaml:167`, `bridge/main.go:157` |
+| `server/dist/data/backup.js` | `compose.yaml:238`, `server/package.json` |
+| `server/dist/data/purge-sessions.js` | `compose.yaml:262`, `server/package.json` |
+| `server/dist/data/agent-credentials.js` | `compose.yaml:296`, `server/package.json` |
+| `server/dist/data/role-assignments.js` | `compose.yaml:323`, `server/package.json` |
+| `/bridge -healthcheck` | `compose.yaml:211`, `bridge/main.go:157` |
 
 > ⚠️ Moving an entry point means updating `compose.yaml` and `package.json` too.
 > Nothing type-checks these; they fail at runtime, in production.
 
-<sub>Verified against `36e95b2` — 2026-08-25</sub>
+<sub>Verified against `6c3cc83` — 2026-09-16</sub>

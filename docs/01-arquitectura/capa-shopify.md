@@ -2,7 +2,7 @@
 
 ```mermaid
 graph TB
-    T["agent/tools.ts"] --> CAT["catalog.ts<br/>18 operations"]
+    T["tools/registry.ts"] --> CAT["catalog.ts<br/>17 operations"]
     T --> CACHE["cache.ts<br/>TTL snapshot"]
     T --> RANK["rank.ts<br/>Spanish relevance"]
     CACHE --> CAT
@@ -114,4 +114,4 @@ and — decisively — **no comparable score**.
 
 **[← Message pipeline](pipeline-mensajes.md)** · **[Agent & sessions →](agente-y-sesiones.md)**
 
-<sub>Verified against `6f9211b` — 2026-08-24</sub>
+<sub>Verified against `6c3cc83` — 2026-09-16</sub>
