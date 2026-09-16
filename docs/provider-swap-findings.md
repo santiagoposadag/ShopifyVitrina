@@ -147,6 +147,6 @@ Before cutting over:
 1. Accept the latency trade explicitly (5.8 s → 9.1 s median).
 2. Re-run the comparison with the corrected tests to replace the estimated near-parity with a measured one.
 3. Run once in a different UTC window to sanity-check the peak-pricing question.
-4. Watch `servedModel` in the logs for the first day — DeepSeek resolves an unrecognised model id to its own default *silently*, so a typo in `MODEL` yields good replies from the wrong model.
+4. Watch the boot log and the first day's turns for a rejected model id — DeepSeek does not resolve a typo in `MODEL` to a default quietly, it rejects it with HTTP 400 naming the valid ids. `requestedModel` in the turn log only ever echoes what was configured, so it cannot surface a typo on its own.
 
 Rollback is a one-line change: `--profile anthropic`.

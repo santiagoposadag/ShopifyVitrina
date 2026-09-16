@@ -44,7 +44,7 @@ def render(entry):
         seconds = (entry.get("durationMs") or 0) / 1000
         head = (f"{BOLD}TURN{OFF}  {seconds:.1f}s  numTurns={entry.get('numTurns')}  "
                 f"in={entry.get('inputTokens')} out={entry.get('outputTokens')}  "
-                f"model={entry.get('servedModel')}  end={entry.get('resultSubtype')}")
+                f"model={entry.get('requestedModel')}  end={entry.get('resultSubtype')}")
         return (f"{COL.get(level,'')}{stamp(entry)} {LVL.get(level,level):5}{OFF} {head}\n"
                 f"{' ' * 15}{DIM}tools:{OFF} {entry.get('tools') or '(none)'}")
 

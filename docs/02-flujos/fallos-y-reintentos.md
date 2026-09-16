@@ -73,14 +73,14 @@ graph TB
 ## What one turn records
 
 `logTurn` writes a single line per turn, and these are the fields that answer the questions
-people actually ask. `server/src/agent/runtime.ts:149-188`
+people actually ask. `server/src/agent/runtime.ts:165-213`
 
 | Field | Answers |
 |---|---|
 | `tools` | Which tools ran, in order — or none, meaning it answered from the prompt |
 | `numTurns` | Hitting `maxTurns` (12) means the turn ended without an answer |
 | `resultSubtype` | Only `success` carries a reply; anything else produced none |
-| `servedModel` | Compare against `configuredModel`: DeepSeek substitutes SILENTLY |
+| `requestedModel` | Echoes what `MODEL` was set to — not proof of what ran; a rejected id fails loudly (HTTP 400) instead of substituting silently |
 | `durationMs` / `inputTokens` / `outputTokens` | Where the minute and the spend went |
 
 > ⚠️ A turn that ends with no words still sends `NO_ANSWER_FALLBACK`, logged at ERROR.

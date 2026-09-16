@@ -93,9 +93,11 @@ describe("buildAgentEnv", () => {
 
   describe("model tiers", () => {
     // The CLI resolves the utility tier through several code paths. An unset
-    // one keeps asking for the compiled-in Haiku default — which DeepSeek
-    // answers by SILENTLY substituting its own model rather than erroring, so
-    // the mistake hides behind a perfectly good reply.
+    // one keeps asking for the compiled-in Haiku default, and that one does NOT
+    // fail: DeepSeek maps `claude-haiku-*` to deepseek-flash and answers 200.
+    // Only an id it does not recognise at all is rejected with a 400 — a known
+    // Claude name is a different case. Pinning all three removes the gap
+    // instead of depending on a provider-side mapping nobody configured.
     it("pins every small/fast resolution path, not just the main model", () => {
       const env = build(DEEPSEEK);
       expect(env["ANTHROPIC_MODEL"]).toBe("deepseek-v4-flash");

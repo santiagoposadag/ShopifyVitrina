@@ -106,8 +106,10 @@ export function buildAgentEnv(config: Config): Record<string, string | undefined
     // All three, deliberately. The CLI resolves the utility tier through
     // different code paths depending on the call, and an unset one keeps asking
     // for the compiled-in Haiku default — which an Anthropic-compatible endpoint
-    // may serve with a silent substitution rather than an error, hiding the
-    // mistake behind a working reply from a model we did not choose.
+    // is not guaranteed to serve: DeepSeek rejects an unrecognised model id
+    // outright (HTTP 400, naming the valid ids), so the failure mode is a loud
+    // one, not a quiet substitution. Pinning all three removes the gap rather
+    // than relying on that error to be caught quickly.
     ANTHROPIC_DEFAULT_HAIKU_MODEL: config.smallFastModel,
     ANTHROPIC_SMALL_FAST_MODEL: config.smallFastModel,
     CLAUDE_CODE_SUBAGENT_MODEL: config.smallFastModel,
@@ -148,7 +150,7 @@ interface StreamMessage {
   session_id?: string;
   result?: string;
   message?: { content?: AssistantBlock[] };
-  /** Keyed by the model that actually answered — see TurnStats.servedModel. */
+  /** Keyed by the model id the turn was sent with — see TurnStats.requestedModel. */
   modelUsage?: Record<string, ModelUsage>;
   total_cost_usd?: number;
   duration_ms?: number;
@@ -169,12 +171,20 @@ function isRecord(v: unknown): v is StreamMessage {
  */
 export interface TurnStats {
   /**
-   * The model that answered, read from the keys of `modelUsage`. Asserted
-   * against the configured model rather than assumed: DeepSeek resolves an
-   * unrecognised model id to its own default SILENTLY, so a typo produces a
-   * perfectly good reply from the wrong model.
+   * NOT independent evidence of what answered — despite the name a field like
+   * this invites. It is read from the keys of `modelUsage`, which the CLI
+   * populates from the model id echoed back on the assistant message, and for
+   * DeepSeek that echo is the id we SENT, verbatim, not a normalised or
+   * resolved one (confirmed by comparing it against `GET /v1/models`, which
+   * DOES normalise). So this can only ever equal `configuredModel`; it cannot
+   * expose a substitution the endpoint made on its own. A genuinely
+   * unrecognised model id does not surface here either way — DeepSeek rejects
+   * it outright (HTTP 400, naming the valid ids), and a turn that fails before
+   * a result message ever arrives leaves this field unset, not wrong. The SDK
+   * exposes no field that independently confirms which model executed a
+   * request; this one only confirms which id we asked for.
    */
-  servedModel?: string;
+  requestedModel?: string;
   inputTokens?: number;
   outputTokens?: number;
   cacheReadInputTokens?: number;
@@ -212,7 +222,7 @@ interface TurnResult {
 function readStats(raw: StreamMessage): TurnStats {
   // One entry in practice; if a turn ever spans models, the joined key makes
   // that visible instead of quietly reporting whichever came first.
-  const servedModel = raw.modelUsage ? Object.keys(raw.modelUsage).join(",") : undefined;
+  const requestedModel = raw.modelUsage ? Object.keys(raw.modelUsage).join(",") : undefined;
   const usage = Object.values(raw.modelUsage ?? {}).reduce<ModelUsage>(
     (acc, u) => ({
       inputTokens: (acc.inputTokens ?? 0) + (u.inputTokens ?? 0),
@@ -225,7 +235,7 @@ function readStats(raw: StreamMessage): TurnStats {
   );
 
   return {
-    servedModel: servedModel || undefined,
+    requestedModel: requestedModel || undefined,
     ...usage,
     estimatedCostUsdAnthropicTable: raw.total_cost_usd,
     durationMs: raw.duration_ms,
@@ -414,8 +424,10 @@ function logTurn(
       endpointHost: endpointHost(config.agentBaseUrl),
       configuredModel: config.model,
       smallFastModel: config.smallFastModel,
-      // Compare these two: a mismatch means the endpoint substituted a model.
-      servedModel: stats.servedModel,
+      // NOT a substitution check — see TurnStats.requestedModel. It only
+      // confirms which id the turn was sent with, useful for spotting a stray
+      // config value, not for detecting anything the endpoint did on its own.
+      requestedModel: stats.requestedModel,
       maxThinkingTokens: config.maxThinkingTokens,
       extraBody: config.agentExtraBody,
       startedAt: startedAt.toISOString(),

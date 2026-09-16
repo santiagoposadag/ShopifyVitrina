@@ -55,7 +55,7 @@ Passed to the SDK subprocess by `buildAgentEnv` (`server/src/agent/agent.ts`):
 Three notes that are easy to get wrong:
 
 - The SDK's `env` option **replaces** `process.env` rather than merging. `buildAgentEnv` spreads `process.env` first; dropping that spread strips `PATH` and the subprocess never starts.
-- The small/fast tier is pinned through **all three** variables because the CLI resolves it via different code paths. An unset one keeps asking for the compiled-in `claude-haiku-4-5` — which DeepSeek answers by silently substituting its own model rather than erroring.
+- The small/fast tier is pinned through **all three** variables because the CLI resolves it via different code paths. An unset one keeps asking for the compiled-in `claude-haiku-4-5`, and that does **not** fail: DeepSeek maps `claude-haiku-*` and `claude-sonnet-*` to `deepseek-flash` (and `claude-opus-*` to `deepseek-v4-pro`) and answers HTTP 200. Measured, not assumed. Only an id DeepSeek does not recognise at all is rejected with a 400 — a known Claude name is a different case, and on this deployment it lands on the very model we wanted, which is exactly why it would go unnoticed. Pinning all three removes the dependency on a provider-side mapping nobody configured.
 - `config` is the single source of truth. A leftover shell variable cannot outvote it, and the unused credential is deleted outright.
 
 ---
@@ -91,9 +91,9 @@ Anthropic **requires** `budget_tokens` whenever thinking is enabled; DeepSeek ig
 
 Every turn logs one structured line (`agent turn complete`) carrying:
 
-`endpointHost` · `configuredModel` · **`servedModel`** · `inputTokens` · `outputTokens` · `cacheReadInputTokens` · `cacheCreationInputTokens` · `durationMs` · `durationApiMs` · `numTurns` · `maxThinkingTokens` · `extraBody` · `startedAt` · `utcHour`
+`endpointHost` · `configuredModel` · **`requestedModel`** · `inputTokens` · `outputTokens` · `cacheReadInputTokens` · `cacheCreationInputTokens` · `durationMs` · `durationApiMs` · `numTurns` · `maxThinkingTokens` · `extraBody` · `startedAt` · `utcHour`
 
-**Compare `configuredModel` against `servedModel` in production.** DeepSeek resolves an unrecognised model id to its own default *silently*, so a typo in `MODEL` produces perfectly good replies from a model you did not choose. `servedModel` is read from the response's usage map and is the only evidence of what actually answered.
+**`requestedModel` is not a substitution check.** It is read from the SDK's usage map, which is keyed by the model id echoed back on the assistant message — and for DeepSeek that echo is the id we SENT, unmodified, not a normalised one (`GET /v1/models` normalises; the completion response does not). So it can only ever equal `configuredModel`; it exists to catch a stray config value, not an endpoint substituting a model on its own. A typo in `MODEL` does not produce a quiet mismatch here — DeepSeek rejects an unrecognised id outright with HTTP 400, naming the valid ids.
 
 `estimatedCostUsdAnthropicTable` is named for what it is: the SDK computes it from a compiled-in **Anthropic** price table, so it is accurate for Anthropic and wrong for anyone else. Real per-provider cost is computed by the comparison harness from raw token counts.
 
@@ -132,7 +132,7 @@ All measured 2026-07-25 against `claude-haiku-4-5` and `deepseek-v4-flash`.
 
 | Question | Anthropic | DeepSeek |
 | --- | --- | --- |
-| `servedModel` matches what we configured | ✅ | ✅ `deepseek-v4-flash` |
+| `requestedModel` echoes what we configured | ✅ | ✅ `deepseek-v4-flash` |
 | Thinking block actually returned | ✅ | ✅ (393 chars) |
 | Configured `AGENT_EXTRA_BODY` accepted | n/a (empty) | ✅ HTTP 200 |
 | Thinking can be turned **off** | ✅ | ✅ 0 thinking blocks |
@@ -310,6 +310,6 @@ Two things the bar does not decide, which are judgement calls rather than measur
 - **Latency.** ~40 % slower at the median, structurally — DeepSeek reasons by default and its effort floor is `high`. Acceptable on a channel that already debounces bursts for 8–45 s, but it is a real regression and customers feel it.
 - **Provider risk.** A second external dependency, a rate card that has already deprecated two model ids this month, and an unconfirmed peak-pricing schedule.
 
-Before flipping production, run one more comparison in a different UTC window to sanity-check the peak-pricing question, and watch `servedModel` in the logs for the first day.
+Before flipping production, run one more comparison in a different UTC window to sanity-check the peak-pricing question, and watch the boot log and the first day's turns for a rejected model id (HTTP 400) rather than for a mismatch in `requestedModel` — that field only ever echoes what was configured.
 
 Cost per *token* is never the metric. A model at half the price that fails a third of the time is more expensive, and its failures are wrong prices on a public storefront.

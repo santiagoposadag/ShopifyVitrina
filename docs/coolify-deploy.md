@@ -276,16 +276,17 @@ Send the owner number a message from WhatsApp:
 The reply must match the Shopify admin. Then check the turn in the logs:
 
 ```json
-{"msg":"agent turn complete","servedModel":"deepseek-v4-flash",
+{"msg":"agent turn complete","requestedModel":"deepseek-v4-flash",
  "tools":"search_catalog","resultSubtype":"success","durationMs":15474}
 ```
 
 Three fields carry the whole verification:
 
-- **`servedModel`** — not optional to check. **DeepSeek resolves an
-  unrecognised model id to its own default silently**, so a typo in `MODEL`
-  produces perfectly good replies from a model you did not choose. This is the
-  only evidence of what actually answered.
+- **`requestedModel`** — worth a glance, but it is not a substitution check: it
+  only echoes the id the turn was sent with, so it can never disagree with
+  `MODEL`. A typo in `MODEL` does not produce a quiet wrong-model reply —
+  DeepSeek rejects an unrecognised id outright with HTTP 400, naming the valid
+  ids. That rejection, not this field, is what would tell you.
 - **`tools`** — a turn that answered about products with `tools: (none)` means
   the agent invented them.
 - **`resultSubtype: success`** — anything else means the turn ended without
