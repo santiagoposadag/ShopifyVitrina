@@ -1,0 +1,694 @@
+<title>Two Doors, One Inbox</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500;600&display=swap">
+<style>
+  :root {
+    --ground:      #F2F5F3;
+    --surface:     #FFFFFF;
+    --surface-sunk:#E8EDEA;
+    --ink:         #17242A;
+    --ink-soft:    #4A5C60;
+    --ink-faint:   #7B8D8F;
+    --rule:        #CBD6D4;
+    --rule-strong: #A3B4B2;
+    --owner:       #A8480B;
+    --owner-wash:  #F6E8DC;
+    --customer:    #1D6B67;
+    --customer-wash:#DDEBE9;
+    --temp:        #6B4E9B;
+    --temp-wash:   #E8E2F2;
+    --attn:        #B03A3F;
+    --ok:          #2D7A4E;
+
+    --f-display: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+    --f-body:    "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --f-mono:    "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #0F1817;
+      --surface:     #17211F;
+      --surface-sunk:#101A19;
+      --ink:         #E3EBE8;
+      --ink-soft:    #A7B8B6;
+      --ink-faint:   #7C8E8C;
+      --rule:        #2C3B39;
+      --rule-strong: #43534F;
+      --owner:       #E58A45;
+      --owner-wash:  #2E2018;
+      --customer:    #5FBDB4;
+      --customer-wash:#14262A;
+      --temp:        #AF95DE;
+      --temp-wash:   #221D2E;
+      --attn:        #E57B80;
+      --ok:          #6CC293;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:      #0F1817;
+    --surface:     #17211F;
+    --surface-sunk:#101A19;
+    --ink:         #E3EBE8;
+    --ink-soft:    #A7B8B6;
+    --ink-faint:   #7C8E8C;
+    --rule:        #2C3B39;
+    --rule-strong: #43534F;
+    --owner:       #E58A45;
+    --owner-wash:  #2E2018;
+    --customer:    #5FBDB4;
+    --customer-wash:#14262A;
+    --temp:        #AF95DE;
+    --temp-wash:   #221D2E;
+    --attn:        #E57B80;
+    --ok:          #6CC293;
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--f-body);
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding-inline: 20px;
+    padding-block: 48px 72px;
+    display: flex;
+    flex-direction: column;
+    gap: 56px;
+  }
+  .prose { max-width: 68ch; }
+
+  h1 {
+    font-family: var(--f-display);
+    font-weight: 600;
+    font-size: clamp(30px, 5vw, 46px);
+    line-height: 1.1;
+    letter-spacing: -0.015em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  h2 {
+    font-family: var(--f-display);
+    font-weight: 600;
+    font-size: clamp(20px, 3vw, 25px);
+    line-height: 1.25;
+    margin: 0 0 6px;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--f-body);
+    font-weight: 600;
+    font-size: 14px;
+    margin: 0 0 10px;
+  }
+  p { margin: 0 0 12px; }
+  p:last-child { margin-bottom: 0; }
+
+  .eyebrow {
+    font-family: var(--f-mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 0 0 12px;
+  }
+  .lede { font-size: 17px; color: var(--ink-soft); }
+  code, .mono { font-family: var(--f-mono); font-size: 0.9em; }
+  code { color: var(--ink-soft); }
+  strong { font-weight: 600; }
+
+  section { display: flex; flex-direction: column; gap: 20px; }
+
+  .scroll-x { overflow-x: auto; }
+  figure { margin: 0; display: flex; flex-direction: column; gap: 12px; }
+  figure svg { display: block; max-width: 100%; height: auto; min-width: 780px; }
+  figcaption { font-size: 13px; color: var(--ink-soft); max-width: 70ch; }
+
+  .grid { display: grid; gap: 16px; }
+  .g3 { grid-template-columns: repeat(3, 1fr); }
+  .g2 { grid-template-columns: repeat(2, 1fr); }
+  @media (max-width: 760px) { .g3, .g2 { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 18px 18px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .panel > p { font-size: 13.5px; color: var(--ink-soft); }
+
+  .store-head {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+    border-bottom: 1px solid var(--rule); padding-bottom: 8px;
+  }
+  .store-head .where { font-family: var(--f-mono); font-size: 11px; color: var(--ink-faint); }
+
+  ul.items { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+  ul.items li { font-family: var(--f-mono); font-size: 12.5px; color: var(--ink-soft); }
+  ul.items li span { font-family: var(--f-body); color: var(--ink-faint); font-size: 12px; }
+
+  .roles { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .roles { grid-template-columns: 1fr; } }
+  .role { border-radius: 3px; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+  .role.owner    { background: var(--owner-wash);    border: 1px solid var(--owner); }
+  .role.customer { background: var(--customer-wash); border: 1px solid var(--customer); }
+  .role .who { font-family: var(--f-mono); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; }
+  .role.owner .who    { color: var(--owner); }
+  .role.customer .who { color: var(--customer); }
+  .role .count { font-family: var(--f-display); font-size: 30px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; }
+  .tools { display: flex; flex-wrap: wrap; gap: 5px; }
+  .tool {
+    font-family: var(--f-mono); font-size: 11.5px;
+    background: var(--surface); border: 1px solid var(--rule);
+    border-radius: 2px; padding: 2px 6px; color: var(--ink-soft);
+  }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 9px 12px 9px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font-size: 11px; font-family: var(--f-mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-faint); font-weight: 500; }
+  td.path { font-family: var(--f-mono); font-size: 12.5px; white-space: nowrap; padding-right: 20px; }
+  td.note { color: var(--ink-soft); }
+
+  .note-block {
+    border-left: 2px solid var(--rule-strong);
+    padding: 2px 0 2px 16px;
+    color: var(--ink-soft);
+    font-size: 14px;
+    max-width: 68ch;
+  }
+  .note-block.warn { border-left-color: var(--owner); }
+  .note-block.temp { border-left-color: var(--temp); }
+
+  .tag {
+    display: inline-block; font-family: var(--f-mono); font-size: 10.5px;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    padding: 2px 7px; border-radius: 2px;
+    background: var(--temp-wash); color: var(--temp); border: 1px solid var(--temp);
+  }
+  .shift { display: flex; flex-direction: column; gap: 0; border-top: 1px solid var(--rule); }
+  .shift-row {
+    display: grid; grid-template-columns: minmax(0,1.3fr) minmax(0,1fr) minmax(0,1.6fr);
+    gap: 12px; align-items: baseline; padding: 12px 0; border-bottom: 1px solid var(--rule);
+    font-size: 13.5px;
+  }
+  .shift-row .who  { font-family: var(--f-mono); font-size: 12.5px; }
+  .shift-row .sym  { font-family: var(--f-mono); font-size: 12px; color: var(--ink-soft); }
+  .shift-row .move { font-family: var(--f-mono); font-size: 12.5px; }
+  .shift-row .was  { color: var(--attn); text-decoration: line-through; text-decoration-thickness: 1px; }
+  .shift-row .now  { color: var(--ok); }
+  @media (max-width: 760px) { .shift-row { grid-template-columns: 1fr; gap: 3px; } }
+  .note-block.attn { border-left-color: var(--attn); }
+  hr { border: 0; border-top: 1px solid var(--rule); margin: 0; }
+  .foot { font-size: 12.5px; color: var(--ink-faint); font-family: var(--f-mono); }
+</style>
+
+<div class="wrap">
+
+  <header class="prose">
+    <p class="eyebrow">Vitrina · architecture as built</p>
+    <h1>Two doors, one inbox</h1>
+    <p class="lede" style="margin-top:14px">
+      A WhatsApp-native inventory assistant for a Shopify store. Every inbound message —
+      from a person or from another agent — lands in the same durable table and travels the
+      same path. What differs is only who is asking, and that is decided by a row in a
+      database, never by anything the message says.
+    </p>
+  </header>
+
+  <section>
+    <div class="prose">
+      <h2>The path a message takes</h2>
+      <p style="color:var(--ink-soft)">
+        Two entry points, both authenticating before anything else. They converge on one
+        inbox because everything after that point — the retry budget, the ordering guarantee,
+        the crash replay — is a property of the table, not of the door.
+      </p>
+    </div>
+
+    <figure>
+      <div class="scroll-x">
+        <svg viewBox="0 0 1330 250" role="img"
+             aria-label="Two doors, the WhatsApp webhook and the agent-to-agent door, both persist to one inbox table. From there a message is claimed by the batcher, serialized by a per-conversation queue, run by the agent runtime, and delivered by the responder either back to a phone or to the calling agent.">
+          <defs>
+            <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"></path>
+            </marker>
+          </defs>
+
+          <!-- doors -->
+          <rect x="24" y="42" width="150" height="56" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect>
+          <text x="99" y="66" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">WhatsApp door</text>
+          <text x="99" y="84" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">inbox/webhook.ts</text>
+
+          <rect x="24" y="142" width="150" height="56" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect>
+          <text x="99" y="166" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">Agent door</text>
+          <text x="99" y="184" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">inbox/a2a.ts</text>
+
+          <!-- converge -->
+          <path d="M 174 70 L 214 70 L 214 104 L 242 104" fill="none" stroke="currentColor" stroke-width="1.3" marker-end="url(#ah)"></path>
+          <path d="M 174 170 L 214 170 L 214 136 L 242 136" fill="none" stroke="currentColor" stroke-width="1.3" marker-end="url(#ah)"></path>
+          <text x="208" y="34" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="currentColor" opacity="0.8">verify · persist · ACK</text>
+
+          <!-- inbox -->
+          <rect x="244" y="78" width="132" height="84" rx="2" fill="none" stroke="currentColor" stroke-width="2.2"></rect>
+          <text x="310" y="106" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">inbox table</text>
+          <text x="310" y="124" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">pending → done</text>
+          <text x="310" y="140" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">replayed on boot</text>
+
+          <!-- inbox → batcher -->
+          <line x1="376" y1="120" x2="442" y2="120" stroke="currentColor" stroke-width="1.3" marker-end="url(#ah)"></line>
+          <text x="409" y="112" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="currentColor" opacity="0.8">claim</text>
+
+          <!-- batcher -->
+          <rect x="444" y="92" width="146" height="56" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect>
+          <text x="517" y="114" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">batcher</text>
+          <text x="517" y="132" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">debounce a burst</text>
+
+          <line x1="590" y1="120" x2="652" y2="120" stroke="currentColor" stroke-width="1.3" marker-end="url(#ah)"></line>
+          <text x="621" y="112" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="currentColor" opacity="0.8">one turn</text>
+
+          <!-- queue -->
+          <rect x="654" y="92" width="128" height="56" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect>
+          <text x="718" y="114" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">queue</text>
+          <text x="718" y="132" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">per conversation</text>
+
+          <line x1="782" y1="120" x2="846" y2="120" stroke="currentColor" stroke-width="1.3" marker-end="url(#ah)"></line>
+          <text x="814" y="112" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="currentColor" opacity="0.8">in order</text>
+
+          <!-- runtime -->
+          <rect x="848" y="92" width="150" height="56" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect>
+          <text x="923" y="114" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">agent runtime</text>
+          <text x="923" y="132" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">agent/runtime.ts</text>
+
+          <line x1="998" y1="120" x2="1056" y2="120" stroke="currentColor" stroke-width="1.3" marker-end="url(#ah)"></line>
+          <text x="1027" y="112" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="currentColor" opacity="0.8">returns</text>
+
+          <!-- responder -->
+          <rect x="1058" y="92" width="150" height="56" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect>
+          <text x="1133" y="114" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">responder</text>
+          <text x="1133" y="132" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">picks the route</text>
+
+          <!-- exits -->
+          <path d="M 1208 108 L 1240 108 L 1240 78 L 1268 78" fill="none" stroke="currentColor" stroke-width="1.3" marker-end="url(#ah)"></path>
+          <path d="M 1208 132 L 1240 132 L 1240 162 L 1268 162" fill="none" stroke="currentColor" stroke-width="1.3" marker-end="url(#ah)"></path>
+          <text x="1276" y="82" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">the phone</text>
+          <text x="1276" y="166" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">calling agent</text>
+
+          <!-- side call: shopify -->
+          <line x1="923" y1="148" x2="923" y2="196" stroke="currentColor" stroke-width="1.1" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="933" y="202" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.8">tools → Shopify Admin API</text>
+
+          <!-- record -->
+          <line x1="517" y1="148" x2="517" y2="196" stroke="currentColor" stroke-width="1.1" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="527" y="202" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.8">records inbound</text>
+          <line x1="1133" y1="148" x2="1133" y2="196" stroke="currentColor" stroke-width="1.1" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="1006" y="222" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.8">records outbound, after the send</text>
+        </svg>
+      </div>
+      <figcaption>
+        Solid arrows carry the message; dashed arrows are writes to durable state that happen
+        alongside it. The two dashed writes at the bottom are the conversation record — inbound
+        as soon as the text is final, outbound only after the send actually succeeded.
+      </figcaption>
+    </figure>
+
+    <div class="note-block">
+      The queue serializes by conversation, and that is what makes claiming a batch safe:
+      two batches for one conversation must never overlap. Delivery is at-least-once, so a
+      failed batch returns its rows to <code>pending</code> and retries on a backoff until
+      the attempt budget is spent.
+    </div>
+  </section>
+
+  <hr>
+
+  <section>
+    <div class="prose">
+      <h2>Where state actually lives</h2>
+      <p style="color:var(--ink-soft)">
+        This is the fact that reorganizes everything else: <strong>the catalog is Shopify.</strong>
+        There is no local products table, no storefront of our own, and no sync layer. SQLite
+        holds only what Shopify has nowhere to put.
+      </p>
+    </div>
+
+    <div class="grid g3">
+      <div class="panel">
+        <div class="store-head">
+          <h3 style="margin:0">Shopify</h3>
+          <span class="where">source of truth</span>
+        </div>
+        <ul class="items">
+          <li>products <span>· variants</span></li>
+          <li>prices <span>· decimal strings</span></li>
+          <li>inventory <span>· per location</span></li>
+          <li>product photos</li>
+          <li>checkout <span>· cart permalink</span></li>
+        </ul>
+        <p>We never take payment, quote shipping, or reserve stock. What a buyer pays is settled by Shopify.</p>
+      </div>
+
+      <div class="panel">
+        <div class="store-head">
+          <h3 style="margin:0">SQLite</h3>
+          <span class="where">/data/vitrina.db</span>
+        </div>
+        <ul class="items">
+          <li>inbox <span>· the work queue</span></li>
+          <li>conversation_messages <span>· the record</span></li>
+          <li>sessions <span>· agent_id + conversation</span></li>
+          <li>assignments <span>· who is an owner</span></li>
+          <li>contacts · leads · pending_media</li>
+          <li>agent_registry <span>· a2a credentials</span></li>
+          <li>test_roster <span>· temporary</span></li>
+          <li>knowledge_index <span>· derived, FTS5</span></li>
+        </ul>
+        <p>Every table is the source of truth for itself, except the knowledge index — rebuilt from its files at boot.</p>
+      </div>
+
+      <div class="panel">
+        <div class="store-head">
+          <h3 style="margin:0">Volumes</h3>
+          <span class="where">docker named volumes</span>
+        </div>
+        <ul class="items">
+          <li>vitrina-data <span>· db + media</span></li>
+          <li>vitrina-sessions <span>· SDK transcripts</span></li>
+          <li>vitrina-whatsapp <span>· bridge pairing</span></li>
+        </ul>
+        <p>
+          Losing <span class="mono">vitrina-sessions</span> costs conversation history, not business
+          data. <span class="mono">vitrina-whatsapp</span> is the one that is not disposable — and it
+          is only used by the bridge transport.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <hr>
+
+  <section>
+    <div class="prose">
+      <h2>The role boundary</h2>
+      <p style="color:var(--ink-soft)">
+        Role comes from the <span class="mono">assignments</span> table, read on every message, so a
+        change takes effect with no restart. It is never read from what the person writes — the
+        sales persona explicitly ignores “I am the owner”. The boundary is enforced twice, and
+        both layers have pinning tests.
+      </p>
+    </div>
+
+    <div class="roles">
+      <div class="role owner">
+        <span class="who">Owner → vitrina-inventario</span>
+        <div style="display:flex;align-items:baseline;gap:10px">
+          <span class="count">15</span>
+          <span style="font-size:13px;color:var(--ink-soft)">tools, declared in <span class="mono">agent.yaml</span></span>
+        </div>
+        <div class="tools">
+          <span class="tool">search_catalog</span><span class="tool">get_product_any_status</span>
+          <span class="tool">list_products</span><span class="tool">create_product</span>
+          <span class="tool">update_product</span><span class="tool">add_variant</span>
+          <span class="tool">delete_product</span><span class="tool">get_inventory</span>
+          <span class="tool">adjust_inventory</span><span class="tool">attach_pending_photos</span>
+          <span class="tool">list_locations</span><span class="tool">list_leads</span>
+          <span class="tool">save_lead</span><span class="tool">build_cart</span>
+          <span class="tool">search_knowledge</span>
+        </div>
+        <p style="font-size:13px;color:var(--ink-soft);margin:0">
+          Plus a knowledge base in two tiers: a glossary held inline on every turn, and operations
+          notes searched on demand.
+        </p>
+      </div>
+
+      <div class="role customer">
+        <span class="who">Customer → vitrina-ventas</span>
+        <div style="display:flex;align-items:baseline;gap:10px">
+          <span class="count">4</span>
+          <span style="font-size:13px;color:var(--ink-soft)">tools, and nothing else</span>
+        </div>
+        <div class="tools">
+          <span class="tool">search_catalog</span><span class="tool">get_product</span>
+          <span class="tool">save_lead</span><span class="tool">build_cart</span>
+        </div>
+        <p style="font-size:13px;color:var(--ink-soft);margin:0">
+          <span class="mono">get_product</span> is a different registry entry from the owner’s: it
+          answers “no product found” for anything not <span class="mono">ACTIVE</span>, because
+          confirming that a hidden product exists is itself a leak.
+        </p>
+      </div>
+    </div>
+
+    <div class="note-block warn">
+      No role is consulted anywhere in the tool registry. The served set is the agent definition’s
+      own <span class="mono">tools[]</span> — a property of the agent, never of the caller. A
+      customer reaching an owner tool would be a stranger repricing a live store.
+    </div>
+  </section>
+
+  <hr>
+
+  <section>
+    <div class="prose">
+      <h2>Agents are data, not code</h2>
+      <p style="color:var(--ink-soft)">
+        Each assistant is a directory on disk, validated at boot. A typo in a definition, a prompt
+        naming a tool it was never given, or a knowledge document that does not fit its declared
+        budget fails the deploy rather than the first message.
+      </p>
+    </div>
+    <div class="scroll-x">
+      <table>
+        <thead>
+          <tr><th>Path</th><th>What it holds</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="path">agents/vitrina-inventario/agent.yaml</td><td class="note">Tool list, roles served, reach, session and turn limits</td></tr>
+          <tr><td class="path">agents/vitrina-inventario/prompt.md</td><td class="note">The persona, in Spanish</td></tr>
+          <tr><td class="path">agents/vitrina-inventario/knowledge/glosario.md</td><td class="note">Inline tier — carried on every turn</td></tr>
+          <tr><td class="path">agents/vitrina-inventario/knowledge/operaciones.md</td><td class="note">Searchable tier — indexed into FTS5, queried on demand</td></tr>
+          <tr><td class="path">agents/vitrina-ventas/agent.yaml</td><td class="note">Four tools, the customer role</td></tr>
+          <tr><td class="path">agents/vitrina-ventas/prompt.md</td><td class="note">The sales persona</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <hr>
+
+  <section>
+    <div class="prose">
+      <h2>Components, by what they own</h2>
+    </div>
+    <div class="grid g2">
+      <div class="panel">
+        <h3>Transports — <span class="mono" style="font-weight:400;color:var(--ink-faint)">whatsapp/</span></h3>
+        <p>
+          Two implementations behind one <span class="mono">WhatsAppChannel</span> interface, chosen
+          by <span class="mono">WHATSAPP_PROVIDER</span>. That seam is what makes the choice a
+          variable and a restart rather than a revert.
+        </p>
+        <ul class="items">
+          <li>cloud.ts <span>· Meta Business Cloud API — currently live</span></li>
+          <li>bridge.ts <span>· Go sidecar, paired as a linked device</span></li>
+        </ul>
+      </div>
+
+      <div class="panel">
+        <h3>Shopify layer — <span class="mono" style="font-weight:400;color:var(--ink-faint)">shopify/</span></h3>
+        <ul class="items">
+          <li>client.ts <span>· mints its own token, retries throttling</span></li>
+          <li>catalog.ts <span>· the operations</span></li>
+          <li>rank.ts <span>· Spanish relevance scoring</span></li>
+          <li>cache.ts <span>· a corpus for ranking, not a mirror</span></li>
+        </ul>
+        <p>
+          Two failure shapes both arrive as HTTP 200 here: cost throttling, and a business-rule
+          rejection returned as a response <em>field</em>.
+        </p>
+      </div>
+
+      <div class="panel">
+        <h3>Tools — <span class="mono" style="font-weight:400;color:var(--ink-faint)">tools/</span></h3>
+        <p>
+          A registry keyed by definition, plus five packs that state policy. What they may reach is
+          assembled once in the composition root: catalog, leads, media, knowledge, agents.
+        </p>
+      </div>
+
+      <div class="panel">
+        <h3>Ops levers — <span class="mono" style="font-weight:400;color:var(--ink-faint)">data/*.ts</span></h3>
+        <ul class="items">
+          <li>role-assignments <span>· who is an owner, now</span></li>
+          <li>agent-credentials <span>· the a2a door</span></li>
+          <li>purge-sessions <span>· drop customer history</span></li>
+          <li>backup <span>· consistent snapshot under writes</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <hr>
+
+  <section>
+    <div class="prose">
+      <h2>How the code is layered</h2>
+      <p style="color:var(--ink-soft)">
+        The pipeline above is how a message <em>moves</em>. This is how the modules
+        <em>depend</em> — a different cut of the same system. It is modular by
+        responsibility with ports at the boundaries that matter, not a strict layered
+        architecture, and the figure says so rather than drawing it cleaner than it is.
+      </p>
+    </div>
+
+    <figure>
+      <div class="scroll-x">
+        <svg viewBox="0 0 960 490" role="img"
+     aria-label="Module layers of server/src. index.ts sits on top as the composition root, imported by nothing. Below it: admin, inbox, egress and whatsapp; then knowledge, tools and agent; then data and shopify; and at the bottom the shared leaves anyone may import. shopify implements the port that tools defines. Two cycles remain, both running through the tool registry: tools with agent, and tools with knowledge.">
+  <defs>
+    <marker id="lh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"></path></marker>
+    <marker id="lha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" style="fill: var(--attn)"></path></marker>
+  </defs>
+
+  <rect x="380" y="14" width="200" height="44" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect><text x="480" y="33" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">index.ts</text><text x="480" y="49" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">composition root</text>
+  <line x1="480" y1="58" x2="480" y2="96" stroke="currentColor" stroke-width="1.3"></line>
+  <line x1="145" y1="96" x2="835" y2="96" stroke="currentColor" stroke-width="1.3"></line>
+  <line x1="145" y1="96" x2="145" y2="118" stroke="currentColor" stroke-width="1.3" marker-end="url(#lh)"></line>
+  <line x1="375" y1="96" x2="375" y2="118" stroke="currentColor" stroke-width="1.3" marker-end="url(#lh)"></line>
+  <line x1="605" y1="96" x2="605" y2="118" stroke="currentColor" stroke-width="1.3" marker-end="url(#lh)"></line>
+  <line x1="835" y1="96" x2="835" y2="118" stroke="currentColor" stroke-width="1.3" marker-end="url(#lh)"></line>
+  <text x="492" y="84" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.8">wires every layer · imported by nothing</text>
+
+  <rect x="60" y="120" width="170" height="44" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect><text x="145" y="139" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">admin</text><text x="145" y="155" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">temporary console</text>
+  <rect x="290" y="120" width="170" height="44" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect><text x="375" y="139" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">inbox</text><text x="375" y="155" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">the two doors</text>
+  <rect x="520" y="120" width="170" height="44" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect><text x="605" y="139" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">egress</text><text x="605" y="155" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">responder</text>
+  <rect x="750" y="120" width="170" height="44" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect><text x="835" y="139" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">whatsapp</text><text x="835" y="155" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">two transports</text>
+
+  <line x1="460" y1="142" x2="518" y2="142" stroke="currentColor" stroke-width="1.3" marker-end="url(#lh)"></line>
+
+  <rect x="75" y="230" width="170" height="44" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect><text x="160" y="249" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">knowledge</text><text x="160" y="265" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">two tiers</text>
+  <rect x="315" y="230" width="170" height="44" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect><text x="400" y="249" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">tools</text><text x="400" y="265" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">registry · packs · ports</text>
+  <rect x="555" y="230" width="170" height="44" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect><text x="640" y="249" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">agent</text><text x="640" y="265" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">runtime · definitions</text>
+
+  <line x1="575" y1="230" x2="462" y2="165" stroke="currentColor" stroke-width="1.2" marker-end="url(#lh)"></line>
+  <text x="560" y="194" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.8">principalId</text>
+
+  <line x1="315" y1="245" x2="247" y2="245" style="stroke: var(--attn)" stroke-width="1.6" marker-end="url(#lha)"></line>
+  <line x1="245" y1="261" x2="313" y2="261" style="stroke: var(--attn)" stroke-width="1.6" marker-end="url(#lha)"></line>
+  <line x1="485" y1="245" x2="553" y2="245" style="stroke: var(--attn)" stroke-width="1.6" marker-end="url(#lha)"></line>
+  <line x1="555" y1="261" x2="487" y2="261" style="stroke: var(--attn)" stroke-width="1.6" marker-end="url(#lha)"></line>
+  <text x="432" y="219" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" style="fill: var(--attn)">cycles through the registry</text>
+
+  <rect x="60" y="340" width="170" height="44" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect><text x="145" y="359" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">data</text><text x="145" y="375" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">SQLite · ops levers</text>
+  <rect x="315" y="340" width="170" height="44" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect><text x="400" y="359" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="currentColor">shopify</text><text x="400" y="375" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.65">client · catalog</text>
+
+  <path d="M 300 164 L 300 300 L 145 300 L 145 338" fill="none" stroke="currentColor" stroke-width="1.2" marker-end="url(#lh)"></path>
+  <text x="152" y="294" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.8">persists</text>
+  <path d="M 60 142 L 36 142 L 36 362 L 58 362" fill="none" stroke="currentColor" stroke-width="1.1" marker-end="url(#lh)"></path>
+  <line x1="575" y1="274" x2="232" y2="352" stroke="currentColor" stroke-width="1.1" marker-end="url(#lh)"></line>
+
+  <line x1="400" y1="274" x2="400" y2="338" stroke="currentColor" stroke-width="1.3" marker-end="url(#lh)"></line>
+  <text x="392" y="297" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.8">calls</text>
+  <line x1="462" y1="340" x2="462" y2="276" stroke="currentColor" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#lh)"></line>
+  <text x="470" y="330" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" opacity="0.8">implements the port</text>
+
+  <rect x="36" y="420" width="884" height="56" rx="2" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 3" opacity="0.7"></rect>
+  <text x="52" y="438" font-family="IBM Plex Mono, monospace" font-size="10" fill="currentColor" opacity="0.65">SHARED LEAVES · ANYONE MAY IMPORT</text>
+  <text x="140" y="462" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="currentColor">config</text>
+  <text x="260" y="462" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="currentColor">types</text>
+  <text x="380" y="462" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="currentColor">router</text>
+  <text x="560" y="462" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" style="fill: var(--ok)">a2a-protocol</text>
+  <text x="760" y="462" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" style="fill: var(--ok)">tool-mentions</text>
+</svg>
+      </div>
+      <figcaption>
+        Solid arrows are value imports; the dashed one is a type-only import that only looks
+        backwards — <span class="mono">tools/ports.ts</span> defines the interface and
+        <span class="mono">shopify/</span> implements it, which is dependency inversion working as
+        intended (<span class="mono">data/tool-ports.ts</span> and the knowledge store implement it the
+        same way). The composition root wires every layer, not only the first row. Green leaves
+        landed today. Red marks the two cycles that remain.
+      </figcaption>
+    </figure>
+  </section>
+
+  <hr>
+
+  <section>
+    <div class="prose">
+      <h2>What moved today</h2>
+      <p style="color:var(--ink-soft)">
+        Three value imports pointed backwards: a concept owned by more than one layer, defined
+        inside one of them. Each now lives in a shared leaf both sides read.
+      </p>
+    </div>
+
+    <div class="shift">
+      <div class="shift-row">
+        <span class="who">data/purge.ts</span>
+        <span class="sym">isAgentConversationKey</span>
+        <span class="move"><span class="was">inbox/envelope.ts</span> → <span class="now">a2a-protocol.ts</span></span>
+      </div>
+      <div class="shift-row">
+        <span class="who">tools/packs/agents.ts</span>
+        <span class="sym">MAX_HOP</span>
+        <span class="move"><span class="was">inbox/a2a.ts</span> → <span class="now">a2a-protocol.ts</span></span>
+      </div>
+      <div class="shift-row">
+        <span class="who">knowledge/store.ts</span>
+        <span class="sym">undeclaredToolMentions</span>
+        <span class="move"><span class="was">agent/definition.ts</span> → <span class="now">tool-mentions.ts</span></span>
+      </div>
+    </div>
+
+    <div class="note-block">
+      <span class="mono">a2a-protocol.ts</span> holds the agent-to-agent vocabulary whole — the
+      prefix, the key minter, the predicate and the hop cap. Moving only the predicate would
+      have put a format's writer in one file and its reader in another, which is worse than the
+      leak it closes. Relocations only: the prefix is still <span class="mono">a2a:</span>, the cap
+      is still 3, and every existing assertion passed unchanged.
+    </div>
+
+    <div class="note-block attn">
+      <strong>Not closed:</strong> two cycles run through <span class="mono">tools/registry.ts</span>.
+      It reads tool-name constants from <span class="mono">agent/definition.ts</span> while the
+      runtime builds the tool server from the registry, and it registers the knowledge tool while
+      that tool uses the registry's shared factory. Both are shallow and both are real; they are
+      recorded as debt rather than drawn away.
+    </div>
+  </section>
+
+  <hr>
+
+  <section>
+    <div class="prose">
+      <h2><span class="tag">temporary</span></h2>
+      <h2 style="margin-top:8px">The test console</h2>
+      <p style="color:var(--ink-soft)">
+        Built so the store owner can experience both flows from their own phone during the manual
+        test period. It is designed to be removed by deleting files and rows, and it announces
+        itself in the boot log on every restart.
+      </p>
+    </div>
+    <div class="note-block temp">
+      Its containment argument is that there is nothing to contain: there is no phone parameter
+      anywhere in its surface. The phone comes from the roster row the bearer token matched, so
+      no request can name another number — there is no field to put one in. An empty roster
+      answers 404 on every path, including the page itself.
+    </div>
+  </section>
+
+  <hr>
+
+  <footer class="foot">
+    835 tests · 43 files · server/ (Fastify + Claude Agent SDK) + bridge/ (Go, whatsmeow) ·
+    catalog in Shopify · SQLite for everything else
+  </footer>
+
+</div>
