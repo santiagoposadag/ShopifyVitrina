@@ -701,27 +701,48 @@ export function recordOutboundMessage(
 export function listConversationMessages(
   db: DB,
   conversationKey: string,
-  limit?: number,
+  options: {
+    limit?: number;
+    /**
+     * Narrow to ONE persona's side of this key.
+     *
+     * OMITTED MEANS BOTH, which is what every caller before the admin console
+     * wanted and what the purge tests assert on. A phone holds a separate
+     * conversation with each agent — that is the whole point of the session key
+     * — so a READER rendering a thread must pass this or it interleaves the
+     * owner's stock edits with the same person's customer-side messages into
+     * one conversation that never happened. A caller COUNTING or PURGING
+     * usually wants both, and deleteConversationMessages requires its own scope
+     * separately for a reason documented on it.
+     */
+    agentId?: string;
+  } = {},
 ): ConversationMessage[] {
+  const { limit, agentId } = options;
+  // Built rather than branched, so the agent scope and the limit compose: the
+  // four combinations were two nested ifs and a duplicated SELECT before.
+  const where = agentId === undefined ? `conversation_key = ?` : `conversation_key = ? AND agent_id = ?`;
+  const params: (string | number)[] = agentId === undefined ? [conversationKey] : [conversationKey, agentId];
+
   if (limit === undefined) {
     return db
       .prepare(
         `SELECT * FROM conversation_messages
-         WHERE conversation_key = ?
+         WHERE ${where}
          ORDER BY occurred_at ASC, id ASC`,
       )
-      .all(conversationKey) as ConversationMessage[];
+      .all(...params) as ConversationMessage[];
   }
   return db
     .prepare(
       `SELECT * FROM (
          SELECT * FROM conversation_messages
-         WHERE conversation_key = ?
+         WHERE ${where}
          ORDER BY occurred_at DESC, id DESC
          LIMIT ?
        ) ORDER BY occurred_at ASC, id ASC`,
     )
-    .all(conversationKey, limit) as ConversationMessage[];
+    .all(...params, limit) as ConversationMessage[];
 }
 
 /**
@@ -772,6 +793,329 @@ function outboundDedupeKey(conversationKey: string, turnKey: string, body: strin
     .update(JSON.stringify([conversationKey, turnKey, body]))
     .digest("hex");
   return `out:${digest}`;
+}
+
+/**
+ * Every conversation_key that has messages, regardless of whether a `sessions`
+ * row still points at it.
+ *
+ * THE POINT IS THE INDEPENDENCE FROM `sessions`. purgeCustomerSessions is
+ * driven by listSessions, which filters `agent_session_id IS NOT NULL` — so a
+ * conversation whose session expired and was swept keeps its words through
+ * every future purge run, undeletable rather than merely late (DEUDA #8, raised
+ * to High by the indefinite retention in #7). This is what that loop unions
+ * against, and it is here rather than as raw SQL inside purge.ts so the table
+ * keeps the single seam every other caller goes through.
+ *
+ * The agent id comes back WITH the key, not separately: deleteConversationMessages
+ * requires a scope for a reason that is documented at length on it — one phone
+ * can hold rows under both personas, and an unscoped delete removes the spared
+ * one's history. A caller handed only keys would have to invent that scope.
+ */
+export function listConversationKeysWithMessages(
+  db: DB,
+): { conversation_key: string; agent_id: string }[] {
+  return db
+    .prepare(
+      `SELECT DISTINCT conversation_key, agent_id FROM conversation_messages
+       ORDER BY conversation_key, agent_id`,
+    )
+    .all() as { conversation_key: string; agent_id: string }[];
+}
+
+/** One conversation as the admin console's index lists them. */
+export interface ConversationSummary {
+  conversation_key: string;
+  agent_id: string;
+  message_count: number;
+  inbound_count: number;
+  /** Newest first is what the index sorts by; this is that value. */
+  last_occurred_at: string;
+  first_occurred_at: string;
+  /** The most recent message's direction and words, for the index's preview line. */
+  last_direction: MessageDirection;
+  last_body: string;
+}
+
+/**
+ * Every conversation, newest activity first.
+ *
+ * GROUPED BY (conversation_key, agent_id), not by key alone. One phone holds a
+ * separate conversation with each persona — that is the whole point of the
+ * session key — and collapsing them would interleave an owner's stock edits
+ * with the same person's customer-side test messages into one thread that never
+ * happened.
+ *
+ * The preview comes from a CORRELATED SUBQUERY rather than an aggregate over
+ * the group: SQLite's bare-column-with-max() would pick the row matching
+ * max(occurred_at), but occurred_at has second resolution here and ties are
+ * broken by id everywhere else in this file — so the aggregate form would show
+ * a different "last message" than opening the thread does, which reads as a
+ * bug in whichever of the two the reader believes.
+ *
+ * NO SEARCH PARAMETER, deliberately. A LIKE over `body` is the obvious next
+ * feature and it is also the one that would make this query scan every stored
+ * word on every page load; the index serves the grouping and nothing else.
+ * When it is wanted, it wants FTS5 like the knowledge index, not a LIKE bolted
+ * on here.
+ */
+export function listConversations(
+  db: DB,
+  options: { limit: number; offset?: number } = { limit: 50 },
+): ConversationSummary[] {
+  return db
+    .prepare(
+      `SELECT
+         conversation_key,
+         agent_id,
+         COUNT(*) AS message_count,
+         SUM(CASE WHEN direction = 'inbound' THEN 1 ELSE 0 END) AS inbound_count,
+         MAX(occurred_at) AS last_occurred_at,
+         MIN(occurred_at) AS first_occurred_at,
+         (SELECT direction FROM conversation_messages m
+           WHERE m.conversation_key = c.conversation_key AND m.agent_id = c.agent_id
+           ORDER BY m.occurred_at DESC, m.id DESC LIMIT 1) AS last_direction,
+         (SELECT body FROM conversation_messages m
+           WHERE m.conversation_key = c.conversation_key AND m.agent_id = c.agent_id
+           ORDER BY m.occurred_at DESC, m.id DESC LIMIT 1) AS last_body
+       FROM conversation_messages c
+       GROUP BY conversation_key, agent_id
+       ORDER BY last_occurred_at DESC, conversation_key ASC
+       LIMIT ? OFFSET ?`,
+    )
+    .all(options.limit, options.offset ?? 0) as ConversationSummary[];
+}
+
+/** How many conversations exist, so a reader knows whether a page is the last one. */
+export function countConversations(db: DB): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM
+         (SELECT 1 FROM conversation_messages GROUP BY conversation_key, agent_id)`,
+    )
+    .get() as { n: number };
+  return row.n;
+}
+
+// --- Tool trace ---------------------------------------------------------------
+
+// What the assistant DID, beside what it said. See the conversation_tool_calls
+// block in db.ts for why this is its own table rather than a third direction on
+// conversation_messages.
+//
+// The writer here is wrapped around every tool handler in one place
+// (tools/registry.ts buildToolServer), so a tool added to a pack is traced
+// without anything remembering to trace it.
+
+export type ToolOutcome = "ok" | "error";
+
+export interface ToolCall {
+  id: number;
+  dedupe_key: string;
+  conversation_key: string;
+  agent_id: string;
+  turn_key: string;
+  /** Position in the turn's call sequence, from 1. See db.ts on why not time. */
+  ordinal: number;
+  tool_name: string;
+  /** The arguments as JSON text, capped — see MAX_TOOL_INPUT_CHARS. */
+  input: string;
+  /** What the model was handed back, capped — see MAX_TOOL_RESULT_CHARS. */
+  result: string;
+  /** 'error' means the handler THREW. A business refusal is 'ok' with the refusal in `result`. */
+  outcome: ToolOutcome;
+  duration_ms: number;
+  occurred_at: string;
+}
+
+/**
+ * How much of a tool result is kept.
+ *
+ * GENEROUS ON PURPOSE. The whole reason this trace exists is to answer "where
+ * did that number come from", and a cap that routinely cut the answer in half
+ * would leave a trace that looks complete and is not. The largest thing any
+ * shipped tool returns is a catalog search or a product listing, both of which
+ * sit comfortably under this — so in normal operation nothing is cut at all,
+ * and the cap is a bound against a pathological result rather than a budget.
+ *
+ * The input cap is smaller because the largest input is a create_product
+ * payload, which is an order of magnitude smaller than a listing.
+ */
+const MAX_TOOL_RESULT_CHARS = 16_000;
+const MAX_TOOL_INPUT_CHARS = 4_000;
+
+/**
+ * Cut to a cap, leaving a MARKER saying it was cut.
+ *
+ * A silent truncation is the failure mode worth spending a line on: a trace
+ * that ends mid-sentence reads as a tool that returned less than it did, and
+ * the person reading it is by definition trying to find out what the tool
+ * returned. The marker names how much is missing, so the reader knows whether
+ * they are looking at a rounding error or at most of the answer.
+ */
+function cap(value: string, limit: number): string {
+  if (value.length <= limit) return value;
+  const dropped = value.length - limit;
+  return `${value.slice(0, limit)}\n… [truncado: ${dropped} caracteres más]`;
+}
+
+/**
+ * Serialise a tool's arguments without letting a bad value lose the call.
+ *
+ * JSON.stringify throws on a circular structure and returns undefined for a
+ * bare function or symbol. Neither should reach here — every tool's input is
+ * JSON off the wire — but this runs inside the wrapper around a live tool call,
+ * and a trace writer that can throw would turn an observability feature into a
+ * way to fail a turn. The failure is recorded as itself instead.
+ */
+function serialiseToolInput(input: unknown): string {
+  try {
+    return cap(JSON.stringify(input) ?? String(input), MAX_TOOL_INPUT_CHARS);
+  } catch (err) {
+    return `[no serializable: ${err instanceof Error ? err.message : String(err)}]`;
+  }
+}
+
+/**
+ * Record one tool call. Returns false when this exact call was already recorded.
+ *
+ * IDEMPOTENT ON (conversation, turn, ordinal, name, input, result), hashed —
+ * the same shape and the same reasoning as recordOutboundMessage, because it
+ * retries against the same thing. A failed batch re-runs the whole turn under
+ * the SAME turn key (it is minted from the first inbox row, stable by
+ * construction), so:
+ *
+ *  - A replay that calls the same tools with the same arguments and gets the
+ *    same answers collapses onto the rows already written. The work really was
+ *    the same work, and one row is the honest record of it.
+ *  - A replay that DIVERGES — the store changed between attempts, the model
+ *    chose different arguments — writes new rows from the point of divergence.
+ *    That divergence is the single most valuable thing this table can show, and
+ *    keying on (turn, ordinal) alone would hide it behind the first attempt.
+ *
+ * THE AGENT IS PART OF THE KEY, even though a turn key is unique enough on its
+ * own today (it is minted from an inbox row id, and no two agents share one).
+ * "Unique enough today" is the property that quietly stops holding: one
+ * conversation_key legitimately holds rows under BOTH personas everywhere else
+ * in this schema, and every other scope over this data is mandatory-by-agent
+ * for that reason. A key that omitted it would file the second persona's
+ * identical call as a duplicate of the first and drop it from the trace, with
+ * nothing to show it had.
+ *
+ * Hashed rather than concatenated for the reason spelled out on
+ * outboundDedupeKey: a conversation key contains colons, so a separator that
+ * occurs inside a field lets two different tuples collide — and here a
+ * collision silently drops a real call from the trace.
+ */
+export function recordToolCall(
+  db: DB,
+  input: {
+    conversationKey: string;
+    agentId: string;
+    turnKey: string;
+    ordinal: number;
+    toolName: string;
+    /** The raw arguments; serialised and capped here, not by the caller. */
+    toolInput: unknown;
+    result: string;
+    outcome: ToolOutcome;
+    durationMs: number;
+  },
+): boolean {
+  const serialisedInput = serialiseToolInput(input.toolInput);
+  const cappedResult = cap(input.result, MAX_TOOL_RESULT_CHARS);
+  const dedupeKey = `tool:${createHash("sha256")
+    .update(
+      JSON.stringify([
+        input.conversationKey,
+        input.agentId,
+        input.turnKey,
+        input.ordinal,
+        input.toolName,
+        serialisedInput,
+        cappedResult,
+      ]),
+    )
+    .digest("hex")}`;
+
+  const info = db
+    .prepare(
+      `INSERT OR IGNORE INTO conversation_tool_calls
+         (dedupe_key, conversation_key, agent_id, turn_key, ordinal,
+          tool_name, input, result, outcome, duration_ms)
+       VALUES
+         (@dedupe_key, @conversation_key, @agent_id, @turn_key, @ordinal,
+          @tool_name, @input, @result, @outcome, @duration_ms)`,
+    )
+    .run({
+      dedupe_key: dedupeKey,
+      conversation_key: input.conversationKey,
+      agent_id: input.agentId,
+      turn_key: input.turnKey,
+      ordinal: input.ordinal,
+      tool_name: input.toolName,
+      input: serialisedInput,
+      result: cappedResult,
+      outcome: input.outcome,
+      // Rounded, because the column is an INTEGER and a fractional millisecond
+      // from performance.now() would otherwise be stored by SQLite's own
+      // coercion rather than by a decision here.
+      duration_ms: Math.round(input.durationMs),
+    });
+  return info.changes > 0;
+}
+
+/**
+ * One conversation's tool calls, in the order they ran.
+ *
+ * Ordered by time FIRST and then by (turn, ordinal), which is what makes the
+ * sequence read correctly at both scales. Time alone is not enough: occurred_at
+ * has second resolution, several calls of one turn routinely land inside one
+ * second, and a trace where a write precedes the read it was based on is worse
+ * than no trace — so the ordinal breaks those ties and restores the order the
+ * model issued them in. Conversations are serialized per key
+ * (`PerConversationQueue`), so two turns cannot interleave in time here and the
+ * turn-level order is unambiguous.
+ *
+ * Scoped by agent as well as by conversation, matching listConversations: the
+ * two personas on one phone are two threads and their traces must not merge.
+ */
+export function listConversationToolCalls(
+  db: DB,
+  conversationKey: string,
+  agentId: string,
+): ToolCall[] {
+  return db
+    .prepare(
+      `SELECT * FROM conversation_tool_calls
+       WHERE conversation_key = ? AND agent_id = ?
+       ORDER BY occurred_at ASC, turn_key ASC, ordinal ASC, id ASC`,
+    )
+    .all(conversationKey, agentId) as ToolCall[];
+}
+
+/**
+ * Forget one conversation's tool trace. Returns the number of rows deleted.
+ *
+ * SCOPED BY AGENT AND MANDATORY, for the identical reason
+ * deleteConversationMessages is: one conversation_key can hold rows under both
+ * personas, and an unscoped delete would take the spared one's trace with it.
+ * There is no unscoped form to fall back to.
+ *
+ * This MUST be called wherever deleteConversationMessages is. A purge that
+ * removed a customer's words and left the tool calls behind would leave their
+ * product questions, their name and whatever a save_lead captured sitting in a
+ * table the operator believes they cleared — the failure that matters most
+ * here, since these are third parties under Ley 1581 (DEUDA #7).
+ */
+export function deleteConversationToolCalls(
+  db: DB,
+  conversationKey: string,
+  agentId: string,
+): number {
+  return db
+    .prepare(`DELETE FROM conversation_tool_calls WHERE conversation_key = ? AND agent_id = ?`)
+    .run(conversationKey, agentId).changes;
 }
 
 // --- Pending media ----------------------------------------------------------

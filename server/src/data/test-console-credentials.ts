@@ -6,6 +6,7 @@ import {
   listRosterEntries,
   rotateRosterToken,
 } from "./test-roster.js";
+import { buildConsoleLink, type ConsoleLink } from "./console-link.js";
 import { openDb, type DB } from "./db.js";
 import { isEntryPoint } from "./entry-point.js";
 
@@ -61,51 +62,18 @@ function parseAddOptions(argv: string[]): AddOptions {
   return { label };
 }
 
-export interface RosterLink {
-  /** The full URL, ready to hand to the phone's holder — or null, see `placeholder`. */
-  link: string | null;
-  /** The path alone, always present, so it can still be relayed with a placeholder base. */
-  path: string;
-  /** True when PUBLIC_BASE_URL is missing or does not look like a real deployed host. */
-  placeholder: boolean;
-}
-
-/**
- * Hosts that are real syntactically but never reachable from a phone. Not an
- * exhaustive list — a false negative here just means an operator gets a link
- * that does not work and notices immediately; a false positive would hide a
- * working link behind an unnecessary warning, which is the worse failure.
- */
-function isPlaceholderHost(hostname: string): boolean {
-  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0") return true;
-  return hostname === "example.com" || hostname.endsWith(".example.com") || hostname.endsWith(".example");
-}
+export type RosterLink = ConsoleLink;
 
 /**
  * Builds the console link for a minted token.
  *
- * THE TOKEN RIDES THE URL FRAGMENT, NEVER A QUERY STRING. Fastify runs with
- * `logger: true` (server/src/index.ts), so a `?t=` token would be written
- * into the request log on every single page load the holder makes. A fragment
- * is never sent to the server at all — the browser keeps it client-side — so
- * it never reaches that log, nor any proxy or CDN log in front of it. Do NOT
- * "tidy" this into a query string.
+ * The composition — and the reason the token rides the URL FRAGMENT rather
+ * than a query string — now lives in data/console-link.ts, shared with the
+ * admin console. This stays as the name the rest of this module and its test
+ * use, and as the one place the test console's own route is written down.
  */
 export function buildRosterLink(token: string, publicBaseUrl: string | undefined): RosterLink {
-  const path = `/test-console#t=${token}`;
-  const trimmed = publicBaseUrl?.trim();
-  if (!trimmed) return { link: null, path, placeholder: true };
-
-  let url: URL;
-  try {
-    url = new URL(trimmed);
-  } catch {
-    return { link: null, path, placeholder: true };
-  }
-  if (isPlaceholderHost(url.hostname)) return { link: null, path, placeholder: true };
-
-  const base = trimmed.replace(/\/+$/, "");
-  return { link: `${base}${path}`, path, placeholder: false };
+  return buildConsoleLink("/test-console", token, publicBaseUrl);
 }
 
 function printLink(phone: string, token: string, label: string): void {

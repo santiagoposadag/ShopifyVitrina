@@ -395,6 +395,122 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
       recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- WHAT THE ASSISTANT DID, beside what it said.
+    --
+    -- conversation_messages answers "what words were exchanged". It cannot
+    -- answer "where did that price come from" or "did it actually write to the
+    -- store", and those are the questions someone monitoring an assistant over
+    -- a LIVE STORE is really asking: a reply saying "listo, quedó en $80.000"
+    -- and a reply saying that while set_price silently refused are the same row
+    -- over there and different facts here.
+    --
+    -- A SEPARATE TABLE, NOT A THIRD direction ON conversation_messages. Two
+    -- reasons and both are load-bearing. direction and kind carry CHECK
+    -- constraints, and SQLite cannot widen a CHECK with ALTER TABLE — reaching
+    -- that shape means rebuilding the table on a running deployment, which is
+    -- the one migration this schema has gone out of its way to avoid everywhere
+    -- else. And a tool call is not a message: it was neither sent nor received,
+    -- nobody read it, and filing it as 'inbound' or 'outbound' would make
+    -- "what did we send this person" answer wrongly in the other direction.
+    --
+    -- THE JOIN IS turn_key, not a foreign key. Every message answered by one
+    -- turn already carries it (see conversation_messages), so a reader
+    -- interleaves the two tables on it and gets question → tools → answer in
+    -- the order it happened. No foreign key for the same reason
+    -- source_inbox_id is not one: these rows outlive what they point at.
+    --
+    -- ordinal IS THE CALL SEQUENCE WITHIN THE TURN, from 1. Occurrence time has
+    -- second resolution like every other stamp here, and a turn routinely fires
+    -- several tools inside one second — so time alone would shuffle them, and a
+    -- trace where the write precedes the read it was based on is worse than no
+    -- trace.
+    --
+    -- outcome IS ONLY 'ok' OR 'error', and the missing third value is
+    -- deliberate. A business-rule refusal (factory.ts failure) returns text to
+    -- the model exactly like a success does, so nothing at the wrapper can tell
+    -- the two apart without pattern-matching the words — a guess that would be
+    -- wrong silently. 'error' means the handler THREW, which is the one
+    -- distinction that is mechanical. The refusal is still fully visible: it is
+    -- in result, verbatim.
+    --
+    -- SIZE IS BOUNDED HERE AND NOWHERE ELSE, by the recorder's own caps (see
+    -- repo.ts recordToolCall). A search over the catalog returns every matching
+    -- line, and this table takes one row per call rather than one per turn, so
+    -- it grows faster than conversation_messages by a wide margin — which makes
+    -- the retention decision in DEUDA #7 compound here first. Truncation writes
+    -- its own marker: a cut that left no trace would read as a tool that
+    -- returned less than it did.
+    --
+    -- A new table, so IF NOT EXISTS IS the migration for a database that
+    -- predates it: nothing here alters an existing table.
+    CREATE TABLE IF NOT EXISTS conversation_tool_calls (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      dedupe_key TEXT NOT NULL UNIQUE,
+      -- The same key space as conversation_messages and sessions: one
+      -- conversation is one thing everywhere, so a purge that names a key
+      -- reaches all of them.
+      conversation_key TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      turn_key TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      -- The name the MODEL called, already stripped of its mcp__vitrina__
+      -- prefix — that prefix is transport, and it is the same on every row.
+      tool_name TEXT NOT NULL,
+      -- The arguments, as JSON. Stored as the text we serialised rather than
+      -- re-encoded on read, so a value that failed to serialise is visible as
+      -- such instead of arriving as an empty object.
+      input TEXT NOT NULL,
+      -- What the tool handed back to the model, verbatim up to the cap.
+      result TEXT NOT NULL,
+      outcome TEXT NOT NULL CHECK (outcome IN ('ok','error')),
+      duration_ms INTEGER NOT NULL,
+      occurred_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- WHO MAY READ EVERY CONVERSATION IN THIS DEPLOYMENT.
+    --
+    -- THIS TABLE IS THE SWITCH, exactly like agent_registry: the admin console
+    -- authenticates by looking a presented token up in here, so an empty table
+    -- matches nothing and the console answers 404 on every path. There is no
+    -- second enabling flag, for the reason stated on agent_registry — two
+    -- switches for one thing is how one ends up in the wrong position.
+    --
+    -- A THIRD CREDENTIAL TABLE, and the separation is the containment. This one
+    -- CANNOT share test_roster: that roster's whole shape is one token → one
+    -- phone, which is what lets the test console have no phone parameter
+    -- anywhere in its surface. An admin credential is the opposite by
+    -- definition — it reads everyone — so putting the two in one table would
+    -- turn every test link into a reader of every customer's conversation, and
+    -- nothing in either console's code would show it. Three tables, three key
+    -- spaces, none of them a superset of another.
+    --
+    -- KEYED BY AN OPERATOR-CHOSEN NAME, NOT A PHONE. An admin is not a
+    -- WhatsApp principal: they never receive a message, no role is resolved for
+    -- them, and they may not have a number in this system at all. A phone
+    -- primary key here would invite exactly the wrong question — "is this admin
+    -- an owner?" — which nothing answers and nothing should.
+    --
+    -- WHAT A TOKEN HERE GRANTS IS READ-ONLY AND THE CONSOLE ENFORCES IT: the
+    -- admin surface has no write route at all. That is a much larger read than
+    -- the test console's (every customer's number and every word they typed,
+    -- third parties under Ley 1581 — see DEUDA #7), which is why the link is a
+    -- bearer credential to be treated like one and why remove takes effect on
+    -- the next request with no restart.
+    --
+    -- token_hash NOT NULL and UNIQUE, name the PRIMARY KEY, label operator-typed
+    -- and rendered with textContent only — same reasoning as test_roster, which
+    -- states it at length.
+    --
+    -- A new table, so IF NOT EXISTS IS the migration for a database that
+    -- predates it: nothing here alters an existing table.
+    CREATE TABLE IF NOT EXISTS admin_roster (
+      name TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE,
+      label TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      rotated_at TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
     -- Every batch flush claims one CONVERSATION's un-settled rows. The index
     -- that serves that claim is created in migrate() below, not here: on a
@@ -414,6 +530,18 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
     -- can never run against a table that does not have the columns yet.
     CREATE INDEX IF NOT EXISTS idx_conversation_messages_key
       ON conversation_messages(conversation_key, occurred_at, id);
+    -- The conversation INDEX is what the console's list page reads: it groups
+    -- by conversation_key and takes the newest occurred_at per group, which is
+    -- this index scanned backwards rather than a sort over the whole table.
+    -- Same three columns and the same reasoning as the messages index above,
+    -- including the id tie-break at second resolution.
+    CREATE INDEX IF NOT EXISTS idx_conversation_tool_calls_key
+      ON conversation_tool_calls(conversation_key, occurred_at, id);
+    -- Reading ONE conversation joins the two tables on turn_key, once per
+    -- rendered thread. Without this that join is a full scan of the faster
+    -- growing of the two tables on every page view.
+    CREATE INDEX IF NOT EXISTS idx_conversation_tool_calls_turn
+      ON conversation_tool_calls(turn_key, ordinal);
     CREATE INDEX IF NOT EXISTS idx_pending_media_phone ON pending_media(phone);
   `);
 

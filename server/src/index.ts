@@ -13,6 +13,8 @@ import { countAgentCredentials } from "./data/agent-registry.js";
 // src/admin/test-console.ts.
 import { registerTestConsole } from "./admin/test-console.js";
 import { countRosterEntries } from "./data/test-roster.js";
+import { registerAdminConsole } from "./admin/console.js";
+import { countAdminEntries } from "./data/admin-roster.js";
 import {
   countAssignedOwners,
   listPhonesWithRole,
@@ -449,7 +451,19 @@ async function main(): Promise<void> {
       // different act: delete its registry row.
       if (person && ctx.role !== "owner" && !config.customerAgentEnabled) {
         try {
-          await channel.sendText(person.phone, CUSTOMER_UNAVAILABLE_NOTICE);
+          // Through the RESPONDER, not straight to the channel, so it reaches
+          // the durable conversation record like every other reply. This is a
+          // message the person genuinely received; sending it around the
+          // recorder made "what did we send this person" answer wrongly in
+          // exactly the case someone reviewing a complaint would be looking at
+          // — a customer who says nobody ever answered them, and a record that
+          // agrees with them.
+          //
+          // STILL BEST-EFFORT. deliver() throws on a transport failure so a
+          // real turn's batch retries; here the batch is deliberately consumed,
+          // and retrying a whole burst to re-send a static notice would spend
+          // the attempt budget on a message that carries no answer anyway.
+          await respond.deliver(CUSTOMER_UNAVAILABLE_NOTICE);
         } catch {
           // Best effort.
         }
@@ -471,7 +485,12 @@ async function main(): Promise<void> {
           app.log.warn({ phone: person.phone, decision }, "agent turn rate limited");
           if (decision === "phone_limited" && rateLimiter.shouldNotify(person.phone)) {
             try {
-              await channel.sendText(person.phone, RATE_LIMIT_NOTICE);
+              // Recorded, for the same reason the kill-switch notice above is:
+              // the person received it, so the record has to say so. Best
+              // effort for the same reason too — this batch is consumed either
+              // way, and rate limiting exists to STOP work rather than to
+              // generate a retry.
+              await respond.deliver(RATE_LIMIT_NOTICE);
             } catch {
               // Best effort.
             }
@@ -518,7 +537,26 @@ async function main(): Promise<void> {
       try {
         // Present for a WhatsApp principal by construction; the batcher fills
         // it from the row the webhook wrote.
-        if (ctx.phone) await channel.sendText(ctx.phone, AGENT_ERROR_APOLOGY);
+        //
+        // Delivered through the RESPONDER so it lands in the conversation
+        // record. This is the most important of the three notices to have
+        // recorded: it is the only outbound message a turn produces when the
+        // turn failed, so a record that omits it shows a person's question with
+        // no reply at all — indistinguishable from a message that was never
+        // processed, which is the opposite diagnosis from the true one.
+        //
+        // The responder is built HERE rather than reused from onMessage: this
+        // callback is reached on an attempt that may have thrown before that
+        // one existed, and the context carries everything it needs.
+        if (ctx.phone) {
+          await responders
+            .for(
+              ctx.principal,
+              { agentId: ctx.agentId, turnKey: ctx.turnKey },
+              { conversationKey: ctx.conversationKey },
+            )
+            .deliver(AGENT_ERROR_APOLOGY);
+        }
       } catch {
         // Best effort; the failure is already in the logs.
       }
@@ -559,6 +597,30 @@ async function main(): Promise<void> {
   // enabling flag, because two switches for one thing is how one of them ends
   // up in the wrong position.
   registerTestConsole(app, { db });
+
+  // The admin console (src/admin/console.ts): read-only access to every
+  // conversation and to what the assistant did inside each turn. Registered
+  // unconditionally and CLOSED until an operator adds an `admin_roster` row,
+  // on the same "one switch, and it is the data" principle as the two doors
+  // above.
+  registerAdminConsole(app, { db });
+  const admins = countAdminEntries(db);
+  if (admins > 0) {
+    // WARN, next to ECHO_MODE and the test console, and for a reason of its
+    // own: what is open here is every customer's phone number and every word
+    // they typed — third parties under Ley 1581 who are not party to this
+    // deployment's decisions. A standing read of that should announce itself on
+    // every restart rather than be something an operator has to remember
+    // enabling.
+    app.log.warn(
+      `ADMIN CONSOLE IS OPEN to ${admins} credential(s) at GET /admin — each of them can read ` +
+        "EVERY conversation in this store: every customer's phone number, every message, and " +
+        "every catalog operation performed on their behalf. It is read-only. Revoke a " +
+        "credential with `admin-credentials remove <name>`; it stops working on its next " +
+        "request, with no restart.",
+    );
+  }
+
   const testNumbers = countRosterEntries(db);
   if (testNumbers > 0) {
     // WARN, next to ECHO_MODE and for the same reason: this is a door that

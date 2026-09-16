@@ -3,8 +3,8 @@ import type { FastifyBaseLogger } from "fastify";
 import type { Config } from "../config.js";
 import { principalId } from "../inbox/envelope.js";
 import type { DB } from "../data/db.js";
-import { clearSessionId, getSessionId, setSessionId } from "../data/repo.js";
-import { buildToolServer, MCP_SERVER_NAME } from "../tools/registry.js";
+import { clearSessionId, getSessionId, recordToolCall, setSessionId } from "../data/repo.js";
+import { buildToolServer, MCP_SERVER_NAME, type ToolCallRecorder } from "../tools/registry.js";
 import type { ToolPorts } from "../tools/ports.js";
 import type { KnowledgeBase } from "../knowledge/store.js";
 import type { AgentDefinition } from "./definition.js";
@@ -256,10 +256,49 @@ async function runQuery(
   incomingText: string,
   resumeId: string | undefined,
 ): Promise<TurnResult> {
-  const { config, knowledge, ports, log } = deps;
+  const { config, db, knowledge, ports, log } = deps;
+  // The durable trace of what the tools actually did and returned. Wired HERE
+  // rather than inside the registry for the same reason ConversationRecorder is
+  // wired at the composition root: the registry stays free of a database and
+  // every test of it stays free of one too.
+  //
+  // THE FAILURE IS CAUGHT AND LOGGED, NEVER PROPAGATED — the port's contract
+  // says implementations must not throw, and this is the implementation. By the
+  // time this runs the tool has already executed, quite possibly a write
+  // against a live store; letting a failed INSERT throw would fail the turn,
+  // retry the batch and run that write a second time. An untraced call is the
+  // far cheaper mistake, and logging at ERROR is what keeps it from being a
+  // silent one. Same shape and same reasoning as responder.ts recordSafely.
+  const toolRecorder: ToolCallRecorder = {
+    record: (call) => {
+      try {
+        recordToolCall(db, {
+          conversationKey: ctx.conversationKey,
+          agentId: ctx.agentId,
+          turnKey: ctx.turnKey,
+          ordinal: call.ordinal,
+          toolName: call.toolName,
+          toolInput: call.input,
+          result: call.result,
+          outcome: call.outcome,
+          durationMs: call.durationMs,
+        });
+      } catch (err) {
+        log.error(
+          { err, tool: call.toolName, conversationKey: ctx.conversationKey },
+          "a tool call was not recorded",
+        );
+      }
+    },
+  };
   // Exactly `definition.tools[]`, in the order the definition lists them. The
   // role on the context selects nothing here any more.
-  const { server, toolNames } = buildToolServer({ definition, ctx, ports });
+  const { server, toolNames } = buildToolServer({
+    definition,
+    ctx,
+    ports,
+    recorder: toolRecorder,
+  });
   // Names in call order. The turn summary reports them, because "it took 52
   // seconds" is not actionable and "it called search_catalog nine times" is.
   const toolsUsed: string[] = [];

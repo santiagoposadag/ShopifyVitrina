@@ -4,7 +4,13 @@ import { isOwner } from "../config.js";
 import { AGENT_IDS } from "../router.js";
 import { countAssignedOwners, roleForPhone } from "./assignments.js";
 import type { DB } from "./db.js";
-import { clearSessionId, deleteConversationMessages, listSessions } from "./repo.js";
+import {
+  clearSessionId,
+  deleteConversationMessages,
+  deleteConversationToolCalls,
+  listConversationKeysWithMessages,
+  listSessions,
+} from "./repo.js";
 import { deleteTranscript, sweepOrphanedTranscripts } from "./transcripts.js";
 
 /**
@@ -33,6 +39,23 @@ export interface PurgeResult {
    * session row alone is not where a customer's words live.
    */
   purgedMessages: number;
+  /**
+   * Durable `conversation_tool_calls` rows deleted for purged customers.
+   *
+   * Counted separately from the messages rather than summed into them: this is
+   * what the assistant DID on that customer's behalf, and an operator verifying
+   * that a person was forgotten needs to see both numbers move. One message and
+   * nine tool calls is a normal turn, so a single total would read as if far
+   * more had been said than was.
+   */
+  purgedToolCalls: number;
+  /**
+   * Conversations whose words outlived their session row and that this run
+   * reached anyway — the second pass below. Non-zero on the first run after
+   * this pass existed (it clears a backlog no previous run could touch) and
+   * normally zero afterwards.
+   */
+  purgedOrphanPairs: number;
   /** Orphaned transcripts collected, or null when no root was configured. */
   swept: number | null;
 }
@@ -169,23 +192,51 @@ export function purgeCustomerSessions(db: DB, config: PurgeConfig, root?: string
   // it, even though its row and its transcript survive — a session with no
   // history is not what "spared" is supposed to mean.
   let purgedMessages = 0;
+  let purgedToolCalls = 0;
   for (const session of customers) {
     purgedMessages += deleteConversationMessages(db, session.conversation_key, session.agent_id);
+    // THE TOOL TRACE GOES WITH THE WORDS, always. It holds what the customer
+    // asked about, whatever a save_lead captured of their name and note, and
+    // the catalog operations performed on their behalf — so a purge that
+    // removed the messages and left this behind would report a customer
+    // forgotten while their data sat in a table the operator does not know to
+    // look in. Scoped by agent for the identical reason the line above is.
+    purgedToolCalls += deleteConversationToolCalls(db, session.conversation_key, session.agent_id);
     clearSessionId(db, session.agent_id, session.conversation_key);
     if (root) deleteTranscript(root, session.agent_session_id);
   }
 
-  // KNOWN GAP, not silently patched: a conversation can hold
-  // `conversation_messages` rows with no `sessions` row at all — the session
-  // expired and was swept, or a purge from before this deletion existed
-  // already cleared it while the messages (which have no timer of their own,
-  // see db.ts) persisted. This loop is driven by listSessions, so such a
-  // conversation is invisible to it and its messages survive every future run
-  // of this tool. Closing that requires enumerating conversation_keys that
-  // have messages independently of the sessions table — repo.ts has no such
-  // function today, and reaching around it with raw SQL from here would break
-  // the one seam every other caller of this table goes through. Reported
-  // upstream rather than worked around.
+  // THE SECOND PASS: conversations whose words outlived their session row.
+  //
+  // A conversation can hold `conversation_messages` rows with no `sessions` row
+  // at all — the session expired and was swept, or an earlier purge cleared it
+  // while the messages (which have no timer of their own, see db.ts) persisted.
+  // The loop above is driven by listSessions, so every one of those was
+  // invisible to it and survived every run of this tool. With retention
+  // indefinite, "survived" meant undeletable rather than merely late.
+  //
+  // THE SAME THREE PREDICATES DECIDE, in the same conservative direction:
+  // an agent-to-agent key is kept, a key that reads as an owner is kept, and a
+  // pair recorded under the owner AGENT is kept whatever the phone reads as
+  // now. A pair already handled above deletes nothing here — the DELETE is
+  // idempotent and simply reports zero — so the two passes cannot double-count.
+  //
+  // Driven by (conversation_key, agent_id) PAIRS rather than keys, because that
+  // is the scope deleteConversationMessages requires and for the reason it
+  // documents: one phone can hold rows under both personas, and a key-only
+  // sweep would take the spared persona's history with it.
+  let purgedOrphanPairs = 0;
+  for (const orphan of listConversationKeysWithMessages(db)) {
+    if (isAgentConversationKey(orphan.conversation_key)) continue;
+    if (isOwnerKey(orphan.conversation_key)) continue;
+    if (isOwnerAgentSession(orphan.agent_id)) continue;
+    const messages = deleteConversationMessages(db, orphan.conversation_key, orphan.agent_id);
+    const toolCalls = deleteConversationToolCalls(db, orphan.conversation_key, orphan.agent_id);
+    if (messages > 0 || toolCalls > 0) purgedOrphanPairs += 1;
+    purgedMessages += messages;
+    purgedToolCalls += toolCalls;
+  }
+
   const swept = root
     ? sweepOrphanedTranscripts(
         root,
@@ -199,6 +250,8 @@ export function purgeCustomerSessions(db: DB, config: PurgeConfig, root?: string
     kept: sessions.length - customers.length - agents.length,
     keptAgent: agents.length,
     purgedMessages,
+    purgedToolCalls,
+    purgedOrphanPairs,
     swept,
   };
 }

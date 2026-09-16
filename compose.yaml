@@ -364,6 +364,44 @@ services:
       - vitrina-data:/data
     profiles: ["ops"]
 
+  # Who may READ every conversation in this store, and the ONLY way onto that
+  # roster — see server/src/data/admin-roster.ts and docs/admin-console.md. The
+  # admin_roster table IS the switch: with no rows GET /admin answers 404 on
+  # every path, the same shape as agent-credentials and test-console above.
+  #   docker compose --profile ops run --rm admin-credentials list
+  #   docker compose --profile ops run --rm admin-credentials add santiago --label "Portátil"
+  #   docker compose --profile ops run --rm admin-credentials remove santiago
+  #
+  # `entrypoint` rather than `command` so `run --rm admin-credentials add ...`
+  # APPENDS its arguments instead of replacing the whole command.
+  #
+  # A SEPARATE ROSTER FROM test-console ABOVE, and that separation is the
+  # containment: a test-console token flips ONE phone's own role, an admin token
+  # reads EVERY customer's phone number and every word they typed. One table for
+  # both would silently make each test link the second thing, invisibly from
+  # either console's code.
+  #
+  # Needs OWNER_PHONE_NUMBERS for the same reason as its neighbours (legacy
+  # session migration on open), and PUBLIC_BASE_URL to print a working link
+  # rather than a bare path.
+  #
+  # The token is printed ONCE, inside a link, and only its SHA-256 is stored, so
+  # a lost link is replaced with `rotate`, never looked up. `remove` revokes on
+  # the link's next request, with no restart.
+  admin-credentials:
+    image: vitrina-server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      <<: *data-env
+      OWNER_PHONE_NUMBERS: ${OWNER_PHONE_NUMBERS:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+    entrypoint: ["node", "server/dist/data/admin-credentials.js"]
+    volumes:
+      - vitrina-data:/data
+    profiles: ["ops"]
+
 volumes:
   # A named volume (not a host bind mount): the image already creates /data
   # owned by the non-root `node` user (see the Dockerfiles). A named volume
