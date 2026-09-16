@@ -148,8 +148,14 @@ services:
       BATCH_MAX_WAIT_MS: ${BATCH_MAX_WAIT_MS:-}
       BATCH_MEDIA_DEBOUNCE_MS: ${BATCH_MEDIA_DEBOUNCE_MS:-}
       BATCH_MEDIA_MAX_WAIT_MS: ${BATCH_MEDIA_MAX_WAIT_MS:-}
-    ports:
-      - "3001:3001"
+    # Reachable on the compose network only. On Coolify the proxy routes the
+    # domain to this port over the docker network, so publishing it on the host
+    # adds nothing but a plain-HTTP path around TLS — and a failed deploy
+    # ("port is already allocated") when anything else on the server holds 3001.
+    # Local runs publish it through compose.override.yaml, which `docker compose`
+    # loads on its own and Coolify never reads: it passes `-f compose.yaml`.
+    expose:
+      - "3001"
     volumes:
       - vitrina-data:/data
       # The Agent SDK stores its session transcripts under its home directory,

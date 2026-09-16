@@ -1,0 +1,10 @@
+# Local development only. `docker compose` merges this file automatically when
+# it sits next to compose.yaml and no `-f` is given. Coolify always passes
+# `-f compose.yaml`, so none of this reaches a deployment.
+#
+# The server publishes its port here and NOT in compose.yaml: on a shared
+# deployment host 3001 may already be taken, and the proxy never needed it.
+services:
+  server:
+    ports:
+      - "3001:3001"

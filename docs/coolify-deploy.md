@@ -47,6 +47,17 @@ in the file, restrict it: `bridge` has no job here, and `backup`,
 `purge-sessions`, `agent-credentials` and `role-assignments` sit behind compose
 profiles and never start with `up` anyway.
 
+`bridge` has no profile, so a plain `up` starts it. Restrict it in the
+application's **General** settings (Coolify adds the `-f` and `--env-file`
+flags itself):
+
+| Field | Value |
+| --- | --- |
+| Custom Build Command | `docker compose build server` |
+| Custom Start Command | `docker compose up -d server` |
+
+Coolify still lists `bridge` among the parsed services. Give it no domain.
+
 ### Volumes — both persistent, both named
 
 | Volume | Mount | Losing it costs |
@@ -63,8 +74,17 @@ anything about volumes.
 ### Domain and port
 
 `server` listens on **3001** and needs a public domain: Meta must be able to
-POST to it. Note the URL — it is both `PUBLIC_BASE_URL` and the callback URL
-you give Meta in §5.
+POST to it. Set the domain on the `server` service as
+`https://<your-domain>:3001` — the port tells the proxy which container port to
+route to; the public URL has none. Note the URL — it is both `PUBLIC_BASE_URL`
+and the callback URL you give Meta in §5.
+
+`compose.yaml` does **not** publish 3001 on the host (`expose`, not `ports`).
+The proxy reaches the container over the docker network, and a host binding
+only fails the deploy with `Bind for 0.0.0.0:3001 failed: port is already
+allocated` when anything else on the server holds that port. Local runs get
+the binding from `compose.override.yaml`, which Coolify never reads because it
+passes `-f compose.yaml` explicitly.
 
 ---
 
