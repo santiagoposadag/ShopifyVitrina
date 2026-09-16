@@ -457,7 +457,7 @@ describe("reading a conversation back", () => {
       });
     }
 
-    expect(listConversationMessages(db, PHONE, 2).map((m) => m.body)).toEqual([
+    expect(listConversationMessages(db, PHONE, { limit: 2 }).map((m) => m.body)).toEqual([
       "reply 3",
       "reply 4",
     ]);

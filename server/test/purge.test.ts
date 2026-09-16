@@ -275,20 +275,18 @@ describe("purgeCustomerSessions durable message deletion", () => {
     expect(listConversationMessages(db, OTHER_CUSTOMER)).toHaveLength(0);
   });
 
-  // The hard case: a session can expire and be swept (or be cleared by an
-  // earlier purge) while its messages persist by design — deleteConversationMessages
-  // never runs on a timer. The loop this tool runs iterates SESSIONS
-  // (listSessions), so a conversation with no session row is invisible to it.
+  // The hard case, and it USED TO BE A DOCUMENTED GAP: a session can expire and
+  // be swept (or be cleared by an earlier purge) while its messages persist by
+  // design — deleteConversationMessages never runs on a timer. The session loop
+  // iterates listSessions, so a conversation with no session row was invisible
+  // to it and its words survived every run, which with indefinite retention
+  // meant undeletable rather than merely late.
   //
-  // Reaching these belongs here in principle — the whole point of this slice is
-  // that a purge's name should match what it does — but repo.ts exposes no way
-  // to enumerate conversation_keys that have messages independently of the
-  // sessions table, and hacking that up with raw SQL from outside repo.ts would
-  // bypass the one seam every other caller in this codebase goes through. So
-  // this case is documented as a KNOWN GAP rather than silently patched: it
-  // requires a new repo.ts function (see purge.ts's comment at the loop) before
-  // it can close.
-  it("cannot reach a customer's messages once its session row is gone (documented gap)", () => {
+  // It closes with the second pass in purge.ts, driven by
+  // listConversationKeysWithMessages — the repo-layer enumeration whose absence
+  // was the reason the gap stayed open. Still through the seam, still no raw
+  // SQL from outside repo.ts.
+  it("reaches a customer's messages even once its session row is gone", () => {
     const ORPHAN_KEY = "573009990000";
     seedMessage(SALES, ORPHAN_KEY, "nadie me va a leer");
     // No setSessionId for ORPHAN_KEY: this conversation has messages but no
@@ -296,8 +294,48 @@ describe("purgeCustomerSessions durable message deletion", () => {
 
     const result = purgeCustomerSessions(db, CONFIG, root);
 
-    expect(listConversationMessages(db, ORPHAN_KEY)).toHaveLength(1); // NOT purged — see comment above
+    expect(listConversationMessages(db, ORPHAN_KEY)).toHaveLength(0);
+    // `purged` still counts SESSION rows dropped, and this conversation had
+    // none — the orphan pass is reported on its own field so the two facts stay
+    // distinguishable.
     expect(result.purged).toBe(1); // only CUSTOMER, the one with a session row
+    expect(result.purgedOrphanPairs).toBe(1);
+  });
+
+  // The other half of the same rule: the orphan pass must be as conservative as
+  // the session loop it extends. An owner's words are spared whether or not a
+  // session row still points at them — otherwise closing the gap above would
+  // have turned "a purge never touches an owner" into "a purge never touches an
+  // owner who is currently mid-conversation", which is a different and much
+  // weaker promise.
+  it("spares an owner's orphaned messages, and an agent exchange's", () => {
+    const ORPHAN_OWNER = OWNER; // in the allowlist, no session row of its own here
+    // An a2a key with no session row either — the correlation id is what no
+    // allowlist can ever contain, so isOwner would read it as a customer's.
+    const ORPHAN_AGENT = agentConversationKey("super-agent", INVENTORY, "corr-orphan");
+    seedMessage(INVENTORY, ORPHAN_OWNER, "mi inventario");
+    seedMessage(SALES, ORPHAN_AGENT, "otra maquina");
+
+    purgeCustomerSessions(db, CONFIG, root);
+
+    expect(listConversationMessages(db, ORPHAN_OWNER)).not.toHaveLength(0);
+    expect(listConversationMessages(db, ORPHAN_AGENT)).not.toHaveLength(0);
+  });
+
+  // A phone demoted after holding an owner conversation: the pair is recorded
+  // under the OWNER AGENT, and that is what decides, exactly as it does in the
+  // session loop. Without this the orphan pass would delete owner-mode history
+  // the session loop would have kept — the two passes disagreeing about the
+  // same conversation.
+  it("spares an orphaned conversation recorded under the owner agent", () => {
+    const DEMOTED = "573007778888"; // not in the allowlist: reads as a customer now
+    seedMessage(INVENTORY, DEMOTED, "cuando era dueno");
+    seedMessage(SALES, DEMOTED, "ahora soy cliente");
+
+    purgeCustomerSessions(db, CONFIG, root);
+
+    expect(listConversationMessages(db, DEMOTED, { agentId: INVENTORY })).toHaveLength(1);
+    expect(listConversationMessages(db, DEMOTED, { agentId: SALES })).toHaveLength(0);
   });
 });
 
