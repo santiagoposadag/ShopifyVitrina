@@ -547,25 +547,65 @@ describe("admin console: replying inside a conversation", () => {
   });
 
   /**
-   * THE INVARIANT THAT MAKES A HANDOFF MEAN ANYTHING. Without it the admin's
-   * message and the agent's next reply interleave, and the customer gets two
-   * voices answering the same question with neither aware of the other. The
-   * route refuses rather than pausing on the admin's behalf, because an
-   * implicit takeover is one nobody remembers to undo.
+   * EVERY HUMAN INTERVENTION SUSPENDS THE AGENT, and sending is one — so a
+   * reply into a live conversation TAKES IT rather than being refused. An
+   * earlier version answered 409 and made the admin pause first; that paid for
+   * a risk with the confusion it meant to prevent, since the admin learned the
+   * rule from an error while the bot was still answering their customer.
+   *
+   * The safety property is unchanged and this is what pins it: the pause is in
+   * place BEFORE the message goes out, so no agent reply can interleave.
    */
-  it("refuses to send into a conversation the agent still handles", async () => {
+  it("takes the conversation over when replying into a live one", async () => {
     const h = await harness();
     seedInbound(h.db, SALES, PHONE, "t1", "hola", "2026-01-01 10:00:00", 1);
 
     const response = await h.post("/admin/conversation/message", {
       key: PHONE,
       agent: SALES,
-      body: "hola",
+      body: "te respondo yo",
     });
 
-    expect(response.statusCode).toBe(409);
-    expect(response.json()).toEqual({ error: "not_paused" });
-    expect(h.sent).toEqual([]);
+    expect(response.statusCode).toBe(200);
+    expect(h.sent).toEqual([{ to: PHONE, body: "te respondo yo" }]);
+    // The gate the message pipeline reads before every turn.
+    expect(isConversationPaused(h.db, PHONE, SALES)).toBe(true);
+  });
+
+  /**
+   * A failed send is a human MID-REPLY, not one who changed their mind.
+   * Resuming the agent here would put it back in front of somebody who is
+   * still typing to them.
+   */
+  it("keeps the conversation paused when the send fails", async () => {
+    const db = openDb(":memory:");
+    recordInboundMessages(db, {
+      agentId: SALES,
+      turnKey: "t1",
+      rows: [
+        {
+          id: 1,
+          conversation_key: PHONE,
+          agent_text: "hola",
+          kind: "text",
+          received_at: "2026-01-01 10:00:00",
+        },
+      ],
+    });
+    const { token } = issueAdminSession(db, { phone: ADMIN, issuedVia: "whatsapp" });
+    const app = Fastify({ logger: false });
+    registerAdminConsole(app, { db, channel: fakeChannel([], new Error("bridge unreachable")) });
+    await app.ready();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/admin/conversation/message",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      payload: JSON.stringify({ key: PHONE, agent: SALES, body: "hola" }),
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(isConversationPaused(db, PHONE, SALES)).toBe(true);
   });
 
   /**
@@ -692,6 +732,58 @@ describe("admin console: the leads panel", () => {
 
     expect((await h.get("/admin/leads")).json().leads).toHaveLength(0);
     expect((await h.get("/admin/leads?include_handled=true")).json().leads).toHaveLength(1);
+  });
+
+  /**
+   * EVERY HUMAN INTERVENTION SUSPENDS THE AGENT, and taking a lead is one.
+   * Marking a lead as yours and then discovering the bot is still answering
+   * that customer is the confusion this rule exists to remove: the person was
+   * told a team member would follow up, one picked it up, and the assistant
+   * kept talking over them in between.
+   */
+  it("silences the agent for the conversation when a lead is taken", async () => {
+    const h = await harness();
+    const lead = seedLead(h.db);
+    expect(isConversationPaused(h.db, PHONE, SALES)).toBe(false);
+
+    const response = await h.post("/admin/lead/status", { id: lead.id, status: "in_progress" });
+
+    expect(response.json()).toMatchObject({
+      paused: true,
+      conversationKey: PHONE,
+      agentId: SALES,
+    });
+    expect(isConversationPaused(h.db, PHONE, SALES)).toBe(true);
+  });
+
+  /**
+   * "I am done with this lead" and "the assistant may have this conversation
+   * back" are different statements — somebody can close a lead and still be
+   * mid-exchange. An auto-release would resume the agent mid-sentence.
+   */
+  it("does not hand the conversation back when a lead is closed", async () => {
+    const h = await harness();
+    const lead = seedLead(h.db);
+    await h.post("/admin/lead/status", { id: lead.id, status: "in_progress" });
+
+    await h.post("/admin/lead/status", { id: lead.id, status: "closed" });
+
+    expect(isConversationPaused(h.db, PHONE, SALES)).toBe(true);
+  });
+
+  /**
+   * A lead from before leads carried a provenance has no conversation to pause.
+   * The status still changes — that is what was asked for — and the answer says
+   * plainly that nothing was paused.
+   */
+  it("still moves a lead that has no conversation behind it", async () => {
+    const h = await harness();
+    const lead = seedLead(h.db, { conversation_key: null, agent_id: null });
+
+    const response = await h.post("/admin/lead/status", { id: lead.id, status: "in_progress" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ paused: false });
   });
 
   it("records who took a lead, and clears that on reopening", async () => {

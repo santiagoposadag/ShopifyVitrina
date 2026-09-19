@@ -288,8 +288,31 @@ Ahora:
 
 ## Tomar la conversación
 
-Desde el hilo, **Tomar la conversación** pausa el agente para esa conversación
-—y solo para esa— y habilita el cuadro de respuesta. Mientras esté pausada:
+**Cualquier intervención humana suspende al agente.** No hay que acordarse de
+pausar: tomar un lead lo hace, y escribir una respuesta lo hace. Las dos rutas
+pausan **antes** de que salga nada, así que nunca hay una ventana en la que tus
+palabras y la siguiente respuesta del bot se entrelacen.
+
+Dos caminos, el mismo resultado:
+
+| Desde | Qué haces | Qué pasa |
+|---|---|---|
+| Panel de leads | **Lo atiendo yo →** | Marca el lead como tuyo, silencia al agente con ese cliente y te lleva a la conversación |
+| Un hilo | **Responder yo (silencia al asistente)** | Silencia al agente y abre el cuadro |
+| Un hilo | Escribir y enviar sin pausar antes | Pausa sola y envía |
+
+Una versión anterior respondía 409 y te obligaba a pausar primero, con el
+argumento de que un traspaso implícito es uno que nadie recuerda deshacer. Ese
+argumento era sobre el *riesgo*, no sobre la corrección — y pagaba el riesgo con
+justo la confusión que quería evitar: marcabas un lead como tuyo, empezabas a
+escribir, y te enterabas de la regla por un error mientras el bot seguía
+atendiendo a tu cliente.
+
+**Cerrar un lead NO devuelve la conversación**, a propósito: "terminé con este
+lead" y "el asistente puede volver a atender a esta persona" son cosas distintas,
+y podés cerrar el lead estando todavía a mitad de un intercambio.
+
+Mientras esté pausada:
 
 - Los mensajes del cliente **se siguen registrando** y se ven en el panel. Lo
   que no ocurre es un turno: sin llamada al modelo, sin herramientas, sin
@@ -297,15 +320,21 @@ Desde el hilo, **Tomar la conversación** pausa el agente para esa conversación
 - Tus mensajes salen **desde el número del negocio** y quedan grabados con
   `sent_by` apuntándote. Ese campo es lo único que distingue las palabras de un
   humano de las de un modelo.
-- **No se puede escribir sin pausar primero.** La ruta responde 409 en vez de
-  pausar por su cuenta: un traspaso implícito es uno que nadie recuerda
-  deshacer, y sin la pausa tus mensajes y los del agente se entrelazan y el
-  cliente recibe dos voces respondiendo lo mismo.
 
 **Nada se despausa solo**, a propósito. Un temporizador que reanudara el bot lo
 haría a mitad de un intercambio, con el humano a media frase y sin forma de
-notarlo. El costo es la falla contraria —una conversación olvidada en pausa— y
-esa sí es visible: el índice la marca y reporta cuántas hay.
+notarlo.
+
+El costo es la falla contraria: **una conversación olvidada en pausa, que no
+responde nadie** — el asistente callado y el humano que siguió con otra cosa.
+Los mensajes del cliente se acumulan registrados y sin leer, y **las dos puntas
+están en silencio**: el cliente no ve respuesta, y nada le avisa al admin que
+todavía la tiene. Ese costo creció con la regla de arriba, porque ahora se pausa
+mucho más seguido y casi nunca de forma deliberada.
+
+Hoy solo se mitiga con visibilidad: el índice muestra un aviso arriba con
+cuántas están en pausa. No hay alerta ni umbral de tiempo. Está documentado como
+**deuda #18**, marcada High.
 
 **Al devolverla, la sesión del agente se descarta.** Mientras el humano la tuvo,
 el agente no corrió turnos, así que su transcript termina en el momento de la
