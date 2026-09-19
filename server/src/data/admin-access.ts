@@ -10,7 +10,8 @@ import {
   revokeAdminSessionsForPhone,
 } from "./admin-sessions.js";
 import { roleForPhone } from "./assignments.js";
-import { buildConsoleLink } from "./console-link.js";
+import { ADMIN_DEEP_LINK_TTL_HOURS, mintAdminDeepLink } from "./admin-deep-links.js";
+import { buildConsoleLink, buildLandingLink } from "./console-link.js";
 import { openDb, type DB } from "./db.js";
 import { isEntryPoint } from "./entry-point.js";
 
@@ -44,12 +45,17 @@ import { isEntryPoint } from "./entry-point.js";
 const USAGE = `Usage:
   admin-access list [--all]
   admin-access issue <phone>
+  admin-access link <phone> [--conversation <key> --agent <agent-id>]
   admin-access revoke <session-id>
   admin-access revoke-phone <phone>
 
   list          live sessions; --all includes expired and revoked ones.
   issue         BREAK GLASS. Mints a link from here instead of over WhatsApp.
                 Normally an admin just writes "panel" to the business number.
+  link          mints the ONE-SHOT landing code a WhatsApp template's button
+                carries (/go/<code>), optionally aimed at one conversation.
+                For testing that flow before a template exists, and for
+                checking what a Meta reviewer sees.
   revoke        kills one session on its next request, with no restart.
   revoke-phone  kills every live session for a phone.
 
@@ -82,6 +88,31 @@ function printLink(phone: string, token: string): void {
       "every customer's phone number, every message, and every catalog operation performed\n" +
       "on their behalf. Those customers are third parties covered by Ley 1581.",
   );
+}
+
+interface LinkOptions {
+  conversationKey?: string;
+  agentId?: string;
+}
+
+function parseLinkOptions(argv: string[]): LinkOptions {
+  const options: LinkOptions = {};
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i];
+    const value = argv[i + 1];
+    if (flag === "--conversation") {
+      if (!value) throw new Error("--conversation needs a value");
+      options.conversationKey = value;
+      i++;
+    } else if (flag === "--agent") {
+      if (!value) throw new Error("--agent needs a value");
+      options.agentId = value;
+      i++;
+    } else {
+      throw new Error(`unknown option "${flag ?? ""}"`);
+    }
+  }
+  return options;
 }
 
 function list(db: DB, all: boolean): void {
@@ -138,6 +169,40 @@ async function main(): Promise<void> {
       }
       const { token } = issueAdminSession(db, { phone, issuedVia: "cli" });
       printLink(phone, token);
+      return;
+    }
+
+    if (command === "link") {
+      const phone = normalizePhone(argument ?? "");
+      if (phone.length === 0) throw new Error(`"${argument ?? ""}" contains no digits.\n\n${USAGE}`);
+      const { conversationKey, agentId } = parseLinkOptions(rest);
+      // A conversation is named by BOTH halves of the session key, so half of
+      // one is refused rather than silently landing on the front page — an
+      // operator who typed only --conversation meant to aim it somewhere.
+      if ((conversationKey === undefined) !== (agentId === undefined)) {
+        throw new Error(`--conversation and --agent go together.\n\n${USAGE}`);
+      }
+      const { code } = mintAdminDeepLink(db, {
+        phone,
+        conversationKey: conversationKey ?? null,
+        agentId: agentId ?? null,
+      });
+      const { link, path, placeholder } = buildLandingLink(
+        "/go",
+        code,
+        process.env["PUBLIC_BASE_URL"],
+      );
+      console.log(`One-shot landing link for ${phone} is shown ONCE:\n`);
+      console.log(`  ${link ?? path}\n`);
+      if (placeholder) {
+        console.log(
+          "PUBLIC_BASE_URL is unset or still a placeholder, so only the path is shown above.\n",
+        );
+      }
+      console.log(
+        `It is SINGLE USE and dies in ${ADMIN_DEEP_LINK_TTL_HOURS} hours. Opening it spends the ` +
+          "code and issues an admin session; opening it again lands on the expired page.",
+      );
       return;
     }
 

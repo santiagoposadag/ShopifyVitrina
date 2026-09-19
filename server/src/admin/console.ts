@@ -740,7 +740,16 @@ const PAGE = `<!doctype html>
   // The token lives in the FRAGMENT and never leaves the browser except as an
   // Authorization header. A query string would be written into the server's
   // request log on every page load.
-  var token = new URLSearchParams(window.location.hash.slice(1)).get("t");
+  //
+  // The keys c and g arrive the same way when a notification's landing code
+  // named a conversation (admin/deep-link.ts). The conversation key IS a customer's
+  // phone number, so it rides the fragment too rather than a query string —
+  // keeping it out of the request log costs nothing here.
+  var hash = new URLSearchParams(window.location.hash.slice(1));
+  var token = hash.get("t");
+  var deepLink = hash.get("c") && hash.get("g")
+    ? { key: hash.get("c"), agent: hash.get("g") }
+    : null;
 
   var statusEl = document.getElementById("status");
   var indexEl = document.getElementById("index");
@@ -1071,6 +1080,14 @@ const PAGE = `<!doctype html>
 
   if (!token) {
     say("Falta el enlace completo. Ábrelo exactamente como te lo enviaron, sin recortarlo.", true);
+  } else if (deepLink) {
+    // Landed from a notification that named one conversation: open it directly
+    // rather than making the person find it in a list they did not ask for.
+    // The index is still loaded underneath, so "Volver" has somewhere to go.
+    loadPage().catch(function () {});
+    openThread(deepLink.key, deepLink.agent).catch(function () {
+      say("No se pudo abrir esa conversación. Puede que ya no exista.", true);
+    });
   } else {
     indexEl.hidden = false;
     loadPage().catch(function () {

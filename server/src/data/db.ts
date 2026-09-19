@@ -526,6 +526,60 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
       revoked_at TEXT
     );
 
+    -- A ONE-SHOT LINK THAT LANDS SOMEBODY ON ONE CONVERSATION.
+    --
+    -- WHY IT IS NOT JUST A SESSION TOKEN IN A URL. This is what a WhatsApp
+    -- TEMPLATE button points at, and Meta allows a template's URL button
+    -- exactly ONE variable, appended at the END of a fixed base. So a single
+    -- opaque value has to carry everything the landing needs: who it was minted
+    -- for, which conversation to open, and with which persona. A URL shaped
+    -- /admin/conversation/<key>?agent=<id>&t=<token> cannot exist in a template
+    -- at all.
+    --
+    -- IT IS ALSO THE SAFER SHAPE, independently of Meta. The base URL is fixed
+    -- and approved once, so the only thing that varies per message is this
+    -- code — and the code is SINGLE USE, which the session link deliberately is
+    -- not. A chat forwarded weeks later carries a code that was spent the first
+    -- time its owner opened it.
+    --
+    -- LONGER LIVED THAN A SESSION LINK, and that is not an inconsistency. The
+    -- "panel" link is minutes because it is requested and opened in one motion.
+    -- This one arrives unprompted — a lead at 2am read at 8 — so a window of
+    -- minutes would deliver it already dead. Single use is what pays for the
+    -- longer window.
+    --
+    -- conversation_key/agent_id are NULLABLE: a link may be minted for the
+    -- panel's front page rather than one thread, and a lead captured before
+    -- leads carried a provenance has no conversation to point at.
+    --
+    -- session_id RECORDS WHAT IT MINTED, so the audit trail connects "this
+    -- notification was opened" to "this session then read these conversations".
+    -- Without it the two halves are unrelatable.
+    --
+    -- A new table, so IF NOT EXISTS IS the migration for a database that
+    -- predates it: nothing here alters an existing table.
+    CREATE TABLE IF NOT EXISTS admin_deep_links (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      -- The SHA-256 of the code, never the code. Same reasoning as every other
+      -- credential in this schema: this file is copied by data/backup.ts.
+      code_hash TEXT NOT NULL UNIQUE,
+      -- normalizePhone's output: who this was minted for, and who the session
+      -- it mints will be attributed to.
+      phone TEXT NOT NULL,
+      -- Where it lands. NULL means the panel's front page.
+      conversation_key TEXT,
+      agent_id TEXT,
+      -- What prompted it, for the trail. Not a foreign key: a lead can be
+      -- deleted by a purge and this row must survive that as a record of a
+      -- notification that was sent.
+      lead_id INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at TEXT NOT NULL,
+      -- Stamped on the ONE use it gets. A second open finds it spent.
+      used_at TEXT,
+      session_id INTEGER
+    );
+
     -- WHEN A HUMAN HAS TAKEN OVER A CONVERSATION, AND THE AGENT MUST BE SILENT.
     --
     -- The sales agent captures a lead and tells the customer a team member will
@@ -605,6 +659,12 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
     -- compared on every page load.
     CREATE INDEX IF NOT EXISTS idx_admin_sessions_live
       ON admin_sessions(revoked_at, expires_at);
+    -- Resolving a code scans the LIVE rows with a constant-time compare per
+    -- row, exactly like the session lookup. Spent and expired links can never
+    -- match, and excluding them in SQL is what keeps a year of opened
+    -- notifications from being compared on every landing.
+    CREATE INDEX IF NOT EXISTS idx_admin_deep_links_live
+      ON admin_deep_links(used_at, expires_at);
     CREATE INDEX IF NOT EXISTS idx_pending_media_phone ON pending_media(phone);
   `);
 
