@@ -308,9 +308,47 @@ justo la confusión que quería evitar: marcabas un lead como tuyo, empezabas a
 escribir, y te enterabas de la regla por un error mientras el bot seguía
 atendiendo a tu cliente.
 
+### El lead y la conversación son dos cosas, y están conectadas por una sola
+
+Un lead **no es** una conversación: una sola conversación produce varios leads
+(un aviso de reposición, un seguimiento, tres productos en un mismo chat). Por
+eso tienen estados propios y acciones propias, y no pueden ser un solo control.
+Lo que sí son es **visibles al mismo tiempo**.
+
+Cada lead del panel muestra ahora el estado de su conversación: si el asistente
+sigue callado con ese cliente, quién la pausó, si fue al tomar un lead (y cuál),
+y cuántos **otros** leads de esa misma conversación siguen en curso. Si el lead
+no tiene conversación asociada — porque se capturó antes de que los leads
+guardaran su origen — la tarjeta lo dice en vez de quedarse sin botón.
+
+| Desde el panel de leads | Qué le pasa a la conversación |
+|---|---|
+| **Lo atiendo yo →** | La pausa (y guarda que ese lead fue la causa) |
+| **Reabrir** | La **devuelve al asistente**, si la causa fue un lead y ningún otro lead de esa conversación sigue en curso |
+| **Cerrar** | No la devuelve — pero la tarjeta dice que sigue en pausa |
+| **Devolver al asistente** | La devuelve, siempre. Es la misma ruta que usa el hilo |
+
+**Reabrir devuelve la conversación** porque "reabrir" significa que el lead
+volvió a la cola y **nadie** lo está atendiendo — tanto que el propio `claimed_by`
+se borra. Dejar al asistente callado después de eso deja al cliente entre un bot
+que no responde y un humano que se fue. Es la mitad simétrica de tomarlo.
+
+Solo devuelve cuando se cumplen las tres:
+
+1. La conversación está en pausa.
+2. **La causó un lead** (`conversation_handoff.lead_id`). Una pausa que alguien
+   puso a mano fue por una razón que el lead no conoce, y un lead no la deshace.
+3. **Ningún otro lead de esa conversación sigue `in_progress`.** Si un colega
+   tiene otro, devolverla pondría al bot a hablar encima de él.
+
+Cuando alguna falla, el estado del lead cambia igual y la respuesta dice por qué
+la conversación quedó en pausa, en vez de reportar una devolución que no ocurrió.
+
 **Cerrar un lead NO devuelve la conversación**, a propósito: "terminé con este
 lead" y "el asistente puede volver a atender a esta persona" son cosas distintas,
-y podés cerrar el lead estando todavía a mitad de un intercambio.
+y podés cerrar el lead estando todavía a mitad de un intercambio. Lo que cambió
+es que ahora **se ve**: la tarjeta queda marcada *asistente en pausa* y trae el
+botón para devolverla cuando vos decidas.
 
 Mientras esté pausada:
 
@@ -321,20 +359,20 @@ Mientras esté pausada:
   `sent_by` apuntándote. Ese campo es lo único que distingue las palabras de un
   humano de las de un modelo.
 
-**Nada se despausa solo**, a propósito. Un temporizador que reanudara el bot lo
-haría a mitad de un intercambio, con el humano a media frase y sin forma de
-notarlo.
+**Nada se despausa solo por tiempo**, a propósito. Un temporizador que reanudara
+el bot lo haría a mitad de un intercambio, con el humano a media frase y sin
+forma de notarlo. Reabrir un lead no es eso: es alguien diciendo, en el panel,
+que nadie está atendiendo esto.
 
 El costo es la falla contraria: **una conversación olvidada en pausa, que no
 responde nadie** — el asistente callado y el humano que siguió con otra cosa.
 Los mensajes del cliente se acumulan registrados y sin leer, y **las dos puntas
 están en silencio**: el cliente no ve respuesta, y nada le avisa al admin que
-todavía la tiene. Ese costo creció con la regla de arriba, porque ahora se pausa
-mucho más seguido y casi nunca de forma deliberada.
+todavía la tiene.
 
-Hoy solo se mitiga con visibilidad: el índice muestra un aviso arriba con
-cuántas están en pausa. No hay alerta ni umbral de tiempo. Está documentado como
-**deuda #18**, marcada High.
+Se mitiga con visibilidad, en dos lugares: el índice muestra un aviso arriba con
+cuántas están en pausa, y cada lead marca la suya en su propia tarjeta. No hay
+alerta ni umbral de tiempo. Está documentado como **deuda #18**.
 
 **Al devolverla, la sesión del agente se descarta.** Mientras el humano la tuvo,
 el agente no corrió turnos, así que su transcript termina en el momento de la
