@@ -415,10 +415,6 @@ services:
     profiles: ["ops"]
 
 volumes:
-      - vitrina-data:/data
-    profiles: ["ops"]
-
-volumes:
   # A named volume (not a host bind mount): the image already creates /data
   # owned by the non-root `node` user (see the Dockerfiles). A named volume
   # inherits that ownership on first use; a host bind mount would land
