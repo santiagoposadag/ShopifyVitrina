@@ -1,6 +1,6 @@
 import type { Config } from "../config.js";
 import { normalizePhone } from "../config.js";
-import type { WhatsAppChannel } from "./channel.js";
+import type { TemplateMessage, WhatsAppChannel } from "./channel.js";
 
 /**
  * Client for Meta's official WhatsApp Business Cloud API.
@@ -110,6 +110,12 @@ interface MetaErrorBody {
 const NAMED_ERRORS: Record<number, string> = {
   131047:
     "outside the 24h customer service window — free-form replies are not allowed, only an approved template",
+  132001:
+    "no approved template with that name and language — check WHATSAPP_LEAD_TEMPLATE_NAME and that the language matches the approved one exactly",
+  132000:
+    "the template's parameter count does not match what was approved — a variable was added or dropped on one side",
+  132012:
+    "a template parameter was rejected: they may not be empty, and may not contain newlines, tabs or long runs of spaces",
   131026: "the recipient cannot receive this message (no WhatsApp account, or it is unreachable)",
   131009: "a parameter was rejected (a text body over 4096 chars is the usual cause)",
   100: "invalid parameter — check WHATSAPP_PHONE_NUMBER_ID and the request shape",
@@ -188,6 +194,73 @@ export class CloudApiChannel implements WhatsAppChannel {
         // Throwing reaches the batcher, which retries the whole turn with backoff.
         throw new Error(`Cloud API send failed — ${describeMetaError(res.status, raw)}`);
       }
+    }
+  }
+
+  /**
+   * Send an APPROVED template — the only thing Meta accepts outside the
+   * 24-hour customer service window.
+   *
+   * ONE REQUEST, NEVER CHUNKED, unlike `sendText` above. A template's body is
+   * fixed at approval and Meta renders it; there is nothing here that could
+   * exceed a length we control, and splitting would produce two copies of an
+   * approved message rather than one long one.
+   *
+   * THE BUTTON PARAMETER IS THE SUFFIX ALONE. Meta stores the URL base with the
+   * approved template and concatenates — `index: "0"` names the first button,
+   * and `sub_type: "url"` says which kind it is. Sending a whole URL here
+   * yields the origin twice and a 404 for whoever taps it.
+   *
+   * A REJECTION THROWS, like every other send here, and the caller decides what
+   * that means. For a reply inside a turn that is a retry; for a notification
+   * it is a fallback to free-form text. Neither decision belongs to a transport.
+   */
+  async sendTemplate(to: string, template: TemplateMessage): Promise<void> {
+    const recipient = normalizePhone(to);
+    if (!recipient) throw new Error(`Refusing to send to an unusable recipient: "${to}"`);
+
+    // Built here rather than by the caller so the wire shape stays in the one
+    // module that owns it — the caller names a template and its values.
+    const components: unknown[] = [];
+    if (template.bodyParams.length > 0) {
+      components.push({
+        type: "body",
+        parameters: template.bodyParams.map((text) => ({ type: "text", text })),
+      });
+    }
+    if (template.buttonUrlSuffix !== undefined) {
+      components.push({
+        type: "button",
+        sub_type: "url",
+        index: "0",
+        parameters: [{ type: "text", text: template.buttonUrlSuffix }],
+      });
+    }
+
+    const res = await this.fetchImpl(this.messagesUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: this.authHeader,
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: recipient,
+        type: "template",
+        template: {
+          name: template.name,
+          language: { code: template.language },
+          ...(components.length > 0 ? { components } : {}),
+        },
+      }),
+    });
+    if (!res.ok) {
+      const raw = await res.text().catch(() => "");
+      throw new Error(
+        `Cloud API template send failed (${template.name}/${template.language}) — ` +
+          describeMetaError(res.status, raw),
+      );
     }
   }
 

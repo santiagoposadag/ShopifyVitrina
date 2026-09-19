@@ -44,6 +44,17 @@ x-whatsapp-env: &whatsapp-env
   # value set to point at a proxy or a fake would be obeyed on a developer's
   # machine and quietly ignored the moment it ran in a container.
   WHATSAPP_GRAPH_BASE_URL: ${WHATSAPP_GRAPH_BASE_URL:-}
+  # The APPROVED template that notifies an owner of a lead, and its language.
+  # Configuration rather than a literal because neither is ours to invent: they
+  # name something Meta approved, a template exists PER language, and a rename
+  # on their side has to be a variable and a restart rather than a deploy.
+  #
+  # EMPTY DISABLES THE TEMPLATE PATH and the notice falls back to free-form
+  # text — which works inside the 24h window and is rejected outside it. That is
+  # the behaviour every deployment had before templates existed, so leaving
+  # these unset changes nothing. Defaults live in server/src/config.ts.
+  WHATSAPP_LEAD_TEMPLATE_NAME: ${WHATSAPP_LEAD_TEMPLATE_NAME:-}
+  WHATSAPP_LEAD_TEMPLATE_LANG: ${WHATSAPP_LEAD_TEMPLATE_LANG:-}
 
 # Absolute paths inside the containers. server/src/config.ts short-circuits on
 # isAbsolute(), so these override anything set in .env.

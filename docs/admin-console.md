@@ -214,13 +214,48 @@ Nota: {{4}}
 Abre la conversación para responderle tú mismo.
 ```
 
+### Cómo se envía
+
+La plantilla se intenta **primero**, y el texto libre es el respaldo — al revés
+de lo que sugeriría "lo más barato primero", y a propósito: **solo una plantilla
+puede llevar botón**, y el botón es la función. Mandar texto primero significaría
+que el dueño normalmente recibe el mensaje peor, y solo recibe el bueno cuando
+lleva más de 24 h en silencio. Desde el 1 de octubre de 2026 los dos cuestan
+igual, así que el argumento de "texto primero" tampoco sobrevive.
+
+El respaldo corre cuando el transporte no tiene plantillas (el bridge), cuando
+no hay ninguna configurada, y cuando Meta rechaza el envío. En todos esos casos
+el dueño igual se entera del lead — y dentro de la ventana de 24 h el texto llega
+exactamente como llegaba antes.
+
+```
+WHATSAPP_LEAD_TEMPLATE_NAME=lead_capturado
+WHATSAPP_LEAD_TEMPLATE_LANG=es
+```
+
+Vacío apaga el camino de plantilla. Son variables y no literales porque nombran
+algo que Meta aprobó: un rename del lado de ellos es una variable y un reinicio,
+no un deploy.
+
+### Lo que un aviso de lead lleva ahora
+
+**Cada notificación de lead carga una credencial de admin de un solo uso**,
+válida 24 h. Antes no llevaba ninguna — había que escribir "panel". Es lo que
+pediste y es lo que hace que el botón funcione, pero conviene decirlo claro: un
+chat de WhatsApp con avisos de leads es ahora un chat con credenciales dentro.
+Cada código es de un solo uso, expira en un día, y se acuña **uno por dueño por
+lead** (dos dueños no pueden compartirlo, o el segundo en tocarlo aterriza en
+"este enlace ya no sirve").
+
 Tres reglas que cuestan un rechazo o una falla en producción:
 
 1. **El cuerpo no puede empezar ni terminar con variable, ni tener dos
    seguidas.** El de arriba ya cumple.
-2. **Ninguna variable puede ir vacía al enviar.** `product_code` y `note` son
-   nulos en la base cuando el cliente no los dio, así que el envío sustituye por
-   `—`. Vacío lo rechaza Meta *al enviar*, no al aprobar.
+2. **Ninguna variable puede ir vacía, ni llevar saltos de línea, tabs o corridas
+   largas de espacios.** Una nota es texto libre que el cliente tecleó en
+   WhatsApp, así que rutinariamente tiene todo eso. El envío colapsa espacios,
+   recorta a 280 caracteres y sustituye por `—` lo que quede vacío. Meta rechaza
+   el *envío*, no la plantilla — o sea falla en producción, no en aprobación.
 3. **La URL base queda congelada al aprobarse.** Cambiar de dominio después es
    plantilla nueva y aprobación nueva.
 
