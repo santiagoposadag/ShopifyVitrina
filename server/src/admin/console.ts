@@ -52,12 +52,24 @@ import type { WhatsAppChannel } from "../whatsapp/channel.js";
  * one message. There is still nothing here that touches the catalog, a role, or
  * a credential.
  *
- * SENDING REQUIRES THE CONVERSATION TO BE PAUSED, and that is the invariant
- * that makes a handoff mean anything. Without it an admin's message and the
- * agent's next reply interleave, the customer gets two voices answering the
- * same question, and neither knows about the other. So the console pauses
- * first, and the route refuses rather than quietly pausing on the admin's
- * behalf — an implicit takeover is one nobody remembers to undo.
+ * EVERY HUMAN INTERVENTION SUSPENDS THE AGENT. Taking a lead and sending a
+ * message both pause the conversation they touch, and the pause happens BEFORE
+ * the message goes out — so there is no window in which an admin's words and
+ * the agent's next reply interleave and the customer hears two voices answering
+ * one question.
+ *
+ * AN EARLIER VERSION REFUSED INSTEAD, with a 409, on the reasoning that an
+ * implicit takeover is one nobody remembers to undo. That reasoning was about
+ * the RISK, not about correctness, and it paid for the risk with the very
+ * confusion it meant to prevent: an admin marks a lead as theirs, starts
+ * typing, and learns the rule from an error — while the assistant is still
+ * answering that customer. The rule is now uniform and needs no explaining.
+ *
+ * What was traded away is the guarantee that every pause was deliberate, and
+ * that cost is real: nothing auto-releases, so a conversation can be left
+ * paused and answered by nobody. It is DEUDA #18, and the index carries a
+ * banner naming how many are in that state, because a count in a status line
+ * was missable and this failure is silent on both ends.
  *
  * AUTHENTICATION IS A SESSION, NOT A CREDENTIAL. An admin asks from their own
  * WhatsApp and is sent a link that dies on its own (see data/admin-sessions.ts
@@ -540,8 +552,30 @@ export function registerAdminConsole(app: FastifyInstance, deps: AdminConsoleDep
     if (isAgentConversationKey(key)) {
       return guardHeaders(reply).code(400).send({ error: "not_a_person" });
     }
+    // ANY HUMAN INTERVENTION SUSPENDS THE AGENT, and sending is one — so this
+    // pauses rather than refusing. An earlier version answered 409 and made the
+    // admin pause first, on the reasoning that an implicit takeover is one
+    // nobody remembers to undo. That reasoning was about the RISK, not about
+    // correctness, and it bought the risk at the price of the confusion it was
+    // meant to prevent: an admin typing a reply into a conversation the bot was
+    // still answering, discovering the rule only from an error.
+    //
+    // The safety property is unchanged, because the pause happens BEFORE the
+    // send, in the same request: there is still no window in which a human
+    // message and an agent reply interleave. What is traded away is the
+    // guarantee that every pause was deliberate — and that cost is DEUDA #18,
+    // a conversation left paused and forgotten.
     if (!isConversationPaused(db, key, agent)) {
-      return guardHeaders(reply).code(409).send({ error: "not_paused" });
+      pauseConversation(db, {
+        conversationKey: key,
+        agentId: agent,
+        pausedBy: session.phone,
+        reason: "respuesta directa desde el panel",
+      });
+      request.log.warn(
+        { conversationKey: key, agentId: agent, admin: session.phone },
+        "admin console: replying took the conversation over; the agent is now silent for it",
+      );
     }
 
     const turnKey = adminTurnKey(session.id);
@@ -555,6 +589,9 @@ export function registerAdminConsole(app: FastifyInstance, deps: AdminConsoleDep
         { err, conversationKey: key, admin: session.phone },
         "admin console: sending a message into a conversation failed",
       );
+      // The pause above STAYS. A failed send is a human mid-reply, not a human
+      // who changed their mind — resuming the agent here would put it back in
+      // front of somebody who is still typing to them.
       return guardHeaders(reply).code(502).send({ error: "send_failed" });
     }
 
@@ -598,7 +635,27 @@ export function registerAdminConsole(app: FastifyInstance, deps: AdminConsoleDep
     return guardHeaders(reply).code(200).send({ leads });
   });
 
-  /** Move a lead through its lifecycle. */
+  /**
+   * Move a lead through its lifecycle — and, on taking it, SUSPEND THE AGENT
+   * for the conversation behind it.
+   *
+   * TAKING A LEAD IS A HUMAN INTERVENTION, and every human intervention
+   * suspends the agent. Marking a lead as yours and then discovering the bot is
+   * still answering that customer is the confusion this rule exists to remove:
+   * the person is told a team member will follow up, a team member picks it up,
+   * and the assistant keeps talking over them in between.
+   *
+   * CLOSING DOES NOT RELEASE, deliberately. "I am done with this lead" and "the
+   * assistant may have this conversation back" are different statements —
+   * somebody can close a lead and still be mid-exchange with the person. An
+   * auto-release here would resume the agent mid-sentence, which is exactly
+   * what `Nothing auto-releases a handoff` refuses to do.
+   *
+   * A lead from before leads carried a provenance has no conversation to pause,
+   * and one whose conversation is an agent-to-agent key has no person behind
+   * it. Both are reported as `paused: false` rather than failing: the lead's
+   * status is the thing being changed, and it changed.
+   */
   app.post(`${PREFIX}/lead/status`, async (request, reply) => {
     const session = authenticate(db, reply, request.headers.authorization);
     if (!session) return reply;
@@ -609,7 +666,43 @@ export function registerAdminConsole(app: FastifyInstance, deps: AdminConsoleDep
 
     const lead = setLeadStatus(db, { id, status, claimedBy: session.phone });
     if (!lead) return guardHeaders(reply).code(404).send({ error: "not_found" });
-    return guardHeaders(reply).code(200).send({ lead });
+
+    let paused = false;
+    if (
+      status === "in_progress" &&
+      lead.conversation_key !== null &&
+      lead.agent_id !== null &&
+      !isAgentConversationKey(lead.conversation_key)
+    ) {
+      // Idempotent, so taking a lead whose conversation somebody else already
+      // holds does not produce a second handoff (see pauseConversation).
+      pauseConversation(db, {
+        conversationKey: lead.conversation_key,
+        agentId: lead.agent_id,
+        pausedBy: session.phone,
+        reason: `lead #${lead.id} tomado desde el panel`,
+      });
+      paused = true;
+      request.log.warn(
+        {
+          leadId: lead.id,
+          conversationKey: lead.conversation_key,
+          agentId: lead.agent_id,
+          admin: session.phone,
+        },
+        "admin console: a lead was taken; the agent is now silent for its conversation",
+      );
+    }
+
+    // `paused` and the conversation are reported so the page can go straight
+    // there — taking a lead and then hunting for its conversation is the
+    // three-click path this replaces.
+    return guardHeaders(reply).code(200).send({
+      lead,
+      paused,
+      conversationKey: lead.conversation_key,
+      agentId: lead.agent_id,
+    });
   });
 }
 
@@ -687,6 +780,7 @@ const PAGE = `<!doctype html>
   .status { font-size: 15px; margin-top: 16px; min-height: 1.5em; }
   .status.error { color: var(--bad); }
   .more { border: 1px solid var(--line); background: transparent; color: inherit; border-radius: 10px; padding: 10px 16px; width: 100%; }
+  .banner { border: 1px solid var(--warn); color: var(--warn); border-radius: 12px; padding: 12px 14px; margin-bottom: 14px; font-size: 14px; }
   footer { margin-top: 32px; font-size: 13px; color: var(--dim); text-align: center; }
   [hidden] { display: none !important; }
 </style>
@@ -719,7 +813,7 @@ const PAGE = `<!doctype html>
     <h2 id="panel-state"></h2>
     <p class="meta" id="panel-detail"></p>
     <div class="row">
-      <button id="btn-pause" type="button">Tomar la conversación</button>
+      <button id="btn-pause" type="button">Responder yo (silencia al asistente)</button>
       <button id="btn-release" type="button" hidden>Devolver al asistente</button>
     </div>
     <div id="composer" hidden style="margin-top:12px">
@@ -851,6 +945,22 @@ const PAGE = `<!doctype html>
     return card;
   }
 
+  // A conversation left paused is answered by NOBODY: the assistant is silent
+  // and the human moved on. Nothing releases one automatically — a timer would
+  // resume the bot mid-sentence — so the only defence is that it is impossible
+  // to miss. A count buried in a status line was missable.
+  function renderPausedBanner(count) {
+    var existing = document.getElementById("paused-banner");
+    if (existing) existing.remove();
+    if (!count) return;
+    var banner = el("div", "banner",
+      "⏸ " + count + (count === 1
+        ? " conversación está en manos de un humano y el asistente no le responde."
+        : " conversaciones están en manos de un humano y el asistente no les responde."));
+    banner.id = "paused-banner";
+    indexEl.insertBefore(banner, listEl);
+  }
+
   function loadPage() {
     say("Cargando…");
     return call("/admin/conversations?limit=" + PAGE_SIZE + "&offset=" + offset).then(function (data) {
@@ -859,8 +969,8 @@ const PAGE = `<!doctype html>
       data.conversations.forEach(function (row) { listEl.appendChild(renderConversation(row)); });
       offset += data.conversations.length;
       moreEl.hidden = offset >= total;
-      say(total === 0 ? "Todavía no hay conversaciones registradas."
-        : (data.pausedCount > 0 ? data.pausedCount + " conversación(es) en manos de un humano." : ""));
+      renderPausedBanner(data.pausedCount);
+      say(total === 0 ? "Todavía no hay conversaciones registradas." : "");
     });
   }
 
@@ -921,7 +1031,9 @@ const PAGE = `<!doctype html>
     var last = data.handoffs && data.handoffs.length > 0 ? data.handoffs[0] : null;
     panelDetail.textContent = data.paused
       ? ("El asistente no responderá hasta que la devuelvas." + (last && last.paused_by ? " Tomada por " + last.paused_by + " el " + last.paused_at + " UTC." : ""))
-      : (last ? "Última vez atendida por un humano: " + last.paused_at + " UTC." : "");
+      : (last
+          ? "Si escribes, el asistente queda en silencio automáticamente. Última vez atendida por un humano: " + last.paused_at + " UTC."
+          : "Si escribes, el asistente queda en silencio automáticamente con este cliente.");
     btnPause.hidden = data.paused;
     btnRelease.hidden = !data.paused;
     composer.hidden = !(data.paused && data.replyable);
@@ -1006,17 +1118,37 @@ const PAGE = `<!doctype html>
     row.style.marginTop = "10px";
     ["new", "in_progress", "closed"].forEach(function (status) {
       if (status === lead.status) return;
-      var b = el("button", null, status === "new" ? "Reabrir" : status === "in_progress" ? "Lo tomo yo" : "Cerrar");
+      // "Lo atiendo yo" says what it now does: it takes the lead AND silences
+      // the assistant for that customer, then opens the conversation. The old
+      // label read almost the same as the thread's own button while doing
+      // something else entirely.
+      var label = status === "new" ? "Reabrir"
+        : status === "in_progress" ? "Lo atiendo yo →"
+        : "Cerrar";
+      var b = el("button", null, label);
       b.type = "button";
-      b.style.border = "1px solid var(--line)";
+      b.style.border = status === "in_progress" ? "1px solid currentColor" : "1px solid var(--line)";
       b.style.background = "transparent";
       b.style.color = "inherit";
       b.style.borderRadius = "10px";
       b.style.padding = "7px 14px";
+      if (status === "in_progress") b.style.fontWeight = "600";
       b.addEventListener("click", function () {
         b.disabled = true;
         call("/admin/lead/status", { method: "POST", body: { id: lead.id, status: status } })
-          .then(function (data) { if (data) return loadLeads(); })
+          .then(function (data) {
+            if (!data) return;
+            // Taking it goes straight to the conversation: hunting for it
+            // afterwards was the three-click path this replaces.
+            if (status === "in_progress" && data.conversationKey && data.agentId) {
+              return openThread(data.conversationKey, data.agentId).then(function () {
+                say(data.paused
+                  ? "Tomaste este lead. El asistente quedó en silencio con este cliente — escríbele tú."
+                  : "Tomaste este lead. No tiene una conversación asociada que pausar.");
+              });
+            }
+            return loadLeads();
+          })
           .finally(function () { b.disabled = false; });
       });
       row.appendChild(b);
