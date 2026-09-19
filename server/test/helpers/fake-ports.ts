@@ -9,6 +9,7 @@ import type {
   KnowledgeHit,
   KnowledgePort,
   LeadDraft,
+  LeadQuery,
   LeadsPort,
   MediaPort,
   PendingPhoto,
@@ -168,21 +169,34 @@ export function fakePorts(): FakePorts {
   };
 
   const leads: LeadsPort = {
-    async save(draft: LeadDraft): Promise<Lead> {
+    async save(draft: LeadDraft): Promise<{ lead: Lead; created: boolean }> {
       record("saveLead", draft);
       return {
-        id: 7,
-        phone: draft.phone,
-        product_code: draft.productCode ?? null,
-        type: draft.type,
-        name: draft.name ?? null,
-        note: draft.note ?? null,
-        status: "new",
-        created_at: "2026-09-06T00:00:00Z",
+        // `created: true` is the fake's fixed answer: this port has no store,
+        // so it can never find a duplicate. A suite that wants the "already
+        // noted" branch drives its own stub rather than teaching this one to
+        // remember, which would make it a second implementation of the real
+        // dedupe rule and a second thing that can disagree with it.
+        created: true,
+        lead: {
+          id: 7,
+          phone: draft.phone,
+          product_code: draft.productCode ?? null,
+          type: draft.type,
+          name: draft.name ?? null,
+          note: draft.note ?? null,
+          status: "new",
+          created_at: "2026-09-06T00:00:00Z",
+          conversation_key: draft.conversationKey ?? null,
+          agent_id: draft.agentId ?? null,
+          turn_key: draft.turnKey ?? null,
+          status_changed_at: null,
+          claimed_by: null,
+        },
       };
     },
-    async list(sinceDays?: number): Promise<Lead[]> {
-      record("listLeads", sinceDays);
+    async list(query?: LeadQuery): Promise<Lead[]> {
+      record("listLeads", query);
       return [];
     },
   };

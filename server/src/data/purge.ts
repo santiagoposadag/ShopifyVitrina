@@ -6,6 +6,7 @@ import { countAssignedOwners, roleForPhone } from "./assignments.js";
 import type { DB } from "./db.js";
 import {
   clearSessionId,
+  deleteConversationHandoffs,
   deleteConversationMessages,
   deleteConversationToolCalls,
   listConversationKeysWithMessages,
@@ -202,6 +203,10 @@ export function purgeCustomerSessions(db: DB, config: PurgeConfig, root?: string
     // forgotten while their data sat in a table the operator does not know to
     // look in. Scoped by agent for the identical reason the line above is.
     purgedToolCalls += deleteConversationToolCalls(db, session.conversation_key, session.agent_id);
+    // The handoff history goes too: `paused_by` and `reason` are notes a human
+    // wrote ABOUT this named customer, so leaving them would report the person
+    // forgotten while a record of them sat in a third table.
+    deleteConversationHandoffs(db, session.conversation_key, session.agent_id);
     clearSessionId(db, session.agent_id, session.conversation_key);
     if (root) deleteTranscript(root, session.agent_session_id);
   }
@@ -232,6 +237,7 @@ export function purgeCustomerSessions(db: DB, config: PurgeConfig, root?: string
     if (isOwnerAgentSession(orphan.agent_id)) continue;
     const messages = deleteConversationMessages(db, orphan.conversation_key, orphan.agent_id);
     const toolCalls = deleteConversationToolCalls(db, orphan.conversation_key, orphan.agent_id);
+    deleteConversationHandoffs(db, orphan.conversation_key, orphan.agent_id);
     if (messages > 0 || toolCalls > 0) purgedOrphanPairs += 1;
     purgedMessages += messages;
     purgedToolCalls += toolCalls;

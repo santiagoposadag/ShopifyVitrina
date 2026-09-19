@@ -15,13 +15,49 @@ export interface LeadInput {
   type: LeadType;
   name?: string | null;
   note?: string | null;
+  /**
+   * WHERE THIS LEAD CAME FROM: the conversation, the persona and the exact turn.
+   *
+   * The phone alone says WHO but never WHICH EXCHANGE, so an operator holding a
+   * lead could not find the conversation that produced it — the first thing
+   * they want, and the thing that makes a lead actionable rather than a name
+   * and a guess. Optional because a caller outside a turn (a test, a future
+   * import) genuinely has none, and inventing one would point at a turn that
+   * never happened.
+   */
+  conversation_key?: string | null;
+  agent_id?: string | null;
+  turn_key?: string | null;
 }
+
+/**
+ * The lifecycle `status` was declared with and never given.
+ *
+ * The column has existed since the first schema, defaulting to 'new', and
+ * nothing ever moved it — so an operator reading the list a second time could
+ * not tell which ones they had already handled. These three are the whole
+ * vocabulary, deliberately: a fourth state is a process decision nobody has
+ * made, and one invented here would be that decision.
+ *
+ * NOT A CHECK CONSTRAINT, because SQLite cannot add one to the existing table
+ * and the running pilot is not worth a rebuild for it. `setLeadStatus` is the
+ * single writer and its parameter is this type, so the constraint lives in the
+ * type system where every caller is checked against it.
+ */
+export type LeadStatus = "new" | "in_progress" | "closed";
+
+export const LEAD_STATUSES: readonly LeadStatus[] = ["new", "in_progress", "closed"] as const;
+
+/** Statuses that still owe somebody a contact. */
+const OPEN_STATUSES: readonly LeadStatus[] = ["new", "in_progress"] as const;
 
 export function insertLead(db: DB, input: LeadInput): Lead {
   const info = db
     .prepare(
-      `INSERT INTO leads (phone, product_code, type, name, note)
-       VALUES (@phone, @product_code, @type, @name, @note)`,
+      `INSERT INTO leads (phone, product_code, type, name, note,
+                          conversation_key, agent_id, turn_key)
+       VALUES (@phone, @product_code, @type, @name, @note,
+               @conversation_key, @agent_id, @turn_key)`,
     )
     .run({
       phone: input.phone,
@@ -29,19 +65,124 @@ export function insertLead(db: DB, input: LeadInput): Lead {
       type: input.type,
       name: input.name ?? null,
       note: input.note ?? null,
+      conversation_key: input.conversation_key ?? null,
+      agent_id: input.agent_id ?? null,
+      turn_key: input.turn_key ?? null,
     });
   return db.prepare(`SELECT * FROM leads WHERE id = ?`).get(Number(info.lastInsertRowid)) as Lead;
 }
 
-export function listLeads(db: DB, sinceDays?: number): Lead[] {
+/**
+ * The still-open lead this one would duplicate, or null.
+ *
+ * A customer who asks three times about the same sold-out item is ONE promise
+ * to contact them, not three — and three rows make the list longer without
+ * making it more informative, which is how a list stops being read. Matched on
+ * (phone, type, product_code) because that tuple is what "the same ask" means
+ * here: a different product, or wanting a follow-up rather than a restock
+ * notice, is a different promise.
+ *
+ * ONLY OPEN LEADS MATCH. A closed one has been answered, so the customer asking
+ * again is a NEW request and must produce a new row — collapsing onto a closed
+ * lead would file today's ask under something already marked done.
+ *
+ * A NULL product_code matches only another NULL, which is what `IS` gives us
+ * and `=` would not: a general "tell me when you have more" is one ask, and it
+ * should not merge with one about a specific SKU.
+ */
+export function findOpenDuplicateLead(
+  db: DB,
+  input: { phone: string; type: LeadType; product_code?: string | null },
+): Lead | null {
+  const placeholders = OPEN_STATUSES.map(() => "?").join(",");
+  const row = db
+    .prepare(
+      `SELECT * FROM leads
+       WHERE phone = ? AND type = ? AND product_code IS ?
+         AND status IN (${placeholders})
+       ORDER BY created_at DESC, id DESC LIMIT 1`,
+    )
+    .get(input.phone, input.type, input.product_code ?? null, ...OPEN_STATUSES) as
+    | Lead
+    | undefined;
+  return row ?? null;
+}
+
+/**
+ * Move a lead through its lifecycle. Returns the updated lead, or null when no
+ * such lead exists.
+ *
+ * `claimed_by` is who is handling it — the admin phone behind the session. It
+ * is CLEARED on a move back to 'new', because a lead nobody is handling must
+ * not keep naming somebody: a list that shows an owner for an unattended lead
+ * is how one sits untouched while everyone assumes the named person has it.
+ */
+export function setLeadStatus(
+  db: DB,
+  input: { id: number; status: LeadStatus; claimedBy?: string | null },
+): Lead | null {
+  const changed = db
+    .prepare(
+      `UPDATE leads
+       SET status = @status,
+           status_changed_at = datetime('now'),
+           claimed_by = @claimed_by
+       WHERE id = @id`,
+    )
+    .run({
+      id: input.id,
+      status: input.status,
+      claimed_by: input.status === "new" ? null : (input.claimedBy ?? null),
+    }).changes;
+  if (changed === 0) return null;
+  return db.prepare(`SELECT * FROM leads WHERE id = ?`).get(input.id) as Lead;
+}
+
+/**
+ * How many leads still owe somebody a contact. What a dashboard leads with, and
+ * what the owner's notification counts against.
+ */
+export function countOpenLeads(db: DB): number {
+  const placeholders = OPEN_STATUSES.map(() => "?").join(",");
+  const row = db
+    .prepare(`SELECT COUNT(*) AS n FROM leads WHERE status IN (${placeholders})`)
+    .get(...OPEN_STATUSES) as { n: number };
+  return row.n;
+}
+
+/**
+ * Leads, newest first.
+ *
+ * `limit` IS NOT OPTIONAL IN EFFECT — it defaults, because the unbounded
+ * version was reachable from the `list_leads` tool and put EVERY lead the store
+ * has ever captured into the model's context, one line each, on a turn the
+ * owner was waiting for. A default that grows without bound is a default that
+ * eventually fails in production and nowhere else.
+ */
+export function listLeads(
+  db: DB,
+  options: { sinceDays?: number; status?: LeadStatus; openOnly?: boolean; limit?: number } = {},
+): Lead[] {
+  const { sinceDays, status, openOnly, limit = 100 } = options;
+  const clauses: string[] = [];
+  const params: (string | number)[] = [];
+
   if (sinceDays !== undefined) {
-    return db
-      .prepare(
-        `SELECT * FROM leads WHERE created_at >= datetime('now', ?) ORDER BY created_at DESC`,
-      )
-      .all(`-${sinceDays} days`) as Lead[];
+    clauses.push(`created_at >= datetime('now', ?)`);
+    params.push(`-${sinceDays} days`);
   }
-  return db.prepare(`SELECT * FROM leads ORDER BY created_at DESC`).all() as Lead[];
+  if (status !== undefined) {
+    clauses.push(`status = ?`);
+    params.push(status);
+  } else if (openOnly) {
+    clauses.push(`status IN (${OPEN_STATUSES.map(() => "?").join(",")})`);
+    params.push(...OPEN_STATUSES);
+  }
+
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+  return db
+    .prepare(`SELECT * FROM leads ${where} ORDER BY created_at DESC, id DESC LIMIT ?`)
+    .all(...params, limit) as Lead[];
 }
 
 // --- Contacts / sessions ------------------------------------------------------
@@ -526,6 +667,14 @@ export interface ConversationMessage {
   occurred_at: string;
   /** When we wrote it down. Differs from occurred_at on a replayed batch. */
   recorded_at: string;
+  /**
+   * The admin phone that sent this, or NULL when the assistant did.
+   *
+   * The one field that tells a human's words from a model's. Without it an
+   * admin's reply and the bot's are the same row, which answers the single
+   * question a handoff exists to make answerable.
+   */
+  sent_by: string | null;
 }
 
 /**
@@ -661,25 +810,41 @@ export function recordOutboundMessage(
      * Defaults to now(), which is what every current caller means.
      */
     occurredAt?: string;
+    /**
+     * The admin phone that sent this, when a HUMAN did.
+     *
+     * OMITTED MEANS THE ASSISTANT, which is every message this system sent
+     * before an admin could reply into a conversation — so existing rows read
+     * correctly with no backfill. It is part of the dedupe key below because
+     * the same words from a human and from the agent are two different events,
+     * and collapsing them would attribute one to whichever wrote first.
+     */
+    sentBy?: string;
   },
 ): boolean {
   const info = db
     .prepare(
       `INSERT OR IGNORE INTO conversation_messages
          (dedupe_key, direction, conversation_key, agent_id, body, kind,
-          turn_key, source_inbox_id, occurred_at)
+          turn_key, source_inbox_id, occurred_at, sent_by)
        VALUES
          (@dedupe_key, 'outbound', @conversation_key, @agent_id, @body, @kind,
-          @turn_key, NULL, COALESCE(@occurred_at, datetime('now')))`,
+          @turn_key, NULL, COALESCE(@occurred_at, datetime('now')), @sent_by)`,
     )
     .run({
-      dedupe_key: outboundDedupeKey(input.conversationKey, input.turnKey, input.body),
+      dedupe_key: outboundDedupeKey(
+        input.conversationKey,
+        input.turnKey,
+        input.body,
+        input.sentBy ?? null,
+      ),
       conversation_key: input.conversationKey,
       agent_id: input.agentId,
       body: input.body,
       kind: input.kind ?? "text",
       turn_key: input.turnKey,
       occurred_at: input.occurredAt ?? null,
+      sent_by: input.sentBy ?? null,
     });
   return info.changes > 0;
 }
@@ -788,9 +953,14 @@ function inboundDedupeKey(inboxId: number): string {
  * JSON.stringify over an array, so no field's own punctuation can shift a
  * boundary; the 'out:' prefix keeps the two directions' key spaces apart.
  */
-function outboundDedupeKey(conversationKey: string, turnKey: string, body: string): string {
+function outboundDedupeKey(
+  conversationKey: string,
+  turnKey: string,
+  body: string,
+  sentBy: string | null,
+): string {
   const digest = createHash("sha256")
-    .update(JSON.stringify([conversationKey, turnKey, body]))
+    .update(JSON.stringify([conversationKey, turnKey, body, sentBy]))
     .digest("hex");
   return `out:${digest}`;
 }
@@ -1115,6 +1285,161 @@ export function deleteConversationToolCalls(
 ): number {
   return db
     .prepare(`DELETE FROM conversation_tool_calls WHERE conversation_key = ? AND agent_id = ?`)
+    .run(conversationKey, agentId).changes;
+}
+
+// --- Handoff ------------------------------------------------------------------
+
+// When a human has taken over a conversation and the agent must be silent.
+//
+// The sales agent captures a lead, tells the customer a team member will follow
+// up, and then keeps answering — because nothing told it to stop. These are
+// what tell it. See the conversation_handoff block in db.ts for why the state
+// is a row with a lifetime rather than a boolean column.
+
+export interface Handoff {
+  id: number;
+  conversation_key: string;
+  agent_id: string;
+  paused_at: string;
+  /** The phone behind the admin session that paused it. Attribution, not authorisation. */
+  paused_by: string;
+  reason: string | null;
+  released_at: string | null;
+  released_by: string | null;
+}
+
+/**
+ * Is this conversation currently handled by a human?
+ *
+ * CALLED ON EVERY INBOUND BATCH, before the turn — so it is the hottest read in
+ * this module after the claim itself, and `idx_conversation_handoff_live` is
+ * what makes it an index lookup rather than a scan of every handoff ever.
+ *
+ * Scoped by agent like everything else over a conversation: pausing somebody's
+ * sales thread must not silence the same person's owner thread.
+ */
+export function isConversationPaused(db: DB, conversationKey: string, agentId: string): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 FROM conversation_handoff
+       WHERE conversation_key = ? AND agent_id = ? AND released_at IS NULL
+       LIMIT 1`,
+    )
+    .get(conversationKey, agentId);
+  return row !== undefined;
+}
+
+/**
+ * Hand a conversation to a human. Returns the live handoff — the existing one
+ * when it was already paused.
+ *
+ * IDEMPOTENT, and that is not a convenience. Two admins opening the same thread
+ * and both hitting pause is ordinary, and a second row would make "released"
+ * ambiguous: releasing would close one and leave the conversation paused by the
+ * other, with the console showing it as live. One immediate transaction so the
+ * check and the insert see one state — the same reasoning as every other
+ * read-then-write in this codebase.
+ */
+export function pauseConversation(
+  db: DB,
+  input: { conversationKey: string; agentId: string; pausedBy: string; reason?: string },
+): Handoff {
+  const pause = db.transaction((): Handoff => {
+    const existing = db
+      .prepare(
+        `SELECT * FROM conversation_handoff
+         WHERE conversation_key = ? AND agent_id = ? AND released_at IS NULL
+         ORDER BY id ASC LIMIT 1`,
+      )
+      .get(input.conversationKey, input.agentId) as Handoff | undefined;
+    if (existing) return existing;
+
+    const info = db
+      .prepare(
+        `INSERT INTO conversation_handoff (conversation_key, agent_id, paused_by, reason)
+         VALUES (@conversation_key, @agent_id, @paused_by, @reason)`,
+      )
+      .run({
+        conversation_key: input.conversationKey,
+        agent_id: input.agentId,
+        paused_by: input.pausedBy,
+        reason: input.reason ?? null,
+      });
+    return db
+      .prepare(`SELECT * FROM conversation_handoff WHERE id = ?`)
+      .get(info.lastInsertRowid) as Handoff;
+  });
+  return pause.immediate();
+}
+
+/**
+ * Give the conversation back to the agent. Returns how many handoffs closed —
+ * 0 when it was not paused.
+ *
+ * Closes EVERY live row for the pair, not just the newest. A second row should
+ * be impossible (pauseConversation is idempotent), but if one ever exists,
+ * leaving it open would mean a release that reports success and changes
+ * nothing — the agent still silent, the console showing it live, and nobody
+ * able to tell why.
+ */
+export function releaseConversation(
+  db: DB,
+  input: { conversationKey: string; agentId: string; releasedBy: string },
+): number {
+  return db
+    .prepare(
+      `UPDATE conversation_handoff
+       SET released_at = datetime('now'), released_by = @released_by
+       WHERE conversation_key = @conversation_key AND agent_id = @agent_id
+         AND released_at IS NULL`,
+    )
+    .run({
+      conversation_key: input.conversationKey,
+      agent_id: input.agentId,
+      released_by: input.releasedBy,
+    }).changes;
+}
+
+/** Every conversation a human currently holds, oldest pause first. */
+export function listPausedConversations(db: DB): Handoff[] {
+  return db
+    .prepare(
+      `SELECT * FROM conversation_handoff WHERE released_at IS NULL ORDER BY paused_at ASC`,
+    )
+    .all() as Handoff[];
+}
+
+/** One conversation's handoff history, newest first — the traceability an audit asks for. */
+export function listConversationHandoffs(
+  db: DB,
+  conversationKey: string,
+  agentId: string,
+): Handoff[] {
+  return db
+    .prepare(
+      `SELECT * FROM conversation_handoff
+       WHERE conversation_key = ? AND agent_id = ?
+       ORDER BY paused_at DESC, id DESC`,
+    )
+    .all(conversationKey, agentId) as Handoff[];
+}
+
+/**
+ * Forget one conversation's handoff history. Returns the number of rows.
+ *
+ * Deleted with the words and the tool trace, for the same reason and at the
+ * same call sites: `paused_by` and `reason` are notes a human wrote ABOUT a
+ * named customer, so a purge that left them behind would report that person
+ * forgotten while a record of them sat in a third table.
+ */
+export function deleteConversationHandoffs(
+  db: DB,
+  conversationKey: string,
+  agentId: string,
+): number {
+  return db
+    .prepare(`DELETE FROM conversation_handoff WHERE conversation_key = ? AND agent_id = ?`)
     .run(conversationKey, agentId).changes;
 }
 

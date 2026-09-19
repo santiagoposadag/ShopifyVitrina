@@ -14,7 +14,21 @@ import { countAgentCredentials } from "./data/agent-registry.js";
 import { registerTestConsole } from "./admin/test-console.js";
 import { countRosterEntries } from "./data/test-roster.js";
 import { registerAdminConsole } from "./admin/console.js";
-import { countAdminEntries } from "./data/admin-roster.js";
+import {
+  ADMIN_LINK_RECORDED_PLACEHOLDER,
+  buildAdminLinkMessage,
+  isAdminLinkRequest,
+} from "./admin/link-request.js";
+import { buildLeadNotice } from "./egress/lead-notice.js";
+import {
+  ADMIN_CLAIM_TTL_MINUTES,
+  ADMIN_SESSION_TTL_HOURS,
+  countLiveAdminSessions,
+  deleteStaleAdminSessions,
+  issueAdminSession,
+  revokeAdminSession,
+} from "./data/admin-sessions.js";
+import { buildConsoleLink } from "./data/console-link.js";
 import {
   countAssignedOwners,
   listPhonesWithRole,
@@ -29,6 +43,7 @@ import { RateLimiter } from "./inbox/rate-limit.js";
 import {
   deleteStaleInboxRows,
   deleteStalePendingMedia,
+  isConversationPaused,
   listSessions,
   recordOutboundMessage,
   upsertContact,
@@ -135,7 +150,37 @@ async function main(): Promise<void> {
   // that holds the client and the shared cache.
   const ports: ToolPorts = {
     catalog: shopifyCatalogPort({ client: shopify, cache, config }),
-    leads: sqliteLeadsPort(db),
+    // A captured lead now TELLS SOMEBODY. Before this, the assistant promised
+    // the customer that a team member would follow up and then wrote a row
+    // nothing ever read — the promise depended on the owner remembering to ask.
+    //
+    // FIRE AND FORGET, and both halves are deliberate. The send happens inside
+    // a live tool call on a turn the customer is waiting on, so it must not be
+    // awaited (a slow transport would stall their reply) and it must not throw
+    // (a lead that was written must never fail because nobody could be told
+    // about it). Failures are logged, because a notification nobody receives
+    // and nobody notices is worse than none at all.
+    //
+    // `app.log` is reached through the closure rather than passed, the same way
+    // the agent port's thunks below reach the batcher: this object is built
+    // before Fastify is, and a lead can only arrive long after both exist.
+    leads: sqliteLeadsPort(db, {
+      leadCaptured: (lead) => {
+        void (async () => {
+          // The TABLE's owners, not the seed variable's, and re-read per lead —
+          // the same reasoning as notifyOwnersOfFailures: an owner assigned
+          // through the ops entry point is an owner, and alerting the variable
+          // instead would leave exactly that person unaware.
+          for (const owner of listPhonesWithRole(db, "owner")) {
+            try {
+              await channel.sendText(owner, buildLeadNotice(lead));
+            } catch (err) {
+              app.log.error({ err, leadId: lead.id, owner }, "could not notify an owner of a lead");
+            }
+          }
+        })();
+      },
+    }),
     media: sqliteMediaPort(db),
     knowledge,
     // One agent asking another, IN PROCESS: the same admission checks and the
@@ -221,10 +266,14 @@ async function main(): Promise<void> {
             config.sessionMaxAgeDays,
           )
         : 0;
+      // Admin sessions are swept long AFTER they expire, not on expiry: a dead
+      // session is still an audit record, and an admin write to a conversation
+      // names the session that made it. See deleteStaleAdminSessions.
+      const adminSessions = deleteStaleAdminSessions(db);
       const staged = await sweepStagedMedia(config.bridgeStagingDir, STAGED_MEDIA_TTL_HOURS);
-      if (media > 0 || inbox > 0 || transcripts > 0 || staged > 0) {
+      if (media > 0 || inbox > 0 || transcripts > 0 || staged > 0 || adminSessions > 0) {
         app.log.info(
-          `Housekeeping: removed ${media} stale pending media file(s), ${inbox} settled inbox row(s), ${transcripts} orphaned transcript(s), ${staged} orphaned staged file(s)`,
+          `Housekeeping: removed ${media} stale pending media file(s), ${inbox} settled inbox row(s), ${transcripts} orphaned transcript(s), ${staged} orphaned staged file(s), ${adminSessions} long-dead admin session(s)`,
         );
       }
     } catch (err) {
@@ -439,6 +488,78 @@ async function main(): Promise<void> {
         return; // Consumed; the inbox batch settles as done.
       }
 
+      // THE ADMIN LINK, and it is deliberately NOT a tool.
+      //
+      // A model that decides when to mint a credential is a model that can be
+      // talked into minting one, and the credential would land in
+      // `conversation_messages` — readable from the very console it opens, so
+      // one leaked session could mint its own successors forever. This is a
+      // deterministic intercept instead: an exact word, from a phone the
+      // ASSIGNMENTS TABLE says is an owner, checked before any agent runs.
+      //
+      // It sits after ECHO_MODE (a diagnostic that must answer everything) and
+      // before the two gates below, which only ever apply to non-owners.
+      //
+      // A non-owner writing the same word falls straight through to a normal
+      // turn, so nothing here tells them the intercept exists.
+      if (person && ctx.role === "owner" && isAdminLinkRequest(envelope.text)) {
+        const { session, token } = issueAdminSession(db, {
+          phone: person.phone,
+          issuedVia: "whatsapp",
+        });
+        const { link, path } = buildConsoleLink("/admin", token, config.publicBaseUrl);
+        try {
+          await channel.sendText(
+            person.phone,
+            buildAdminLinkMessage(link ?? path, {
+              claimMinutes: ADMIN_CLAIM_TTL_MINUTES,
+              sessionHours: ADMIN_SESSION_TTL_HOURS,
+            }),
+          );
+        } catch (err) {
+          // REVOKED ON A FAILED SEND. Nobody holds this token, so leaving it
+          // live would mean a valid session existing for fifteen minutes that
+          // no person ever received — small, but it is exactly the kind of
+          // credential nobody can account for later.
+          revokeAdminSession(db, session.id);
+          app.log.error({ err, phone: person.phone }, "could not send the admin link");
+          return;
+        }
+        app.log.warn(
+          { phone: person.phone, session: session.id },
+          "admin console: a link was issued over WhatsApp",
+        );
+        // The FACT, never the secret — see ADMIN_LINK_RECORDED_PLACEHOLDER.
+        recordOutboundMessage(db, {
+          conversationKey: envelope.conversationKey,
+          agentId: envelope.agentId,
+          turnKey: envelope.turnKey,
+          body: ADMIN_LINK_RECORDED_PLACEHOLDER,
+        });
+        return; // Consumed; the inbox batch settles as done.
+      }
+
+      // A HUMAN HAS THIS CONVERSATION. The agent says nothing at all.
+      //
+      // The inbound rows are ALREADY RECORDED by the time this runs (the
+      // batcher records before calling here), so the person's messages reach
+      // the console and the admin sees everything they said while paused —
+      // which is the whole point. What does not happen is a turn: no Claude
+      // call, no tools, no reply.
+      //
+      // Gated on the PRINCIPAL being a person: an agent-to-agent caller is
+      // parked on an open request and answering it with silence would hang it
+      // until its timeout. Nothing pauses an a2a conversation today, and if
+      // something ever does, this is the line that has to be revisited rather
+      // than the one that quietly did the wrong thing.
+      if (person && isConversationPaused(db, envelope.conversationKey, envelope.agentId)) {
+        app.log.info(
+          { phone: person.phone, agentId: envelope.agentId },
+          "conversation is handled by a human; the agent stayed silent",
+        );
+        return; // Consumed; the inbox batch settles as done.
+      }
+
       // Kill switch: with the customer path disabled, non-owners get a static
       // notice and the agent never runs (no Claude call). One reply per
       // coalesced burst, so a message barrage cannot turn this into spam.
@@ -603,8 +724,8 @@ async function main(): Promise<void> {
   // unconditionally and CLOSED until an operator adds an `admin_roster` row,
   // on the same "one switch, and it is the data" principle as the two doors
   // above.
-  registerAdminConsole(app, { db });
-  const admins = countAdminEntries(db);
+  registerAdminConsole(app, { db, channel });
+  const admins = countLiveAdminSessions(db);
   if (admins > 0) {
     // WARN, next to ECHO_MODE and the test console, and for a reason of its
     // own: what is open here is every customer's phone number and every word
@@ -613,11 +734,12 @@ async function main(): Promise<void> {
     // every restart rather than be something an operator has to remember
     // enabling.
     app.log.warn(
-      `ADMIN CONSOLE IS OPEN to ${admins} credential(s) at GET /admin — each of them can read ` +
-        "EVERY conversation in this store: every customer's phone number, every message, and " +
-        "every catalog operation performed on their behalf. It is read-only. Revoke a " +
-        "credential with `admin-credentials remove <name>`; it stops working on its next " +
-        "request, with no restart.",
+      `ADMIN CONSOLE IS OPEN: ${admins} live session(s) at GET /admin. Each can read EVERY ` +
+        "conversation in this store — every customer's phone number, every message, and every " +
+        "catalog operation performed on their behalf — and can take a conversation over and " +
+        "reply inside it as the business. Sessions expire on their own; revoke one now with " +
+        "`admin-access revoke <id>`, or all of a phone's with `admin-access revoke-phone " +
+        "<phone>`. Either takes effect on the next request, with no restart.",
     );
   }
 

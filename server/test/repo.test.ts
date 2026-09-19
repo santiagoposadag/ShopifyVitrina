@@ -57,7 +57,7 @@ describe("leads", () => {
     db.prepare(`UPDATE leads SET created_at = datetime('now', '-10 days')`).run();
     insertLead(db, { phone: PHONE, type: "follow_up" });
 
-    expect(listLeads(db, 3)).toHaveLength(1);
+    expect(listLeads(db, { sinceDays: 3 })).toHaveLength(1);
     expect(listLeads(db)).toHaveLength(2);
   });
 });

@@ -364,31 +364,32 @@ services:
       - vitrina-data:/data
     profiles: ["ops"]
 
-  # Who may READ every conversation in this store, and the ONLY way onto that
-  # roster — see server/src/data/admin-roster.ts and docs/admin-console.md. The
-  # admin_roster table IS the switch: with no rows GET /admin answers 404 on
-  # every path, the same shape as agent-credentials and test-console above.
-  #   docker compose --profile ops run --rm admin-credentials list
-  #   docker compose --profile ops run --rm admin-credentials add santiago --label "Portátil"
-  #   docker compose --profile ops run --rm admin-credentials remove santiago
+  # ADMIN ACCESS. Who can currently reach the console, cutting somebody off, and
+  # — as BREAK GLASS — issuing a link from a terminal. See
+  # server/src/data/admin-sessions.ts and docs/admin-console.md.
   #
-  # `entrypoint` rather than `command` so `run --rm admin-credentials add ...`
+  # THE NORMAL PATH IS NOT THIS SERVICE: an admin writes "panel" to the business
+  # number from a phone the assignments table says is an owner, and is sent a
+  # link that dies on its own. This is for the failure that path cannot survive
+  # — WhatsApp down, the bridge unlinked, Meta rejecting sends — where the
+  # alternative would be an operator locked out of their own store's history.
+  #
+  #   docker compose --profile ops run --rm admin-access list
+  #   docker compose --profile ops run --rm admin-access issue 573001112233
+  #   docker compose --profile ops run --rm admin-access revoke 7
+  #   docker compose --profile ops run --rm admin-access revoke-phone 573001112233
+  #
+  # `entrypoint` rather than `command` so `run --rm admin-access issue ...`
   # APPENDS its arguments instead of replacing the whole command.
   #
-  # A SEPARATE ROSTER FROM test-console ABOVE, and that separation is the
-  # containment: a test-console token flips ONE phone's own role, an admin token
-  # reads EVERY customer's phone number and every word they typed. One table for
-  # both would silently make each test link the second thing, invisibly from
-  # either console's code.
+  # THERE IS NO DURABLE ADMIN CREDENTIAL to mint here, deliberately. Whoever can
+  # run this already has the database, so a permanent token would add exposure
+  # without adding access — and the token travels through a WhatsApp chat, which
+  # is backed up, synced to Web, and readable by whoever holds the phone.
   #
   # Needs OWNER_PHONE_NUMBERS for the same reason as its neighbours (legacy
-  # session migration on open), and PUBLIC_BASE_URL to print a working link
-  # rather than a bare path.
-  #
-  # The token is printed ONCE, inside a link, and only its SHA-256 is stored, so
-  # a lost link is replaced with `rotate`, never looked up. `remove` revokes on
-  # the link's next request, with no restart.
-  admin-credentials:
+  # session migration on open), and PUBLIC_BASE_URL to print a working link.
+  admin-access:
     image: vitrina-server
     build:
       context: .
@@ -397,8 +398,12 @@ services:
       <<: *data-env
       OWNER_PHONE_NUMBERS: ${OWNER_PHONE_NUMBERS:-}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
-    entrypoint: ["node", "server/dist/data/admin-credentials.js"]
+    entrypoint: ["node", "server/dist/data/admin-access.js"]
     volumes:
+      - vitrina-data:/data
+    profiles: ["ops"]
+
+volumes:
       - vitrina-data:/data
     profiles: ["ops"]
 
