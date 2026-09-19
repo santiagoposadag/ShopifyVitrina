@@ -61,6 +61,8 @@ const CONFIG: Config = {
   whatsappAccessToken: "",
   whatsappGraphBaseUrl: "https://graph.facebook.com",
   whatsappGraphVersion: "v23.0",
+  whatsappLeadTemplateName: "lead_capturado",
+  whatsappLeadTemplateLanguage: "es",
   bridgeUrl: "http://bridge:3002",
   bridgeApiToken: "bridge-token",
   bridgeStagingDir: "/tmp/inbound",

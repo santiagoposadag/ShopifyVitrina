@@ -56,4 +56,52 @@ export interface WhatsAppChannel {
    * a reason to lose the message.
    */
   releaseMedia?(ref: string): Promise<void>;
+
+  /**
+   * Deliver an APPROVED template, the only message a transport may send outside
+   * the 24-hour customer service window.
+   *
+   * OPTIONAL BECAUSE IT IS A PROPERTY OF THE TRANSPORT, not a gap. The Cloud API
+   * enforces that window and rejects a free-form reply past it with code 131047;
+   * the linked-device bridge has no window at all and no notion of a template,
+   * so implementing this there would mean faking a concept the transport does
+   * not have. A caller checks for the method rather than for a provider name —
+   * "can this transport send a template" is the question, and the shape answers
+   * it.
+   */
+  sendTemplate?(to: string, template: TemplateMessage): Promise<void>;
+}
+
+/**
+ * One approved template, filled in.
+ *
+ * NAMED AND VERSIONED BY DATA, not by code: the name and language identify a
+ * template Meta approved, and neither is ours to invent at runtime. They come
+ * from configuration so that renaming an approved template — or approving a
+ * second language — is a variable and a restart rather than a deploy.
+ */
+export interface TemplateMessage {
+  /** The approved template's name, exactly as Meta has it. */
+  name: string;
+  /** The approved language code, e.g. "es". A template exists PER language. */
+  language: string;
+  /**
+   * The body's `{{1}}`, `{{2}}`, … in order.
+   *
+   * EVERY ONE MUST BE NON-EMPTY and free of newlines, tabs and long runs of
+   * spaces — Meta rejects the SEND, not the template, when one is not. The
+   * caller sanitises, because only the caller knows what a sensible stand-in
+   * for a missing value is.
+   */
+  bodyParams: string[];
+  /**
+   * What is appended to the URL button's base, when the template has a dynamic
+   * one.
+   *
+   * THE SUFFIX ALONE, never the whole URL: Meta stores the base with the
+   * approved template and concatenates. Sending a full URL here produces a link
+   * with the origin twice, which fails as a 404 for the person who taps it and
+   * as nothing at all in any log.
+   */
+  buttonUrlSuffix?: string;
 }

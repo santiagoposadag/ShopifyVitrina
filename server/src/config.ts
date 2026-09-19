@@ -75,6 +75,24 @@ export interface Config {
    * deliberately, to the version the app panel shows.
    */
   whatsappGraphVersion: string;
+  /**
+   * The APPROVED template used to notify an owner that a lead came in, and its
+   * language.
+   *
+   * CONFIGURATION RATHER THAN A LITERAL, because neither value is ours to
+   * invent: they identify something Meta approved, a template exists PER
+   * language, and a rename on their side must be a variable and a restart
+   * rather than a deploy.
+   *
+   * EMPTY DISABLES THE TEMPLATE PATH, which is what a deployment without an
+   * approved template needs — and what the bridge transport is in permanently,
+   * since it has no templates at all. The notification then goes as free-form
+   * text, which works inside the 24-hour window and fails outside it. That is
+   * strictly what the behaviour was before templates existed, so an untouched
+   * deployment keeps working unchanged.
+   */
+  whatsappLeadTemplateName: string;
+  whatsappLeadTemplateLanguage: string;
   /** Internal URL of the bridge sidecar, e.g. http://bridge:3002 */
   bridgeUrl: string;
   /** Bearer token for the bridge's /send endpoint. */
@@ -404,6 +422,11 @@ export function loadConfig(): Config {
       "",
     ),
     whatsappGraphVersion: optional("WHATSAPP_GRAPH_VERSION", "v23.0"),
+    // Defaulted to the template this repo documents and submitted (see
+    // docs/admin-console.md). A deployment that has not approved it yet sets
+    // the name to empty, and lead notices fall back to free-form text.
+    whatsappLeadTemplateName: optional("WHATSAPP_LEAD_TEMPLATE_NAME", "lead_capturado").trim(),
+    whatsappLeadTemplateLanguage: optional("WHATSAPP_LEAD_TEMPLATE_LANG", "es").trim(),
     bridgeUrl: requiredFor("BRIDGE_URL", "bridge").replace(/\/+$/, ""),
     bridgeApiToken: requiredFor("BRIDGE_API_TOKEN", "bridge"),
     // Empty on the Cloud API, where nothing is staged on disk. Both consumers

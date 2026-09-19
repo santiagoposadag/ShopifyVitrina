@@ -15,13 +15,13 @@ import { registerTestConsole } from "./admin/test-console.js";
 import { countRosterEntries } from "./data/test-roster.js";
 import { registerAdminConsole } from "./admin/console.js";
 import { registerDeepLinks } from "./admin/deep-link.js";
-import { deleteStaleAdminDeepLinks } from "./data/admin-deep-links.js";
+import { deleteStaleAdminDeepLinks, mintAdminDeepLink } from "./data/admin-deep-links.js";
 import {
   ADMIN_LINK_RECORDED_PLACEHOLDER,
   buildAdminLinkMessage,
   isAdminLinkRequest,
 } from "./admin/link-request.js";
-import { buildLeadNotice } from "./egress/lead-notice.js";
+import { buildLeadNotice, buildLeadTemplate } from "./egress/lead-notice.js";
 import {
   ADMIN_CLAIM_TTL_MINUTES,
   ADMIN_SESSION_TTL_HOURS,
@@ -30,7 +30,7 @@ import {
   issueAdminSession,
   revokeAdminSession,
 } from "./data/admin-sessions.js";
-import { buildConsoleLink } from "./data/console-link.js";
+import { buildConsoleLink, buildLandingLink } from "./data/console-link.js";
 import {
   countAssignedOwners,
   listPhonesWithRole,
@@ -66,7 +66,7 @@ import { sqliteLeadsPort, sqliteMediaPort } from "./data/tool-ports.js";
 import type { ToolPorts } from "./tools/ports.js";
 import { loadAndValidateDefinitions } from "./agent/definition.js";
 import { countIndexedChunks, estimateTokens, loadKnowledgeBase } from "./knowledge/store.js";
-import type { Role } from "./types.js";
+import type { Lead, Role } from "./types.js";
 
 const RATE_LIMIT_NOTICE =
   "Estamos recibiendo muchos mensajes tuyos en poco tiempo. Dame unos minutos y escríbeme de nuevo, por favor.";
@@ -147,6 +147,88 @@ async function main(): Promise<void> {
     definitions: Object.values(definitions),
     universe: toolUniverse(),
   });
+  /**
+   * Tell ONE owner that a lead came in, with a link straight into it.
+   *
+   * THE TEMPLATE IS TRIED FIRST AND THE TEXT IS THE FALLBACK, which is the
+   * reverse of what "cheapest first" would suggest and is deliberate. Only a
+   * template can carry a BUTTON, and the button is the feature — it opens the
+   * conversation. Sending free-form first would mean the owner normally gets
+   * the worse message and only gets the good one when they have been silent
+   * over 24 hours, which is exactly backwards. From 1 October 2026 the two cost
+   * the same anyway, so the argument for text-first does not survive either.
+   *
+   * THE FALLBACK IS WHAT KEEPS THIS HONEST. It runs when the transport has no
+   * templates at all (the bridge), when none is configured, and when Meta
+   * rejects the send — a name that no longer matches, a parameter count that
+   * drifted from what was approved. In every one of those the owner still hears
+   * about the lead; inside the 24-hour window the text arrives exactly as it
+   * did before templates existed.
+   *
+   * A LANDING CODE IS MINTED PER OWNER PER LEAD, because it is single use and
+   * attributed: two owners must not share one, or the second to tap it lands on
+   * "this link expired". It is spent by whoever opens it and dies in a day
+   * either way.
+   *
+   * NOTHING HERE THROWS. It runs inside a live tool call, and a lead that was
+   * written must never fail because nobody could be told about it.
+   */
+  const notifyOwnerOfLead = async (owner: string, lead: Lead): Promise<void> => {
+    let landingCode: string | undefined;
+    let landingUrl: string | undefined;
+    try {
+      const minted = mintAdminDeepLink(db, {
+        phone: owner,
+        conversationKey: lead.conversation_key,
+        agentId: lead.agent_id,
+        leadId: lead.id,
+      });
+      landingCode = minted.code;
+      // `link` is null when PUBLIC_BASE_URL is missing or still a placeholder,
+      // in which case a URL in the message would be one nobody can open. The
+      // button suffix is still usable — Meta holds the real base.
+      landingUrl = buildLandingLink("/go", minted.code, config.publicBaseUrl).link ?? undefined;
+    } catch (err) {
+      // A notification without a link beats no notification. The owner can
+      // still write "panel".
+      app.log.error({ err, leadId: lead.id }, "could not mint a landing link for a lead notice");
+    }
+
+    const templateName = config.whatsappLeadTemplateName;
+    if (channel.sendTemplate && templateName.length > 0 && landingCode !== undefined) {
+      try {
+        await channel.sendTemplate(
+          owner,
+          buildLeadTemplate({
+            lead,
+            name: templateName,
+            language: config.whatsappLeadTemplateLanguage,
+            landingCode,
+          }),
+        );
+        return;
+      } catch (err) {
+        // WARN, not ERROR: the message has not failed yet, the good shape of it
+        // has. The line still has to name the template, because a rejection
+        // here is almost always a name or a parameter count that drifted from
+        // what Meta approved, and neither is visible anywhere else.
+        app.log.warn(
+          { err, leadId: lead.id, template: templateName },
+          "lead template rejected; falling back to free-form text",
+        );
+      }
+    }
+
+    try {
+      await channel.sendText(owner, buildLeadNotice(lead, landingUrl));
+    } catch (err) {
+      // Both shapes are spent. Outside the 24-hour window with no working
+      // template this is where a notice dies, and the log line is the only
+      // place that fact exists.
+      app.log.error({ err, leadId: lead.id, owner }, "could not notify an owner of a lead");
+    }
+  };
+
   // What the tools may reach, assembled here and nowhere else: the packs state
   // policy, these five decide what performs it. The catalog adapter is the one
   // that holds the client and the shared cache.
@@ -173,12 +255,13 @@ async function main(): Promise<void> {
           // the same reasoning as notifyOwnersOfFailures: an owner assigned
           // through the ops entry point is an owner, and alerting the variable
           // instead would leave exactly that person unaware.
+          //
+          // SEQUENTIAL, not a concurrent map: this runs inside a live tool call
+          // on a turn the customer is waiting for, and a store with several
+          // owners would otherwise fan out into several simultaneous Graph
+          // requests for a message nobody is waiting on.
           for (const owner of listPhonesWithRole(db, "owner")) {
-            try {
-              await channel.sendText(owner, buildLeadNotice(lead));
-            } catch (err) {
-              app.log.error({ err, leadId: lead.id, owner }, "could not notify an owner of a lead");
-            }
+            await notifyOwnerOfLead(owner, lead);
           }
         })();
       },
