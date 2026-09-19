@@ -204,11 +204,37 @@ export interface LeadDraft {
   note?: string;
   /** SKU or handle the lead is about, free text. */
   productCode?: string;
+  /**
+   * WHICH EXCHANGE produced this lead. Taken from the TURN by the tool, never
+   * from the model — the same rule the phone already follows, and for a
+   * stronger reason: a model-supplied turn key would point a lead at an
+   * exchange that never happened, and the whole value of the link is that an
+   * operator can open the conversation behind it.
+   */
+  conversationKey?: string;
+  agentId?: string;
+  turnKey?: string;
+}
+
+/** What a caller asks for when listing leads. */
+export interface LeadQuery {
+  sinceDays?: number;
+  /** Only leads that still owe somebody a contact. */
+  openOnly?: boolean;
+  limit?: number;
 }
 
 export interface LeadsPort {
-  save(draft: LeadDraft): Promise<Lead>;
-  list(sinceDays?: number): Promise<Lead[]>;
+  /**
+   * Save a lead, or return the still-open one it would duplicate.
+   *
+   * `created` says which happened, because the tool has to tell the model —
+   * "already noted" and "noted" are different things to say to a customer who
+   * is asking a second time, and a model that cannot tell them apart will
+   * cheerfully promise a second follow-up nobody is going to make.
+   */
+  save(draft: LeadDraft): Promise<{ lead: Lead; created: boolean }>;
+  list(query?: LeadQuery): Promise<Lead[]>;
 }
 
 /**

@@ -1,7 +1,13 @@
 import type { LeadsPort, MediaPort, PendingPhoto } from "../tools/ports.js";
 import type { Lead } from "../types.js";
 import type { DB } from "./db.js";
-import { insertLead, listLeads, listPendingMedia, markPendingMediaAttached } from "./repo.js";
+import {
+  findOpenDuplicateLead,
+  insertLead,
+  listLeads,
+  listPendingMedia,
+  markPendingMediaAttached,
+} from "./repo.js";
 
 /**
  * The SQLite side of the tool ports.
@@ -16,17 +22,55 @@ import { insertLead, listLeads, listPendingMedia, markPendingMediaAttached } fro
  * able to implement it, and awaiting a resolved promise costs a microtask.
  */
 
-export function sqliteLeadsPort(db: DB): LeadsPort {
+/**
+ * What happens once a lead is captured, beyond writing the row.
+ *
+ * INJECTED RATHER THAN CALLED FROM HERE, because the only useful thing to do is
+ * send a WhatsApp message and this module must not know what a transport is —
+ * every other query in it is a query. The composition root has the channel and
+ * wires it (see index.ts).
+ */
+export interface LeadNotifier {
+  /**
+   * Tell whoever needs to know. MUST NOT THROW and MUST NOT BLOCK the caller:
+   * this runs inside a live tool call on a turn the customer is waiting for,
+   * and a lead that was written must never fail because nobody could be
+   * notified about it. The implementation logs its own failures.
+   */
+  leadCaptured(lead: Lead): void;
+}
+
+export function sqliteLeadsPort(db: DB, notifier?: LeadNotifier): LeadsPort {
   return {
-    save: async (draft): Promise<Lead> =>
-      insertLead(db, {
+    save: async (draft): Promise<{ lead: Lead; created: boolean }> => {
+      // DEDUPE BEFORE INSERT. A customer who asks three times about the same
+      // sold-out item is one promise to contact them, not three — see
+      // findOpenDuplicateLead for what "the same ask" means and why a closed
+      // lead deliberately does not match.
+      const duplicate = findOpenDuplicateLead(db, {
+        phone: draft.phone,
+        type: draft.type,
+        product_code: draft.productCode,
+      });
+      if (duplicate) return { lead: duplicate, created: false };
+
+      const lead = insertLead(db, {
         phone: draft.phone,
         type: draft.type,
         name: draft.name,
         note: draft.note,
         product_code: draft.productCode,
-      }),
-    list: async (sinceDays?: number): Promise<Lead[]> => listLeads(db, sinceDays),
+        conversation_key: draft.conversationKey,
+        agent_id: draft.agentId,
+        turn_key: draft.turnKey,
+      });
+      // ONLY ON A REAL CAPTURE. Notifying on a duplicate would page the owner
+      // every time an impatient customer repeats themselves, which is how a
+      // notification stops being read at all.
+      notifier?.leadCaptured(lead);
+      return { lead, created: true };
+    },
+    list: async (query = {}): Promise<Lead[]> => listLeads(db, query),
   };
 }
 

@@ -30,8 +30,20 @@ export interface Lead {
   type: LeadType;
   name: string | null;
   note: string | null;
+  /** 'new' | 'in_progress' | 'closed' — see LeadStatus in data/repo.ts. */
   status: string;
   created_at: string;
+  /**
+   * Which exchange produced this lead. NULL on any lead captured before leads
+   * carried a provenance at all — an honest gap rather than an invented turn.
+   */
+  conversation_key: string | null;
+  agent_id: string | null;
+  turn_key: string | null;
+  /** When the status last moved. NULL while it has never moved off 'new'. */
+  status_changed_at: string | null;
+  /** The admin phone handling it. Cleared whenever the status returns to 'new'. */
+  claimed_by: string | null;
 }
 
 /**

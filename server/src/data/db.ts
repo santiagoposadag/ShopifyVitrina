@@ -467,48 +467,100 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
       occurred_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
-    -- WHO MAY READ EVERY CONVERSATION IN THIS DEPLOYMENT.
+    -- WHO MAY READ EVERY CONVERSATION IN THIS DEPLOYMENT, AND UNTIL WHEN.
     --
     -- THIS TABLE IS THE SWITCH, exactly like agent_registry: the admin console
-    -- authenticates by looking a presented token up in here, so an empty table
-    -- matches nothing and the console answers 404 on every path. There is no
-    -- second enabling flag, for the reason stated on agent_registry — two
+    -- authenticates by looking a presented token up in here, so a table with no
+    -- live row matches nothing and the console answers 404 on every path. There
+    -- is no second enabling flag, for the reason stated on agent_registry — two
     -- switches for one thing is how one ends up in the wrong position.
     --
-    -- A THIRD CREDENTIAL TABLE, and the separation is the containment. This one
-    -- CANNOT share test_roster: that roster's whole shape is one token → one
-    -- phone, which is what lets the test console have no phone parameter
-    -- anywhere in its surface. An admin credential is the opposite by
-    -- definition — it reads everyone — so putting the two in one table would
-    -- turn every test link into a reader of every customer's conversation, and
-    -- nothing in either console's code would show it. Three tables, three key
-    -- spaces, none of them a superset of another.
+    -- SESSIONS, NOT A DURABLE CREDENTIAL, and that is the whole shape. An admin
+    -- asks for access from their own WhatsApp and is sent a link; there is no
+    -- long-lived operator-minted credential to lose, rotate or forget to revoke.
+    -- The reason is the delivery channel: a token that travels through a chat
+    -- lands in a history that is backed up, synced to WhatsApp Web, and readable
+    -- by anyone holding the phone. A permanent credential delivered that way
+    -- would turn one forwarded message into permanent access to every
+    -- customer's data. So every token here dies on its own.
     --
-    -- KEYED BY AN OPERATOR-CHOSEN NAME, NOT A PHONE. An admin is not a
-    -- WhatsApp principal: they never receive a message, no role is resolved for
-    -- them, and they may not have a number in this system at all. A phone
-    -- primary key here would invite exactly the wrong question — "is this admin
-    -- an owner?" — which nothing answers and nothing should.
+    -- TWO DEADLINES, ONE SECRET. expires_at before the first use is the
+    -- CLAIM window — minutes, because a link sitting unopened in a chat is the
+    -- exposure this design exists to bound, and one from last week must be
+    -- dead. The first authenticated request stamps claimed_at and pushes
+    -- expires_at out to the session length, because by then the person is
+    -- working in the console and re-authenticating every few minutes would just
+    -- train them to keep a link around.
     --
-    -- WHAT A TOKEN HERE GRANTS IS READ-ONLY AND THE CONSOLE ENFORCES IT: the
-    -- admin surface has no write route at all. That is a much larger read than
-    -- the test console's (every customer's number and every word they typed,
-    -- third parties under Ley 1581 — see DEUDA #7), which is why the link is a
-    -- bearer credential to be treated like one and why remove takes effect on
-    -- the next request with no restart.
+    -- NOT SINGLE-USE, and saying so plainly matters more than the feature
+    -- would: a link intercepted and opened inside the claim window yields the
+    -- same session the owner would have got. What the claim window buys is that
+    -- stale links are worthless and that the exposure has a floor, not that a
+    -- live one is safe. Revocation is revoked_at, and it takes effect on the
+    -- next request with no restart.
     --
-    -- token_hash NOT NULL and UNIQUE, name the PRIMARY KEY, label operator-typed
-    -- and rendered with textContent only — same reasoning as test_roster, which
-    -- states it at length.
+    -- phone IS WHO ASKED, recorded at issue time, and is NOT what authorises
+    -- the request — assignments is (only a phone that reads as owner may ask,
+    -- see the WhatsApp intercept in index.ts). Kept here so a session can be
+    -- attributed: every admin write to a conversation records which session
+    -- made it, and a session that cannot name a person answers no question.
     --
     -- A new table, so IF NOT EXISTS IS the migration for a database that
     -- predates it: nothing here alters an existing table.
-    CREATE TABLE IF NOT EXISTS admin_roster (
-      name TEXT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS admin_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
       token_hash TEXT NOT NULL UNIQUE,
-      label TEXT NOT NULL DEFAULT '',
+      -- normalizePhone's output: the same key space as assignments, so the
+      -- owner check and this attribution cannot disagree about who a phone is.
+      phone TEXT NOT NULL,
+      -- How it was issued: 'whatsapp' for the normal path, 'cli' for the
+      -- break-glass one. Stored rather than inferred, so a session issued from
+      -- a terminal is visible as such in a listing rather than looking like a
+      -- request somebody made from their phone.
+      issued_via TEXT NOT NULL DEFAULT 'whatsapp' CHECK (issued_via IN ('whatsapp','cli')),
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      rotated_at TEXT
+      -- NULL until the link is first opened. Stamped once, never moved.
+      claimed_at TEXT,
+      -- The claim deadline before claimed_at, the session deadline after.
+      expires_at TEXT NOT NULL,
+      revoked_at TEXT
+    );
+
+    -- WHEN A HUMAN HAS TAKEN OVER A CONVERSATION, AND THE AGENT MUST BE SILENT.
+    --
+    -- The sales agent captures a lead and tells the customer a team member will
+    -- follow up — and then keeps answering, because nothing told it to stop.
+    -- The person is talking to a bot that is standing in front of the human who
+    -- is supposed to be helping them. This table is what stops that.
+    --
+    -- A ROW WITH released_at IS NULL MEANS PAUSED. Not a boolean column on some
+    -- other table: the history is the point. "Who took this over, when, and how
+    -- long did it sit paused" is exactly the traceability an operator asks for
+    -- after a complaint, and a flag overwritten in place answers none of it.
+    --
+    -- SCOPED BY (conversation_key, agent_id) like everything else over a
+    -- conversation. One phone holds a thread with each persona; pausing the
+    -- sales conversation must not silence the same person's owner conversation.
+    --
+    -- NOTHING AUTO-RELEASES, deliberately. A timer that resumed the bot on its
+    -- own would do it mid-exchange, with the human mid-sentence and no way to
+    -- notice — the agent would simply start answering over them. The cost is
+    -- the opposite failure (a conversation left paused and forgotten), which is
+    -- visible: the console badges it, and the index can list only those.
+    --
+    -- A new table, so IF NOT EXISTS IS the migration for a database that
+    -- predates it: nothing here alters an existing table.
+    CREATE TABLE IF NOT EXISTS conversation_handoff (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      conversation_key TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      paused_at TEXT NOT NULL DEFAULT (datetime('now')),
+      -- The phone behind the admin session that paused it. Attribution, not
+      -- authorisation: the session is what authorised the request.
+      paused_by TEXT NOT NULL,
+      reason TEXT,
+      released_at TEXT,
+      released_by TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
@@ -542,6 +594,17 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
     -- growing of the two tables on every page view.
     CREATE INDEX IF NOT EXISTS idx_conversation_tool_calls_turn
       ON conversation_tool_calls(turn_key, ordinal);
+    -- "Is this conversation paused?" runs on EVERY inbound batch, before the
+    -- turn, so it is the hottest read this schema has after the claim itself.
+    -- released_at last, because the live rows are the ones being matched.
+    CREATE INDEX IF NOT EXISTS idx_conversation_handoff_live
+      ON conversation_handoff(conversation_key, agent_id, released_at);
+    -- Authentication scans this per request. Small by construction (sessions
+    -- expire), but the scan is a constant-time compare per row, so keeping it
+    -- to the live ones is what stops a year of expired tokens from being
+    -- compared on every page load.
+    CREATE INDEX IF NOT EXISTS idx_admin_sessions_live
+      ON admin_sessions(revoked_at, expires_at);
     CREATE INDEX IF NOT EXISTS idx_pending_media_phone ON pending_media(phone);
   `);
 
@@ -598,6 +661,29 @@ function migrate(db: DB, options: SchemaOptions): void {
   addColumn(db, "inbox", "reply_to", "TEXT");
   addColumn(db, "inbox", "hop", "INTEGER NOT NULL DEFAULT 0");
   backfillInboxEnvelope(db);
+  // WHO SENT AN OUTBOUND MESSAGE, when it was not the agent.
+  //
+  // NULL means the assistant answered, which is every row written before an
+  // admin could reply into a conversation at all — so existing rows read
+  // correctly with no backfill. A non-null value is the admin phone behind the
+  // session that sent it. Without this an admin's reply and the bot's are the
+  // same row, and a trace that cannot tell a human's words from a model's
+  // answers the one question a handoff exists to make answerable.
+  addColumn(db, "conversation_messages", "sent_by", "TEXT");
+  // WHERE A LEAD CAME FROM. The phone alone says who, never which exchange —
+  // so an operator holding a lead could not find the conversation that
+  // produced it, which is the first thing they want. Nullable and unbackfilled:
+  // a lead written before this existed genuinely has no turn to point at, and
+  // inventing one would be worse than an honest gap.
+  addColumn(db, "leads", "conversation_key", "TEXT");
+  addColumn(db, "leads", "agent_id", "TEXT");
+  addColumn(db, "leads", "turn_key", "TEXT");
+  // The lifecycle `status` never had. The column already defaults to 'new' and
+  // nothing ever moved it; these two are what a transition writes. No CHECK,
+  // because SQLite cannot add one to an existing table and the writer is a
+  // single typed function (see repo.ts setLeadStatus).
+  addColumn(db, "leads", "status_changed_at", "TEXT");
+  addColumn(db, "leads", "claimed_by", "TEXT");
   // Created HERE rather than in createSchema: the column it indexes is added by
   // the step immediately above, so on an existing database a CREATE INDEX in
   // the schema block would run against a table that does not have it yet and

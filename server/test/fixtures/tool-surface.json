@@ -407,13 +407,20 @@
     },
     {
       "name": "list_leads",
-      "description": "List captured leads (inquiries, back-in-stock requests and follow-ups), optionally limited to the last N days.",
+      "description": "List captured leads (inquiries, back-in-stock requests and follow-ups). By default shows only leads still waiting to be handled; pass include_handled to see closed ones too, and since_days to limit by age.",
       "params": {
         "since_days": {
           "type": "ZodNumber",
           "optional": true,
           "descriptions": [
             "Only leads from the last N days"
+          ]
+        },
+        "include_handled": {
+          "type": "ZodBoolean",
+          "optional": true,
+          "descriptions": [
+            "Include leads already marked as closed. Defaults to false."
           ]
         }
       }

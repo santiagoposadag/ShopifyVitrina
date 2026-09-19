@@ -1,14 +1,19 @@
 import Fastify, { type FastifyInstance, type LightMyRequestResponse } from "fastify";
 import { describe, expect, it } from "vitest";
 import { registerAdminConsole } from "../src/admin/console.js";
-import { addAdminEntry } from "../src/data/admin-roster.js";
+import { issueAdminSession, revokeAdminSession } from "../src/data/admin-sessions.js";
 import { openDb, type DB } from "../src/data/db.js";
 import {
+  insertLead,
+  isConversationPaused,
+  listConversationMessages,
+  pauseConversation,
   recordInboundMessages,
   recordOutboundMessage,
   recordToolCall,
 } from "../src/data/repo.js";
 import { AGENT_IDS } from "../src/router.js";
+import type { WhatsAppChannel } from "../src/whatsapp/channel.js";
 
 /**
  * The admin console: /admin, /admin/conversations, /admin/conversation.
@@ -34,31 +39,68 @@ const OTHER = "573004445566";
 const INVENTORY = AGENT_IDS.owner;
 const SALES = AGENT_IDS.customer;
 
+const ADMIN = "573009998877";
+
 interface Harness {
   app: FastifyInstance;
   db: DB;
   token: string;
+  sessionId: number;
+  /** Everything the console asked the transport to deliver. */
+  sent: { to: string; body: string }[];
   get: (path: string, token?: string) => Promise<LightMyRequestResponse>;
+  post: (path: string, body: unknown, token?: string) => Promise<LightMyRequestResponse>;
 }
 
-async function harness(options: { empty?: boolean } = {}): Promise<Harness> {
+/**
+ * A transport that records instead of sending. The console's send route is the
+ * one place it reaches the outside world, and what matters about it is WHAT it
+ * asked to deliver and WHETHER it recorded only after that succeeded — so the
+ * fake can also be told to fail.
+ */
+function fakeChannel(sent: { to: string; body: string }[], fail?: Error): WhatsAppChannel {
+  return {
+    sendText: async (to: string, body: string) => {
+      if (fail) throw fail;
+      sent.push({ to, body });
+    },
+    downloadMedia: async () => {
+      throw new Error("not used");
+    },
+  } as unknown as WhatsAppChannel;
+}
+
+async function harness(
+  options: { empty?: boolean; sendFails?: Error } = {},
+): Promise<Harness> {
   const db = openDb(":memory:");
   let token = "";
-  if (!options.empty) token = addAdminEntry(db, "santiago", "Portátil").token;
+  let sessionId = 0;
+  if (!options.empty) {
+    const minted = issueAdminSession(db, { phone: ADMIN, issuedVia: "whatsapp" });
+    token = minted.token;
+    sessionId = minted.session.id;
+  }
 
+  const sent: { to: string; body: string }[] = [];
   const app = Fastify({ logger: false });
-  registerAdminConsole(app, { db });
+  registerAdminConsole(app, { db, channel: fakeChannel(sent, options.sendFails) });
   await app.ready();
 
   return {
     app,
     db,
     token,
+    sessionId,
+    sent,
     get: (path, value = `Bearer ${token}`) =>
+      app.inject({ method: "GET", url: path, headers: { authorization: value } }),
+    post: (path, body, value = `Bearer ${token}`) =>
       app.inject({
-        method: "GET",
+        method: "POST",
         url: path,
-        headers: value === undefined ? {} : { authorization: value },
+        headers: { authorization: value, "content-type": "application/json" },
+        payload: JSON.stringify(body),
       }),
   };
 }
@@ -390,53 +432,371 @@ describe("admin console: one conversation", () => {
   });
 });
 
-describe("admin console: read-only", () => {
+describe("admin console: taking a conversation over", () => {
+  async function withThread() {
+    const h = await harness();
+    seedInbound(h.db, SALES, PHONE, "t1", "quiero 40 unidades", "2026-01-01 10:00:00", 1);
+    return h;
+  }
+
+  it("pauses a conversation and names who took it", async () => {
+    const h = await withThread();
+
+    const response = await h.post("/admin/conversation/pause", {
+      key: PHONE,
+      agent: SALES,
+      reason: "pedido al por mayor",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().paused).toBe(true);
+    // Asserted against the DATABASE, because this is the flag the message
+    // pipeline reads before every turn — not against the response alone.
+    expect(isConversationPaused(h.db, PHONE, SALES)).toBe(true);
+    expect(response.json().handoff).toMatchObject({
+      paused_by: ADMIN,
+      reason: "pedido al por mayor",
+      released_at: null,
+    });
+  });
+
   /**
-   * Asserted against the DATABASE rather than against the absence of a write in
-   * the source, so a future route that did write would fail here rather than
-   * pass a review.
+   * Two admins opening the same thread and both hitting pause is ordinary. A
+   * second handoff row would make release ambiguous: it would close one and
+   * leave the conversation paused by the other, with the console showing it
+   * live.
    */
-  it("changes nothing in the database, whatever is requested", async () => {
+  it("is idempotent, so a second pause does not create a second handoff", async () => {
+    const h = await withThread();
+
+    const first = await h.post("/admin/conversation/pause", { key: PHONE, agent: SALES });
+    const second = await h.post("/admin/conversation/pause", { key: PHONE, agent: SALES });
+
+    expect(second.json().handoff.id).toBe(first.json().handoff.id);
+    const thread = (await h.get(`/admin/conversation?key=${PHONE}&agent=${SALES}`)).json();
+    expect(thread.handoffs).toHaveLength(1);
+  });
+
+  it("releases it back to the agent and keeps the history", async () => {
+    const h = await withThread();
+    await h.post("/admin/conversation/pause", { key: PHONE, agent: SALES });
+
+    const response = await h.post("/admin/conversation/release", { key: PHONE, agent: SALES });
+
+    expect(response.json()).toMatchObject({ paused: false, released: 1 });
+    expect(isConversationPaused(h.db, PHONE, SALES)).toBe(false);
+    // The row stays: "who took this over, when, and how long did it sit" is the
+    // traceability an audit asks for, and a flag overwritten in place answers
+    // none of it.
+    const thread = (await h.get(`/admin/conversation?key=${PHONE}&agent=${SALES}`)).json();
+    expect(thread.handoffs[0]).toMatchObject({ released_by: ADMIN });
+    expect(thread.handoffs[0].released_at).not.toBeNull();
+  });
+
+  it("pauses only the named persona, not the same phone's other thread", async () => {
+    const h = await withThread();
+    seedInbound(h.db, INVENTORY, PHONE, "t2", "como dueño", "2026-01-01 11:00:00", 2);
+
+    await h.post("/admin/conversation/pause", { key: PHONE, agent: SALES });
+
+    expect(isConversationPaused(h.db, PHONE, SALES)).toBe(true);
+    expect(isConversationPaused(h.db, PHONE, INVENTORY)).toBe(false);
+  });
+
+  it("reports the paused state on the thread and on the index", async () => {
+    const h = await withThread();
+    await h.post("/admin/conversation/pause", { key: PHONE, agent: SALES });
+
+    const thread = (await h.get(`/admin/conversation?key=${PHONE}&agent=${SALES}`)).json();
+    const index = (await h.get("/admin/conversations")).json();
+
+    expect(thread.paused).toBe(true);
+    expect(index.pausedCount).toBe(1);
+    expect(index.conversations[0].paused).toBe(true);
+  });
+});
+
+describe("admin console: replying inside a conversation", () => {
+  async function paused() {
+    const h = await harness();
+    seedInbound(h.db, SALES, PHONE, "t1", "quiero 40 unidades", "2026-01-01 10:00:00", 1);
+    await h.post("/admin/conversation/pause", { key: PHONE, agent: SALES });
+    return h;
+  }
+
+  it("delivers the message and records it as the human's", async () => {
+    const h = await paused();
+
+    const response = await h.post("/admin/conversation/message", {
+      key: PHONE,
+      agent: SALES,
+      body: "Hola, soy Santiago. Sí podemos con 40 unidades.",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(h.sent).toEqual([
+      { to: PHONE, body: "Hola, soy Santiago. Sí podemos con 40 unidades." },
+    ]);
+    const recorded = listConversationMessages(h.db, PHONE, { agentId: SALES });
+    const outbound = recorded.filter((m) => m.direction === "outbound");
+    expect(outbound).toHaveLength(1);
+    // sent_by is the one field that tells a human's words from a model's, and
+    // it is the whole question a handoff exists to make answerable.
+    expect(outbound[0]?.sent_by).toBe(ADMIN);
+    expect(outbound[0]?.turn_key.startsWith("admin:")).toBe(true);
+  });
+
+  /**
+   * THE INVARIANT THAT MAKES A HANDOFF MEAN ANYTHING. Without it the admin's
+   * message and the agent's next reply interleave, and the customer gets two
+   * voices answering the same question with neither aware of the other. The
+   * route refuses rather than pausing on the admin's behalf, because an
+   * implicit takeover is one nobody remembers to undo.
+   */
+  it("refuses to send into a conversation the agent still handles", async () => {
     const h = await harness();
     seedInbound(h.db, SALES, PHONE, "t1", "hola", "2026-01-01 10:00:00", 1);
-    recordToolCall(h.db, {
+
+    const response = await h.post("/admin/conversation/message", {
+      key: PHONE,
+      agent: SALES,
+      body: "hola",
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: "not_paused" });
+    expect(h.sent).toEqual([]);
+  });
+
+  /**
+   * Recording a message the person never received is the exact failure the
+   * record exists to make visible — the same contract Responders.deliver keeps.
+   */
+  it("records nothing when the transport fails", async () => {
+    const db = openDb(":memory:");
+    recordInboundMessages(db, {
+      agentId: SALES,
+      turnKey: "t1",
+      rows: [
+        {
+          id: 1,
+          conversation_key: PHONE,
+          agent_text: "hola",
+          kind: "text",
+          received_at: "2026-01-01 10:00:00",
+        },
+      ],
+    });
+    pauseConversation(db, { conversationKey: PHONE, agentId: SALES, pausedBy: ADMIN });
+    const { token } = issueAdminSession(db, { phone: ADMIN, issuedVia: "whatsapp" });
+    const app = Fastify({ logger: false });
+    registerAdminConsole(app, {
+      db,
+      channel: fakeChannel([], new Error("bridge unreachable")),
+    });
+    await app.ready();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/admin/conversation/message",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      payload: JSON.stringify({ key: PHONE, agent: SALES, body: "hola" }),
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(
+      listConversationMessages(db, PHONE, { agentId: SALES }).filter(
+        (m) => m.direction === "outbound",
+      ),
+    ).toEqual([]);
+  });
+
+  it("refuses an empty message and one past the length cap", async () => {
+    const h = await paused();
+
+    expect((await h.post("/admin/conversation/message", { key: PHONE, agent: SALES, body: "   " })).statusCode).toBe(400);
+    expect(
+      (
+        await h.post("/admin/conversation/message", {
+          key: PHONE,
+          agent: SALES,
+          body: "x".repeat(5000),
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(h.sent).toEqual([]);
+  });
+
+  /**
+   * An a2a conversation key is a correlation id, not a phone. Sending into one
+   * would hand `sendText` a string that looks nothing like a number and,
+   * worse, there is no person on the other end to receive it.
+   */
+  it("refuses to send into an agent-to-agent conversation", async () => {
+    const h = await harness();
+    const a2a = "a2a:super-agent:vitrina-inventario:corr-1";
+    seedInbound(h.db, INVENTORY, a2a, "t1", "consulta", "2026-01-01 10:00:00", 1);
+    await h.post("/admin/conversation/pause", { key: a2a, agent: INVENTORY });
+
+    const response = await h.post("/admin/conversation/message", {
+      key: a2a,
+      agent: INVENTORY,
+      body: "hola",
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ error: "not_a_person" });
+    expect(h.sent).toEqual([]);
+    // And the thread says so up front rather than leaving it to be discovered.
+    const thread = (await h.get(`/admin/conversation?key=${encodeURIComponent(a2a)}&agent=${INVENTORY}`)).json();
+    expect(thread.replyable).toBe(false);
+  });
+});
+
+describe("admin console: the leads panel", () => {
+  function seedLead(db: DB, overrides: Record<string, unknown> = {}) {
+    return insertLead(db, {
+      phone: PHONE,
+      type: "follow_up",
+      note: "quiere 40 unidades",
+      conversation_key: PHONE,
+      agent_id: SALES,
+      turn_key: "t1",
+      ...overrides,
+    });
+  }
+
+  it("lists open leads with the conversation that produced each one", async () => {
+    const h = await harness();
+    seedLead(h.db);
+
+    const body = (await h.get("/admin/leads")).json();
+
+    expect(body.leads).toHaveLength(1);
+    expect(body.leads[0]).toMatchObject({
+      phone: PHONE,
+      type: "follow_up",
+      status: "new",
+      // The link back to the exchange. This is what makes a lead actionable
+      // rather than a phone number and a guess.
       conversationKey: PHONE,
       agentId: SALES,
       turnKey: "t1",
-      ordinal: 1,
-      toolName: "search_catalog",
-      toolInput: { query: "x" },
-      result: "nada",
-      outcome: "ok",
-      durationMs: 10,
+    });
+  });
+
+  it("hides handled leads by default and shows them on request", async () => {
+    const h = await harness();
+    const lead = seedLead(h.db);
+    await h.post("/admin/lead/status", { id: lead.id, status: "closed" });
+
+    expect((await h.get("/admin/leads")).json().leads).toHaveLength(0);
+    expect((await h.get("/admin/leads?include_handled=true")).json().leads).toHaveLength(1);
+  });
+
+  it("records who took a lead, and clears that on reopening", async () => {
+    const h = await harness();
+    const lead = seedLead(h.db);
+
+    const taken = (await h.post("/admin/lead/status", { id: lead.id, status: "in_progress" })).json();
+    expect(taken.lead).toMatchObject({ status: "in_progress", claimed_by: ADMIN });
+
+    // A lead nobody is handling must not keep naming somebody: that is how one
+    // sits untouched while everyone assumes the named person has it.
+    const reopened = (await h.post("/admin/lead/status", { id: lead.id, status: "new" })).json();
+    expect(reopened.lead).toMatchObject({ status: "new", claimed_by: null });
+  });
+
+  it("refuses a status outside the lifecycle", async () => {
+    const h = await harness();
+    const lead = seedLead(h.db);
+
+    const response = await h.post("/admin/lead/status", { id: lead.id, status: "archivado" });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it("answers 404 for a lead that does not exist", async () => {
+    const h = await harness();
+    const response = await h.post("/admin/lead/status", { id: 999, status: "closed" });
+    expect(response.statusCode).toBe(404);
+  });
+});
+
+describe("admin console: the session behind a request", () => {
+  /**
+   * The link is a claim window until it is opened, then a session. Nothing
+   * observes the opening except the first authenticated request, which is why
+   * authentication claims rather than a separate login step doing it.
+   */
+  it("claims the session on its first authenticated request", async () => {
+    const h = await harness();
+
+    const before = h.db
+      .prepare(`SELECT claimed_at FROM admin_sessions WHERE id = ?`)
+      .get(h.sessionId) as { claimed_at: string | null };
+    expect(before.claimed_at).toBeNull();
+
+    await h.get("/admin/conversations");
+
+    const after = h.db
+      .prepare(`SELECT claimed_at FROM admin_sessions WHERE id = ?`)
+      .get(h.sessionId) as { claimed_at: string | null };
+    expect(after.claimed_at).not.toBeNull();
+  });
+
+  /**
+   * A revoked session must answer exactly like an unknown one. Telling a holder
+   * that their token is real but stale is telling a prober that the token they
+   * found used to work.
+   */
+  it("refuses a revoked session in the same words as an unknown token", async () => {
+    const h = await harness();
+    // A second live session, so the surface stays open and the first refusal is
+    // about THIS token rather than about the console being closed.
+    issueAdminSession(h.db, { phone: "573001110000", issuedVia: "cli" });
+    revokeAdminSession(h.db, h.sessionId);
+
+    const response = await h.get("/admin/conversations");
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({ error: "unauthorized" });
+  });
+
+  /** An expired session is dead without anything having to sweep it. */
+  it("refuses a session past its deadline", async () => {
+    const h = await harness();
+    issueAdminSession(h.db, { phone: "573001110000", issuedVia: "cli" });
+    h.db
+      .prepare(`UPDATE admin_sessions SET expires_at = datetime('now', '-1 minute') WHERE id = ?`)
+      .run(h.sessionId);
+
+    expect((await h.get("/admin/conversations")).statusCode).toBe(401);
+  });
+
+  /** With every session dead the surface is closed again, shell included. */
+  it("closes the whole surface once no session is live", async () => {
+    const h = await harness();
+    revokeAdminSession(h.db, h.sessionId);
+
+    expect((await h.app.inject({ method: "GET", url: "/admin" })).statusCode).toBe(404);
+    expect((await h.get("/admin/conversations")).statusCode).toBe(404);
+  });
+
+  /** Every write attributes itself to the session's phone, never to a body field. */
+  it("attributes writes to the session, with no field a caller could smuggle one into", async () => {
+    const h = await harness();
+    seedInbound(h.db, SALES, PHONE, "t1", "hola", "2026-01-01 10:00:00", 1);
+
+    const response = await h.post("/admin/conversation/pause", {
+      key: PHONE,
+      agent: SALES,
+      pausedBy: "573000000000",
     });
 
-    const before = {
-      messages: h.db.prepare(`SELECT COUNT(*) AS n FROM conversation_messages`).get(),
-      tools: h.db.prepare(`SELECT COUNT(*) AS n FROM conversation_tool_calls`).get(),
-      admins: h.db.prepare(`SELECT COUNT(*) AS n FROM admin_roster`).get(),
-      assignments: h.db.prepare(`SELECT COUNT(*) AS n FROM assignments`).get(),
-    };
-
-    await h.app.inject({ method: "GET", url: "/admin" });
-    await h.get("/admin/conversations");
-    await h.get(`/admin/conversation?key=${PHONE}&agent=${SALES}`);
-    // Every write verb, on every route, refused by the router rather than
-    // served: nothing here registers one.
-    for (const method of ["POST", "PUT", "PATCH", "DELETE"] as const) {
-      const response = await h.app.inject({
-        method,
-        url: "/admin/conversations",
-        headers: { authorization: `Bearer ${h.token}` },
-      });
-      expect(response.statusCode).toBe(404);
-    }
-
-    expect({
-      messages: h.db.prepare(`SELECT COUNT(*) AS n FROM conversation_messages`).get(),
-      tools: h.db.prepare(`SELECT COUNT(*) AS n FROM conversation_tool_calls`).get(),
-      admins: h.db.prepare(`SELECT COUNT(*) AS n FROM admin_roster`).get(),
-      assignments: h.db.prepare(`SELECT COUNT(*) AS n FROM assignments`).get(),
-    }).toEqual(before);
+    // `.strict()`: a body carrying an identity field is REJECTED, not ignored.
+    // A silently dropped field lets a caller believe such a field exists and
+    // might one day be honoured.
+    expect(response.statusCode).toBe(400);
   });
 });

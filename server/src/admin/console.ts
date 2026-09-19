@@ -1,53 +1,75 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
-import { countAdminEntries, findAdminByToken, type AdminEntry } from "../data/admin-roster.js";
+import { isAgentConversationKey } from "../a2a-protocol.js";
+import {
+  authenticateAdminSession,
+  countLiveAdminSessions,
+  type AdminSession,
+} from "../data/admin-sessions.js";
 import type { DB } from "../data/db.js";
 import {
+  clearSessionId,
   countConversations,
+  isConversationPaused,
+  listConversationHandoffs,
   listConversations,
   listConversationMessages,
   listConversationToolCalls,
+  listLeads,
+  listPausedConversations,
+  pauseConversation,
+  recordOutboundMessage,
+  releaseConversation,
+  setLeadStatus,
+  LEAD_STATUSES,
   type ConversationMessage,
+  type LeadStatus,
   type MessageDirection,
   type ToolCall,
   type ToolOutcome,
 } from "../data/repo.js";
 import { AGENT_IDS } from "../router.js";
+import type { WhatsAppChannel } from "../whatsapp/channel.js";
 
 /**
- * The admin console: a read-only view of every conversation this deployment has
- * held, and of what the assistant actually DID inside each one.
+ * The admin console: every conversation this deployment has held, what the
+ * assistant DID inside each turn, the leads those turns captured — and the two
+ * controls that let a human take one over.
  *
- * WHY IT EXISTS: the words alone do not answer the question an operator is
- * really asking about an assistant that can reprice and delete products in a
- * live store. A reply saying "listo, quedó en $80.000" reads identically
- * whether the write succeeded, was refused by a business rule, or never
- * happened. `conversation_tool_calls` is where that difference lives, and this
- * is what renders it beside the message it explains.
+ * WHY IT EXISTS: the words alone do not answer the question an operator has
+ * about an assistant that can reprice and delete products in a live store. A
+ * reply saying "listo, quedó en $80.000" reads identically whether the write
+ * succeeded, was refused by a business rule, or never happened.
+ * `conversation_tool_calls` is where that difference lives, and this renders it
+ * beside the message it explains.
  *
- * READ-ONLY, AND THAT IS STRUCTURAL RATHER THAN A RULE SOMEBODY REMEMBERS:
- * there is no write route in this file, and the three functions it imports from
- * the repo layer are all SELECTs. Nothing here flips a role, reprices anything,
- * or deletes a conversation. A credential's blast radius is "saw things".
+ * IT IS NO LONGER READ-ONLY, and that is a deliberate revision rather than
+ * drift. The earlier version had no write route and said so as a structural
+ * property. It gained three, because the thing it was built to reveal — a
+ * customer escalated to a human — could be SEEN and not ACTED ON: the agent
+ * kept answering over the person who was supposed to help them. The three are
+ * narrow and each names one conversation or one lead: pause, release, and send
+ * one message. There is still nothing here that touches the catalog, a role, or
+ * a credential.
  *
- * THE CONTRAST WITH THE TEST CONSOLE IS DELIBERATE AND RUNS THE OTHER WAY.
- * admin/test-console.ts has NO phone parameter anywhere in its surface, because
- * its whole containment argument is that the phone comes from the credential
- * and a caller cannot name anyone else. This surface is the opposite by
- * definition — reading every conversation is the feature — so it cannot borrow
- * that argument and must not borrow that credential. `admin_roster` is a
- * separate table for exactly this reason (see data/admin-roster.ts).
+ * SENDING REQUIRES THE CONVERSATION TO BE PAUSED, and that is the invariant
+ * that makes a handoff mean anything. Without it an admin's message and the
+ * agent's next reply interleave, the customer gets two voices answering the
+ * same question, and neither knows about the other. So the console pauses
+ * first, and the route refuses rather than quietly pausing on the admin's
+ * behalf — an implicit takeover is one nobody remembers to undo.
  *
- * WHAT IS EXPOSED IS LARGE AND SHOULD BE TREATED AS SUCH: every customer's
- * phone number, every message they sent, and every catalog operation performed
- * on their behalf. Those customers are third parties under Ley 1581 (DEUDA #7
- * carries the retention decision this sits on top of). The link is a bearer
- * credential and data/admin-credentials.ts says so at length when it mints one.
+ * AUTHENTICATION IS A SESSION, NOT A CREDENTIAL. An admin asks from their own
+ * WhatsApp and is sent a link that dies on its own (see data/admin-sessions.ts
+ * for the two deadlines and why the delivery channel forces them). A table with
+ * no live session matches nothing and every path answers 404, so the surface is
+ * shipped CLOSED with no second enabling flag — the same "off by default" story
+ * as the agent door.
  *
- * NOT MARKED TEMPORARY, unlike the test console. This answers a standing
- * operational need rather than covering a manual test period, so it carries no
- * removal checklist — but it is still killed instantly by emptying its roster,
- * with no restart, because authentication is a lookup in that table.
+ * WHAT IS EXPOSED IS LARGE: every customer's phone number, every message they
+ * sent, and every catalog operation performed on their behalf. Those customers
+ * are third parties under Ley 1581 (DEUDA #7 carries the retention decision
+ * this sits on top of).
  */
 
 /** The prefix every route lives under, so removal is one grep. */
@@ -59,21 +81,28 @@ const PREFIX = "/admin";
  * A CAP RATHER THAN A TRUSTED PARAMETER: the count comes off a query string, and
  * `listConversations` groups over the whole message table to answer it. An
  * unbounded limit would let one request render every conversation the store has
- * ever held into a single JSON document — which is a memory spike on a small
- * container, and a slow response on a server whose webhook must ACK fast.
+ * ever held into a single JSON document.
  */
 const MAX_PAGE = 200;
 
 /**
  * How many messages one thread renders, newest-last.
  *
- * `listConversationMessages` takes the MOST RECENT n when given a limit (its
- * own doc explains why taking the first n answers the wrong question), so a
+ * `listConversationMessages` takes the MOST RECENT n when given a limit, so a
  * long conversation shows its recent end rather than its beginning. There is no
- * retention policy on this table (DEUDA #7), so a conversation has no bound on
+ * retention policy on that table (DEUDA #7), so a conversation has no bound on
  * how long it can get and the unbounded read is the one that needs a decision.
  */
 const MAX_THREAD_MESSAGES = 500;
+
+/**
+ * How long one message an admin sends may be.
+ *
+ * WhatsApp's own limit is far higher; this is about what belongs in a chat
+ * reply typed into a web form, and about not handing the transport a megabyte
+ * because a paste went wrong.
+ */
+const MAX_ADMIN_MESSAGE_CHARS = 4096;
 
 const IndexQuerySchema = z
   .object({
@@ -87,22 +116,57 @@ const IndexQuerySchema = z
  *
  * `agent` is required, not optional-with-a-default: one phone holds a separate
  * conversation with each persona, and a reader that omitted the scope would be
- * handed the two interleaved into a conversation that never happened. Same
- * reasoning `listConversationMessages` states on its own agent scope.
+ * handed the two interleaved into a conversation that never happened.
  *
  * `.strict()` for the reason inbox/a2a.ts and the test console give: a silently
  * dropped field lets a caller believe such a field exists and might one day be
  * honoured.
  */
-const ThreadQuerySchema = z
+const ThreadQuerySchema = z.object({ key: z.string().min(1), agent: z.string().min(1) }).strict();
+
+const PauseBodySchema = z
   .object({
     key: z.string().min(1),
     agent: z.string().min(1),
+    reason: z.string().max(500).optional(),
+  })
+  .strict();
+
+const ReleaseBodySchema = z.object({ key: z.string().min(1), agent: z.string().min(1) }).strict();
+
+const MessageBodySchema = z
+  .object({
+    key: z.string().min(1),
+    agent: z.string().min(1),
+    body: z.string().trim().min(1).max(MAX_ADMIN_MESSAGE_CHARS),
+  })
+  .strict();
+
+const LeadsQuerySchema = z
+  .object({
+    include_handled: z.coerce.boolean().optional(),
+    limit: z.coerce.number().int().min(1).max(MAX_PAGE).default(100),
+  })
+  .strict();
+
+const LeadStatusBodySchema = z
+  .object({
+    id: z.coerce.number().int().positive(),
+    status: z.enum(LEAD_STATUSES as unknown as [LeadStatus, ...LeadStatus[]]),
   })
   .strict();
 
 export interface AdminConsoleDeps {
   db: DB;
+  /**
+   * How an admin's reply reaches the person.
+   *
+   * The same seam every other send in this process goes through, so the console
+   * is testable against a plain object — no HTTP client, no paired device. Its
+   * absence is what a build with no transport would look like, and the send
+   * route refuses rather than pretending.
+   */
+  channel: WhatsAppChannel;
 }
 
 /** The bearer token a request presented, or undefined. NEVER logged, never echoed. */
@@ -115,16 +179,16 @@ function bearerToken(header: string | string[] | undefined): string | undefined 
   const token = value.slice(separator + 1).trim();
   return token.length > 0 ? token : undefined;
 }
-// Copied from the sibling consoles rather than shared, on the same principle
-// they copy it from each other: the three credential surfaces stay disjoint,
-// and a helper shared between them is the first thread tying them together.
+// Copied from the sibling doors rather than shared, on the same principle they
+// copy it from each other: the credential surfaces stay disjoint, and a helper
+// shared between them is the first thread tying them together.
 
 /**
  * Headers every response here carries.
  *
  * `no-store` because the body is every customer's conversation and a cached
- * copy outlives the credential that fetched it; `noindex` because the URL will
- * be pasted into a chat and chat clients fetch previews.
+ * copy outlives the session that fetched it; `noindex` because the URL will be
+ * pasted into a chat and chat clients fetch previews.
  */
 function guardHeaders(reply: FastifyReply): FastifyReply {
   return reply.header("Cache-Control", "no-store").header("X-Robots-Tag", "noindex");
@@ -133,28 +197,28 @@ function guardHeaders(reply: FastifyReply): FastifyReply {
 /**
  * Who is asking, or a refusal already sent.
  *
- * TWO GATES, IN THIS ORDER, exactly as the test console does it. An empty
- * roster is a CLOSED feature, so it answers 404 on every path including the
- * unauthenticated shell — "no rows" must not be distinguishable from "not
- * deployed". Only then is the token looked at, and its refusal is one
- * vocabulary for all three ways it can fail (absent, malformed, unknown) so a
- * prober learns nothing about which.
+ * TWO GATES, IN THIS ORDER. No live session is a CLOSED feature, so it answers
+ * 404 on every path including the unauthenticated shell — "nobody has access"
+ * must not be distinguishable from "not deployed". Only then is the token
+ * looked at, and its refusal is one vocabulary for every way it can fail
+ * (absent, malformed, unknown, expired, revoked) so a prober learns nothing
+ * about which — in particular, not whether a token they hold is real but stale.
  */
 function authenticate(
   db: DB,
   reply: FastifyReply,
   authorization: string | string[] | undefined,
-): AdminEntry | null {
-  if (countAdminEntries(db) === 0) {
+): AdminSession | null {
+  if (countLiveAdminSessions(db) === 0) {
     void guardHeaders(reply).code(404).send({ error: "not_found" });
     return null;
   }
-  const entry = findAdminByToken(db, bearerToken(authorization));
-  if (!entry) {
+  const session = authenticateAdminSession(db, bearerToken(authorization));
+  if (!session) {
     void guardHeaders(reply).code(401).send({ error: "unauthorized" });
     return null;
   }
-  return entry;
+  return session;
 }
 
 /** Which assistant a stored agent id names, in the operator's words. */
@@ -167,15 +231,15 @@ function agentLabel(agentId: string): string {
   return agentId;
 }
 
-/** One message as the page renders it. */
 interface MessageView {
   direction: MessageDirection;
   body: string;
   kind: string;
   occurredAt: string;
+  /** NULL when the assistant answered; the admin phone when a human did. */
+  sentBy: string | null;
 }
 
-/** One executed tool call as the page renders it. */
 interface ToolCallView {
   ordinal: number;
   toolName: string;
@@ -187,7 +251,7 @@ interface ToolCallView {
 }
 
 /**
- * One turn: what the person said, what the assistant did about it, and what it
+ * One turn: what the person said, what the assistant did about it, and what was
  * answered.
  *
  * THE GROUPING IS turn_key, which both tables carry. That is what makes this
@@ -195,6 +259,10 @@ interface ToolCallView {
  * than one per coalesced prompt, and every message answered together shares a
  * turn key — so a burst of four photos and the one reply they produced belong
  * to one turn here, and the tool calls that ran in between sit between them.
+ *
+ * An admin's own messages arrive under their own synthetic turn keys, so each
+ * appears as its own turn in the right chronological place rather than being
+ * folded into whatever the agent was doing.
  */
 interface TurnView {
   turnKey: string;
@@ -210,13 +278,10 @@ interface TurnView {
  * A turn with no messages at all is possible and is NOT dropped: a batch that
  * failed after its tools ran but before any reply was delivered leaves exactly
  * that shape, and it is the single most informative thing this console can show
- * — an assistant that wrote to the store and then went silent. Dropping it
- * would hide the failure that most needs seeing.
+ * — an assistant that wrote to the store and then went silent.
  *
  * Both inputs arrive already ordered by their own readers, so this preserves
- * insertion order within a turn rather than re-sorting: the messages reader
- * orders by occurred_at then id, and the tool reader by ordinal, which is the
- * call sequence and deliberately not time (db.ts says why).
+ * insertion order within a turn rather than re-sorting.
  */
 function toTurns(messages: ConversationMessage[], toolCalls: ToolCall[]): TurnView[] {
   const turns = new Map<string, TurnView>();
@@ -240,6 +305,7 @@ function toTurns(messages: ConversationMessage[], toolCalls: ToolCall[]): TurnVi
       body: message.body,
       kind: message.kind,
       occurredAt: message.occurred_at,
+      sentBy: message.sent_by,
     });
   }
   for (const call of toolCalls) {
@@ -255,12 +321,31 @@ function toTurns(messages: ConversationMessage[], toolCalls: ToolCall[]): TurnVi
   }
 
   return [...turns.values()].sort((a, b) =>
-    a.occurredAt === b.occurredAt ? a.turnKey.localeCompare(b.turnKey) : a.occurredAt < b.occurredAt ? -1 : 1,
+    a.occurredAt === b.occurredAt
+      ? a.turnKey.localeCompare(b.turnKey)
+      : a.occurredAt < b.occurredAt
+        ? -1
+        : 1,
   );
 }
 
+/**
+ * A turn key for a message a HUMAN sent.
+ *
+ * Synthetic because there is no inbox batch behind it — nothing was claimed,
+ * nothing debounced. Namespaced `admin:` so it can never collide with a real
+ * turn key (those are inbox dedupe keys) and so a reader can tell at a glance
+ * that the turn had no agent in it. The session id plus the clock makes two
+ * messages from one admin in one second distinct, which matters because the
+ * outbound dedupe key includes the turn key: without it, an admin sending the
+ * same word twice on purpose would record once.
+ */
+function adminTurnKey(sessionId: number): string {
+  return `admin:${sessionId}:${Date.now()}`;
+}
+
 export function registerAdminConsole(app: FastifyInstance, deps: AdminConsoleDeps): void {
-  const { db } = deps;
+  const { db, channel } = deps;
 
   /**
    * The shell. UNAUTHENTICATED BECAUSE IT CANNOT BE AUTHENTICATED, and the
@@ -274,20 +359,27 @@ export function registerAdminConsole(app: FastifyInstance, deps: AdminConsoleDep
    * a live credential, at rest, in a file nobody thinks of as secret.
    */
   app.get(PREFIX, async (_request, reply) => {
-    if (countAdminEntries(db) === 0) {
+    if (countLiveAdminSessions(db) === 0) {
       return guardHeaders(reply).code(404).send({ error: "not_found" });
     }
     return guardHeaders(reply).type("text/html; charset=utf-8").send(PAGE);
   });
 
-  /** Every conversation, newest activity first. */
+  /** Every conversation, newest activity first, with paused ones marked. */
   app.get(`${PREFIX}/conversations`, async (request, reply) => {
-    const entry = authenticate(db, reply, request.headers.authorization);
-    if (!entry) return reply;
+    const session = authenticate(db, reply, request.headers.authorization);
+    if (!session) return reply;
 
     const parsed = IndexQuerySchema.safeParse(request.query);
     if (!parsed.success) return guardHeaders(reply).code(400).send({ error: "invalid_request" });
     const { limit, offset } = parsed.data;
+
+    // One read for every paused pair, rather than a liveness query per row: the
+    // page is 50 rows and the paused set is normally a handful, so this is one
+    // small query instead of fifty index lookups.
+    const paused = new Set(
+      listPausedConversations(db).map((h) => `${h.conversation_key}\u0000${h.agent_id}`),
+    );
 
     const conversations = listConversations(db, { limit, offset }).map((row) => ({
       conversationKey: row.conversation_key,
@@ -299,25 +391,25 @@ export function registerAdminConsole(app: FastifyInstance, deps: AdminConsoleDep
       lastOccurredAt: row.last_occurred_at,
       lastDirection: row.last_direction,
       lastBody: row.last_body,
+      paused: paused.has(`${row.conversation_key}\u0000${row.agent_id}`),
     }));
 
     return guardHeaders(reply)
       .code(200)
-      .send({ total: countConversations(db), limit, offset, conversations });
+      .send({ total: countConversations(db), limit, offset, pausedCount: paused.size, conversations });
   });
 
   /**
-   * One conversation, as turns.
+   * One conversation, as turns, plus its handoff state and history.
    *
    * The two reads are deliberately NOT one join in SQL. They are different
    * shapes — one row per message against one row per tool call — and a join
    * would multiply each message by that turn's tool count, leaving the
-   * de-duplication to be done here anyway over a result set several times
-   * larger than either input.
+   * de-duplication to be done here anyway over a much larger result set.
    */
   app.get(`${PREFIX}/conversation`, async (request, reply) => {
-    const entry = authenticate(db, reply, request.headers.authorization);
-    if (!entry) return reply;
+    const session = authenticate(db, reply, request.headers.authorization);
+    if (!session) return reply;
 
     const parsed = ThreadQuerySchema.safeParse(request.query);
     if (!parsed.success) return guardHeaders(reply).code(400).send({ error: "invalid_request" });
@@ -340,9 +432,184 @@ export function registerAdminConsole(app: FastifyInstance, deps: AdminConsoleDep
       conversationKey: key,
       agentId: agent,
       agentLabel: agentLabel(agent),
+      // An agent-to-agent exchange has no person on the other end, so nothing
+      // can be sent into it. Reported rather than discovered on a 400.
+      replyable: !isAgentConversationKey(key),
+      paused: isConversationPaused(db, key, agent),
+      handoffs: listConversationHandoffs(db, key, agent),
       truncated: messages.length === MAX_THREAD_MESSAGES,
       turns: toTurns(messages, toolCalls),
     });
+  });
+
+  /**
+   * Take a conversation over. The agent goes silent for it until released.
+   *
+   * Idempotent (see pauseConversation): two admins opening the same thread and
+   * both hitting pause is ordinary, and it must not produce two handoffs that
+   * a single release would only half close.
+   */
+  app.post(`${PREFIX}/conversation/pause`, async (request, reply) => {
+    const session = authenticate(db, reply, request.headers.authorization);
+    if (!session) return reply;
+
+    const parsed = PauseBodySchema.safeParse(request.body);
+    if (!parsed.success) return guardHeaders(reply).code(400).send({ error: "invalid_request" });
+    const { key, agent, reason } = parsed.data;
+
+    const handoff = pauseConversation(db, {
+      conversationKey: key,
+      agentId: agent,
+      pausedBy: session.phone,
+      ...(reason !== undefined ? { reason } : {}),
+    });
+    request.log.warn(
+      { conversationKey: key, agentId: agent, admin: session.phone, session: session.id },
+      "admin console: a human took over a conversation; the agent is now silent for it",
+    );
+    return guardHeaders(reply).code(200).send({ paused: true, handoff });
+  });
+
+  /**
+   * Give the conversation back to the agent.
+   *
+   * THE SESSION IS DROPPED, and that is the part worth explaining. While a
+   * human held the conversation the agent ran no turns, so its transcript still
+   * ends at the moment of the pause — and nothing the person or the admin said
+   * in between is in it, because the SDK's transcript is written by turns and
+   * there were none. Resuming that transcript would put the agent back into a
+   * conversation that has moved on without it, confidently continuing from a
+   * point everyone else has left: the customer writes "sí, como quedamos con
+   * Santiago" and the agent answers about whatever it was doing an hour ago.
+   *
+   * Starting fresh loses context too, and says so instead of inventing it.
+   * That is the same trade `sessionAfterTurn = "reset"` already makes on a
+   * publish transition, and the same mechanism — the orphaned transcript is
+   * collected by the housekeeping sweep.
+   */
+  app.post(`${PREFIX}/conversation/release`, async (request, reply) => {
+    const session = authenticate(db, reply, request.headers.authorization);
+    if (!session) return reply;
+
+    const parsed = ReleaseBodySchema.safeParse(request.body);
+    if (!parsed.success) return guardHeaders(reply).code(400).send({ error: "invalid_request" });
+    const { key, agent } = parsed.data;
+
+    const closed = releaseConversation(db, {
+      conversationKey: key,
+      agentId: agent,
+      releasedBy: session.phone,
+    });
+    // Only when something was actually released: a release that closed nothing
+    // means the conversation was never paused, and dropping a live session
+    // there would reset a conversation the agent is in the middle of.
+    if (closed > 0) clearSessionId(db, agent, key);
+    request.log.warn(
+      { conversationKey: key, agentId: agent, admin: session.phone, closed },
+      "admin console: a conversation was handed back to the agent",
+    );
+    return guardHeaders(reply).code(200).send({ paused: false, released: closed });
+  });
+
+  /**
+   * Send one message into a conversation, as the business.
+   *
+   * REFUSED UNLESS THE CONVERSATION IS PAUSED. This is the invariant that makes
+   * a handoff mean anything: without it the admin's message and the agent's
+   * next reply interleave, and the customer gets two voices answering the same
+   * question with neither aware of the other. The route refuses rather than
+   * pausing on the admin's behalf, because an implicit takeover is one nobody
+   * remembers to undo — and a conversation silently left paused is the failure
+   * this whole surface exists to prevent, not one to introduce by convenience.
+   *
+   * RECORDED ONLY AFTER A SUCCESSFUL SEND, with `sent_by` naming the admin —
+   * the same contract Responders.deliver keeps, for the same reason: a record
+   * of a message the person never received is the failure the record exists to
+   * make visible.
+   */
+  app.post(`${PREFIX}/conversation/message`, async (request, reply) => {
+    const session = authenticate(db, reply, request.headers.authorization);
+    if (!session) return reply;
+
+    const parsed = MessageBodySchema.safeParse(request.body);
+    if (!parsed.success) return guardHeaders(reply).code(400).send({ error: "invalid_request" });
+    const { key, agent, body } = parsed.data;
+
+    // There is no person behind an a2a key — the conversation key is a
+    // correlation id, and `sendText` would treat it as a phone number.
+    if (isAgentConversationKey(key)) {
+      return guardHeaders(reply).code(400).send({ error: "not_a_person" });
+    }
+    if (!isConversationPaused(db, key, agent)) {
+      return guardHeaders(reply).code(409).send({ error: "not_paused" });
+    }
+
+    const turnKey = adminTurnKey(session.id);
+    try {
+      await channel.sendText(key, body);
+    } catch (err) {
+      // Reported, never recorded: nothing was delivered. Logged with the error
+      // because the admin is looking at a form and "no se pudo enviar" alone
+      // does not tell an operator whether the transport is down.
+      request.log.error(
+        { err, conversationKey: key, admin: session.phone },
+        "admin console: sending a message into a conversation failed",
+      );
+      return guardHeaders(reply).code(502).send({ error: "send_failed" });
+    }
+
+    recordOutboundMessage(db, {
+      conversationKey: key,
+      agentId: agent,
+      turnKey,
+      body,
+      sentBy: session.phone,
+    });
+    return guardHeaders(reply).code(200).send({ sent: true, turnKey });
+  });
+
+  /** The leads panel: what the assistant escalated, and where each one came from. */
+  app.get(`${PREFIX}/leads`, async (request, reply) => {
+    const session = authenticate(db, reply, request.headers.authorization);
+    if (!session) return reply;
+
+    const parsed = LeadsQuerySchema.safeParse(request.query);
+    if (!parsed.success) return guardHeaders(reply).code(400).send({ error: "invalid_request" });
+    const { include_handled, limit } = parsed.data;
+
+    const leads = listLeads(db, { openOnly: include_handled !== true, limit }).map((lead) => ({
+      id: lead.id,
+      phone: lead.phone,
+      type: lead.type,
+      status: lead.status,
+      name: lead.name,
+      note: lead.note,
+      productCode: lead.product_code,
+      createdAt: lead.created_at,
+      statusChangedAt: lead.status_changed_at,
+      claimedBy: lead.claimed_by,
+      // The link back to the exchange that produced it. NULL on a lead captured
+      // before leads carried a provenance — an honest gap, not an invented one.
+      conversationKey: lead.conversation_key,
+      agentId: lead.agent_id,
+      turnKey: lead.turn_key,
+    }));
+
+    return guardHeaders(reply).code(200).send({ leads });
+  });
+
+  /** Move a lead through its lifecycle. */
+  app.post(`${PREFIX}/lead/status`, async (request, reply) => {
+    const session = authenticate(db, reply, request.headers.authorization);
+    if (!session) return reply;
+
+    const parsed = LeadStatusBodySchema.safeParse(request.body);
+    if (!parsed.success) return guardHeaders(reply).code(400).send({ error: "invalid_request" });
+    const { id, status } = parsed.data;
+
+    const lead = setLeadStatus(db, { id, status, claimedBy: session.phone });
+    if (!lead) return guardHeaders(reply).code(404).send({ error: "not_found" });
+    return guardHeaders(reply).code(200).send({ lead });
   });
 }
 
@@ -350,11 +617,11 @@ export function registerAdminConsole(app: FastifyInstance, deps: AdminConsoleDep
  * The page. ONE template literal, no framework, no build step, no static file —
  * the same shape as the test console, for the same reason.
  *
- * THERE IS NO `innerHTML` IN THIS DOCUMENT. Every value rendered here is
- * untrusted in the strict sense: a customer's own words, an operator-typed
- * label, a tool result built from Shopify data. All of it is assigned with
- * `textContent` or inserted with `createTextNode`, which is a mechanism rather
- * than a rule someone has to remember. Its test pins that.
+ * THERE IS NO MARKUP-PARSING ASSIGNMENT IN THIS DOCUMENT. Every value rendered
+ * here is untrusted in the strict sense: a customer's own words, a note an
+ * admin typed, a tool result assembled from Shopify data. All of it is assigned
+ * with `textContent` or inserted with `createTextNode`, which is a mechanism
+ * rather than a rule someone has to remember. Its test pins that.
  *
  * User-visible copy is SPANISH. Everything else in this file is English.
  */
@@ -364,76 +631,107 @@ const PAGE = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>Historial de conversaciones</title>
+<title>Panel de administración</title>
 <style>
-  :root { color-scheme: light dark; --line: #d1d5db; --dim: #6b7280; }
+  :root { color-scheme: light dark; --line: #d1d5db; --dim: #6b7280; --warn: #b45309; --bad: #b91c1c; }
   * { box-sizing: border-box; }
   body {
     margin: 0; padding: 20px 16px 64px;
     font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
-    max-width: 860px; margin-inline: auto;
+    max-width: 880px; margin-inline: auto;
   }
   h1 { font-size: 20px; margin: 0 0 4px; }
-  .sub { color: var(--dim); font-size: 14px; margin: 0 0 20px; }
-  button { font: inherit; cursor: pointer; }
-  .back {
+  .sub { color: var(--dim); font-size: 14px; margin: 0 0 16px; }
+  button, textarea, input { font: inherit; }
+  button { cursor: pointer; }
+  nav { display: flex; gap: 8px; margin-bottom: 18px; }
+  nav button {
     border: 1px solid var(--line); background: transparent; color: inherit;
-    border-radius: 10px; padding: 8px 14px; margin-bottom: 16px;
+    border-radius: 999px; padding: 7px 16px;
   }
-  .convo {
+  nav button[aria-selected="true"] { border-color: currentColor; font-weight: 600; }
+  .back { border: 1px solid var(--line); background: transparent; color: inherit; border-radius: 10px; padding: 8px 14px; margin-bottom: 16px; }
+  .card, .convo {
     display: block; width: 100%; text-align: left;
     border: 1px solid var(--line); border-radius: 12px;
-    padding: 12px 14px; margin-bottom: 10px;
-    background: transparent; color: inherit;
+    padding: 12px 14px; margin-bottom: 10px; background: transparent; color: inherit;
   }
   .convo .top { display: flex; justify-content: space-between; gap: 12px; font-weight: 600; }
-  .convo .meta { color: var(--dim); font-size: 13px; margin-top: 2px; }
-  .convo .preview {
-    color: var(--dim); font-size: 14px; margin-top: 6px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
+  .meta { color: var(--dim); font-size: 13px; margin-top: 2px; }
+  .preview { color: var(--dim); font-size: 14px; margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pill { display: inline-block; border: 1px solid currentColor; border-radius: 999px; font-size: 12px; padding: 1px 9px; margin-left: 6px; }
+  .pill.paused { color: var(--warn); }
+  .pill.new { color: #1d4ed8; }
+  .pill.in_progress { color: var(--warn); }
+  .pill.closed { color: var(--dim); }
   .turn { border-left: 3px solid var(--line); padding-left: 14px; margin: 0 0 22px; }
   .turn .when { color: var(--dim); font-size: 12px; margin-bottom: 8px; }
   .msg { border-radius: 12px; padding: 10px 12px; margin-bottom: 8px; white-space: pre-wrap; }
   .msg.inbound { background: rgba(127,127,127,.14); }
   .msg.outbound { background: rgba(37,99,235,.14); }
+  .msg.human { background: rgba(180,83,9,.16); }
   .msg .who { font-size: 12px; color: var(--dim); margin-bottom: 4px; }
-  details.tool {
-    border: 1px solid var(--line); border-radius: 10px;
-    padding: 8px 12px; margin-bottom: 8px; font-size: 14px;
-  }
-  details.tool.error { border-color: #b91c1c; }
+  details.tool { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin-bottom: 8px; font-size: 14px; }
+  details.tool.error { border-color: var(--bad); }
   details.tool summary { cursor: pointer; font-weight: 600; }
   details.tool .badge { font-weight: 400; color: var(--dim); font-size: 13px; }
-  details.tool .badge.error { color: #b91c1c; }
-  pre {
-    white-space: pre-wrap; word-break: break-word; margin: 8px 0 0;
-    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-    background: rgba(127,127,127,.12); border-radius: 8px; padding: 10px;
-  }
+  details.tool .badge.error { color: var(--bad); }
+  pre { white-space: pre-wrap; word-break: break-word; margin: 8px 0 0; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: rgba(127,127,127,.12); border-radius: 8px; padding: 10px; }
   pre .cap { display: block; color: var(--dim); font-size: 12px; margin-bottom: 4px; }
+  .panel { border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin: 0 0 20px; position: sticky; top: 0; background: Canvas; }
+  .panel h2 { font-size: 15px; margin: 0 0 8px; }
+  .panel .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .panel button { border: 1px solid var(--line); background: transparent; color: inherit; border-radius: 10px; padding: 9px 16px; }
+  .panel button.primary { border-color: currentColor; font-weight: 600; }
+  textarea { width: 100%; min-height: 76px; border-radius: 10px; border: 1px solid var(--line); background: transparent; color: inherit; padding: 10px; margin-bottom: 8px; }
   .status { font-size: 15px; margin-top: 16px; min-height: 1.5em; }
-  .status.error { color: #b91c1c; }
+  .status.error { color: var(--bad); }
   .more { border: 1px solid var(--line); background: transparent; color: inherit; border-radius: 10px; padding: 10px 16px; width: 100%; }
   footer { margin-top: 32px; font-size: 13px; color: var(--dim); text-align: center; }
   [hidden] { display: none !important; }
 </style>
 </head>
 <body>
-<h1>Historial de conversaciones</h1>
-<p class="sub" id="subtitle">Todo lo que se dijo, y lo que el asistente hizo en cada turno.</p>
+<h1>Panel de administración</h1>
+<p class="sub" id="subtitle">Conversaciones, lo que el asistente hizo en cada turno, y los leads que escaló.</p>
 
-<button class="back" id="back" type="button" hidden>← Volver a la lista</button>
+<nav id="tabs">
+  <button id="tab-convos" type="button" aria-selected="true">Conversaciones</button>
+  <button id="tab-leads" type="button" aria-selected="false">Leads</button>
+</nav>
+
+<button class="back" id="back" type="button" hidden>← Volver</button>
 
 <div id="index" hidden>
   <div id="list"></div>
   <button class="more" id="more" type="button" hidden>Cargar más</button>
 </div>
 
-<div id="thread" hidden></div>
+<div id="leads" hidden>
+  <div class="row" style="margin-bottom:12px">
+    <button class="more" id="toggle-handled" type="button">Mostrar también los cerrados</button>
+  </div>
+  <div id="leads-list"></div>
+</div>
+
+<div id="thread" hidden>
+  <div class="panel" id="panel">
+    <h2 id="panel-state"></h2>
+    <p class="meta" id="panel-detail"></p>
+    <div class="row">
+      <button id="btn-pause" type="button">Tomar la conversación</button>
+      <button id="btn-release" type="button" hidden>Devolver al asistente</button>
+    </div>
+    <div id="composer" hidden style="margin-top:12px">
+      <textarea id="reply" placeholder="Escribe tu respuesta al cliente…"></textarea>
+      <button class="primary" id="btn-send" type="button">Enviar como el negocio</button>
+    </div>
+  </div>
+  <div id="turns"></div>
+</div>
 
 <p class="status" id="status">Cargando…</p>
-<footer>Solo lectura. Este enlace da acceso a datos de clientes reales.</footer>
+<footer>Este enlace da acceso a datos de clientes reales y caduca solo.</footer>
 
 <script>
 (function () {
@@ -447,14 +745,30 @@ const PAGE = `<!doctype html>
   var statusEl = document.getElementById("status");
   var indexEl = document.getElementById("index");
   var listEl = document.getElementById("list");
+  var leadsEl = document.getElementById("leads");
+  var leadsListEl = document.getElementById("leads-list");
   var threadEl = document.getElementById("thread");
+  var turnsEl = document.getElementById("turns");
   var backEl = document.getElementById("back");
   var moreEl = document.getElementById("more");
+  var tabsEl = document.getElementById("tabs");
+  var tabConvos = document.getElementById("tab-convos");
+  var tabLeads = document.getElementById("tab-leads");
   var subtitleEl = document.getElementById("subtitle");
+  var panelState = document.getElementById("panel-state");
+  var panelDetail = document.getElementById("panel-detail");
+  var btnPause = document.getElementById("btn-pause");
+  var btnRelease = document.getElementById("btn-release");
+  var composer = document.getElementById("composer");
+  var replyEl = document.getElementById("reply");
+  var btnSend = document.getElementById("btn-send");
+  var toggleHandled = document.getElementById("toggle-handled");
 
   var PAGE_SIZE = 50;
   var offset = 0;
   var total = 0;
+  var current = null;
+  var includeHandled = false;
 
   function say(text, isError) {
     statusEl.textContent = text;
@@ -465,28 +779,36 @@ const PAGE = `<!doctype html>
     var node = document.createElement(tag);
     if (className) node.className = className;
     // textContent is the ONLY way text enters this document. Every string
-    // reaching here is untrusted — a customer's own words, an operator's
-    // label, a tool result — and its test pins that no markup-parsing
-    // assignment exists anywhere on this page.
+    // reaching here is untrusted — a customer's words, an admin's note, a
+    // tool result — and its test pins that no markup-parsing assignment
+    // exists anywhere on this page.
     if (text !== undefined && text !== null) node.textContent = String(text);
     return node;
   }
 
   function failed(response) {
     if (response.status === 401) {
-      say("Este enlace ya no es válido. Pide uno nuevo a quien te lo envió.", true);
+      say("Tu sesión caducó o el enlace ya no es válido. Escribe \\"panel\\" al número del negocio para pedir uno nuevo.", true);
     } else if (response.status === 404) {
-      say("No se encontró. Es posible que la consola esté cerrada o que la conversación ya no exista.", true);
+      say("No se encontró. Puede que el panel esté cerrado o que eso ya no exista.", true);
+    } else if (response.status === 409) {
+      say("Primero tienes que tomar la conversación. El asistente sigue atendiéndola.", true);
+    } else if (response.status === 502) {
+      say("No se pudo entregar el mensaje por WhatsApp. No se guardó nada.", true);
     } else {
       say("No se pudo completar la operación. Intenta de nuevo.", true);
     }
   }
 
-  function get(path) {
-    return fetch(path, {
-      headers: { "Authorization": "Bearer " + token },
-      cache: "no-store"
-    }).then(function (response) {
+  function call(path, options) {
+    var init = options || {};
+    init.headers = { "Authorization": "Bearer " + token };
+    if (init.body !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(init.body);
+    }
+    init.cache = "no-store";
+    return fetch(path, init).then(function (response) {
       if (!response.ok) { failed(response); return null; }
       return response.json();
     });
@@ -497,28 +819,56 @@ const PAGE = `<!doctype html>
     return value.length > max ? value.slice(0, max) + "…" : value;
   }
 
+  // --- conversations ---------------------------------------------------------
+
   function renderConversation(row) {
     var card = el("button", "convo");
     card.type = "button";
 
     var top = el("div", "top");
-    top.appendChild(el("span", null, row.conversationKey));
+    var left = el("span", null, row.conversationKey);
+    if (row.paused) left.appendChild(el("span", "pill paused", "atendida por un humano"));
+    top.appendChild(left);
     top.appendChild(el("span", null, row.agentLabel));
     card.appendChild(top);
 
-    card.appendChild(el(
-      "div", "meta",
+    card.appendChild(el("div", "meta",
       row.messageCount + " mensajes · " + row.inboundCount + " de la persona · última actividad " +
-        row.lastOccurredAt + " UTC"
-    ));
+      row.lastOccurredAt + " UTC"));
+    card.appendChild(el("div", "preview",
+      (row.lastDirection === "inbound" ? "Ellos: " : "Nosotros: ") + shorten(row.lastBody, 160)));
 
-    var who = row.lastDirection === "inbound" ? "Ellos: " : "Asistente: ";
-    card.appendChild(el("div", "preview", who + shorten(row.lastBody, 160)));
-
-    card.addEventListener("click", function () {
-      openThread(row.conversationKey, row.agentId);
-    });
+    card.addEventListener("click", function () { openThread(row.conversationKey, row.agentId); });
     return card;
+  }
+
+  function loadPage() {
+    say("Cargando…");
+    return call("/admin/conversations?limit=" + PAGE_SIZE + "&offset=" + offset).then(function (data) {
+      if (!data) return;
+      total = data.total;
+      data.conversations.forEach(function (row) { listEl.appendChild(renderConversation(row)); });
+      offset += data.conversations.length;
+      moreEl.hidden = offset >= total;
+      say(total === 0 ? "Todavía no hay conversaciones registradas."
+        : (data.pausedCount > 0 ? data.pausedCount + " conversación(es) en manos de un humano." : ""));
+    });
+  }
+
+  // --- one thread ------------------------------------------------------------
+
+  function renderMessage(message) {
+    var human = message.sentBy !== null && message.sentBy !== undefined;
+    var box = el("div", "msg " + message.direction + (human ? " human" : ""));
+    var who = message.direction === "inbound" ? "Ellos"
+      : human ? ("Humano · " + message.sentBy) : "Asistente";
+    box.appendChild(el("div", "who", who));
+    if (message.kind === "media" && message.body.length === 0) {
+      box.appendChild(el("div", null, "(foto sin texto)"));
+    } else {
+      box.appendChild(el("div", null, message.body));
+    }
+    return box;
   }
 
   function renderBlock(label, body) {
@@ -528,92 +878,192 @@ const PAGE = `<!doctype html>
     return pre;
   }
 
-  function renderTool(call) {
-    var box = el("details", "tool" + (call.outcome === "error" ? " error" : ""));
+  function renderTool(c) {
+    var box = el("details", "tool" + (c.outcome === "error" ? " error" : ""));
     var summary = el("summary");
-    summary.appendChild(document.createTextNode(call.ordinal + ". " + call.toolName));
-    var badge = el(
-      "span", "badge" + (call.outcome === "error" ? " error" : ""),
-      call.outcome === "error" ? "  — falló (" + call.durationMs + " ms)" : "  — " + call.durationMs + " ms"
-    );
-    summary.appendChild(badge);
+    summary.appendChild(document.createTextNode(c.ordinal + ". " + c.toolName));
+    summary.appendChild(el("span", "badge" + (c.outcome === "error" ? " error" : ""),
+      c.outcome === "error" ? "  — falló (" + c.durationMs + " ms)" : "  — " + c.durationMs + " ms"));
     box.appendChild(summary);
-    box.appendChild(renderBlock("Argumentos", call.input));
-    box.appendChild(renderBlock(call.outcome === "error" ? "Error" : "Resultado", call.result));
+    box.appendChild(renderBlock("Argumentos", c.input));
+    box.appendChild(renderBlock(c.outcome === "error" ? "Error" : "Resultado", c.result));
     return box;
   }
 
   function renderTurn(turn) {
     var box = el("div", "turn");
     box.appendChild(el("div", "when", turn.occurredAt + " UTC"));
-
-    // Inbound first, then the tools that ran because of it, then the reply.
-    // That is the order it happened in, and it is what makes a tool result
-    // readable as the reason for the words underneath it.
     turn.messages.filter(function (m) { return m.direction === "inbound"; })
       .forEach(function (m) { box.appendChild(renderMessage(m)); });
     turn.toolCalls.forEach(function (c) { box.appendChild(renderTool(c)); });
     turn.messages.filter(function (m) { return m.direction === "outbound"; })
       .forEach(function (m) { box.appendChild(renderMessage(m)); });
-
     if (turn.messages.length === 0) {
-      box.appendChild(el("div", "meta", "Este turno no dejó ningún mensaje: las herramientas corrieron y no se entregó respuesta."));
+      box.appendChild(el("div", "meta",
+        "Este turno no dejó ningún mensaje: las herramientas corrieron y no se entregó respuesta."));
     }
     return box;
   }
 
-  function renderMessage(message) {
-    var box = el("div", "msg " + message.direction);
-    box.appendChild(el("div", "who", message.direction === "inbound" ? "Ellos" : "Asistente"));
-    if (message.kind === "media" && message.body.length === 0) {
-      box.appendChild(el("div", null, "(foto sin texto)"));
-    } else {
-      box.appendChild(el("div", null, message.body));
+  function renderPanel(data) {
+    panelState.textContent = data.paused
+      ? "Estás atendiendo esta conversación"
+      : "La atiende el asistente";
+    var last = data.handoffs && data.handoffs.length > 0 ? data.handoffs[0] : null;
+    panelDetail.textContent = data.paused
+      ? ("El asistente no responderá hasta que la devuelvas." + (last && last.paused_by ? " Tomada por " + last.paused_by + " el " + last.paused_at + " UTC." : ""))
+      : (last ? "Última vez atendida por un humano: " + last.paused_at + " UTC." : "");
+    btnPause.hidden = data.paused;
+    btnRelease.hidden = !data.paused;
+    composer.hidden = !(data.paused && data.replyable);
+    if (data.paused && !data.replyable) {
+      panelDetail.textContent += " No se puede escribir en esta conversación: no hay una persona del otro lado.";
     }
-    return box;
-  }
-
-  function showIndex() {
-    threadEl.hidden = true;
-    backEl.hidden = true;
-    indexEl.hidden = false;
-    subtitleEl.textContent = "Todo lo que se dijo, y lo que el asistente hizo en cada turno.";
   }
 
   function openThread(key, agentId) {
     say("Cargando conversación…");
-    get("/admin/conversation?key=" + encodeURIComponent(key) + "&agent=" + encodeURIComponent(agentId))
+    return call("/admin/conversation?key=" + encodeURIComponent(key) + "&agent=" + encodeURIComponent(agentId))
       .then(function (data) {
         if (!data) return;
-        threadEl.replaceChildren();
+        current = { key: key, agent: agentId };
+        turnsEl.replaceChildren();
         subtitleEl.textContent = data.conversationKey + " · " + data.agentLabel;
         if (data.truncated) {
-          threadEl.appendChild(el("p", "sub", "Mostrando solo los mensajes más recientes de esta conversación."));
+          turnsEl.appendChild(el("p", "sub", "Mostrando solo los mensajes más recientes."));
         }
-        data.turns.forEach(function (turn) { threadEl.appendChild(renderTurn(turn)); });
-        indexEl.hidden = true;
-        threadEl.hidden = false;
-        backEl.hidden = false;
+        data.turns.forEach(function (turn) { turnsEl.appendChild(renderTurn(turn)); });
+        renderPanel(data);
+        indexEl.hidden = true; leadsEl.hidden = true; tabsEl.hidden = true;
+        threadEl.hidden = false; backEl.hidden = false;
         say("");
         window.scrollTo(0, 0);
-      })
-      .catch(function () { say("No se pudo conectar. Revisa tu conexión e intenta de nuevo.", true); });
+      });
   }
 
-  function loadPage() {
-    say("Cargando…");
-    return get("/admin/conversations?limit=" + PAGE_SIZE + "&offset=" + offset).then(function (data) {
+  function refreshThread() {
+    if (!current) return Promise.resolve();
+    return openThread(current.key, current.agent);
+  }
+
+  btnPause.addEventListener("click", function () {
+    if (!current) return;
+    btnPause.disabled = true;
+    say("Tomando la conversación…");
+    call("/admin/conversation/pause", { method: "POST", body: { key: current.key, agent: current.agent } })
+      .then(function (data) { if (data) return refreshThread().then(function () { say("El asistente quedó en silencio para esta conversación."); }); })
+      .finally(function () { btnPause.disabled = false; });
+  });
+
+  btnRelease.addEventListener("click", function () {
+    if (!current) return;
+    btnRelease.disabled = true;
+    say("Devolviendo…");
+    call("/admin/conversation/release", { method: "POST", body: { key: current.key, agent: current.agent } })
+      .then(function (data) { if (data) return refreshThread().then(function () { say("El asistente vuelve a atenderla."); }); })
+      .finally(function () { btnRelease.disabled = false; });
+  });
+
+  btnSend.addEventListener("click", function () {
+    if (!current) return;
+    var body = replyEl.value.trim();
+    if (body.length === 0) { say("Escribe algo antes de enviar.", true); return; }
+    btnSend.disabled = true;
+    say("Enviando…");
+    call("/admin/conversation/message", { method: "POST", body: { key: current.key, agent: current.agent, body: body } })
+      .then(function (data) {
+        if (!data) return;
+        replyEl.value = "";
+        return refreshThread().then(function () { say("Enviado."); });
+      })
+      .finally(function () { btnSend.disabled = false; });
+  });
+
+  // --- leads -----------------------------------------------------------------
+
+  function renderLead(lead) {
+    var card = el("div", "card");
+    var top = el("div", "top");
+    top.appendChild(el("strong", null, "#" + lead.id + " · " + lead.type));
+    top.appendChild(el("span", "pill " + lead.status, lead.status));
+    card.appendChild(top);
+    card.appendChild(el("div", "meta",
+      lead.phone + (lead.productCode ? " · " + lead.productCode : "") + " · " + lead.createdAt + " UTC" +
+      (lead.claimedBy ? " · lo lleva " + lead.claimedBy : "")));
+    if (lead.name) card.appendChild(el("div", null, lead.name));
+    if (lead.note) card.appendChild(el("div", null, lead.note));
+
+    var row = el("div", "row");
+    row.style.marginTop = "10px";
+    ["new", "in_progress", "closed"].forEach(function (status) {
+      if (status === lead.status) return;
+      var b = el("button", null, status === "new" ? "Reabrir" : status === "in_progress" ? "Lo tomo yo" : "Cerrar");
+      b.type = "button";
+      b.style.border = "1px solid var(--line)";
+      b.style.background = "transparent";
+      b.style.color = "inherit";
+      b.style.borderRadius = "10px";
+      b.style.padding = "7px 14px";
+      b.addEventListener("click", function () {
+        b.disabled = true;
+        call("/admin/lead/status", { method: "POST", body: { id: lead.id, status: status } })
+          .then(function (data) { if (data) return loadLeads(); })
+          .finally(function () { b.disabled = false; });
+      });
+      row.appendChild(b);
+    });
+
+    if (lead.conversationKey && lead.agentId) {
+      var open = el("button", null, "Ver la conversación");
+      open.type = "button";
+      open.style.border = "1px solid currentColor";
+      open.style.background = "transparent";
+      open.style.color = "inherit";
+      open.style.borderRadius = "10px";
+      open.style.padding = "7px 14px";
+      open.addEventListener("click", function () { openThread(lead.conversationKey, lead.agentId); });
+      row.appendChild(open);
+    }
+    card.appendChild(row);
+    return card;
+  }
+
+  function loadLeads() {
+    say("Cargando leads…");
+    return call("/admin/leads" + (includeHandled ? "?include_handled=true" : "")).then(function (data) {
       if (!data) return;
-      total = data.total;
-      data.conversations.forEach(function (row) { listEl.appendChild(renderConversation(row)); });
-      offset += data.conversations.length;
-      moreEl.hidden = offset >= total;
-      indexEl.hidden = false;
-      say(total === 0 ? "Todavía no hay conversaciones registradas." : "");
+      leadsListEl.replaceChildren();
+      data.leads.forEach(function (lead) { leadsListEl.appendChild(renderLead(lead)); });
+      say(data.leads.length === 0
+        ? (includeHandled ? "No hay leads." : "No hay leads pendientes.")
+        : "");
     });
   }
 
-  backEl.addEventListener("click", showIndex);
+  toggleHandled.addEventListener("click", function () {
+    includeHandled = !includeHandled;
+    toggleHandled.textContent = includeHandled ? "Mostrar solo los pendientes" : "Mostrar también los cerrados";
+    loadLeads();
+  });
+
+  // --- navigation ------------------------------------------------------------
+
+  function showTab(which) {
+    current = null;
+    threadEl.hidden = true; backEl.hidden = true; tabsEl.hidden = false;
+    subtitleEl.textContent = "Conversaciones, lo que el asistente hizo en cada turno, y los leads que escaló.";
+    tabConvos.setAttribute("aria-selected", which === "convos" ? "true" : "false");
+    tabLeads.setAttribute("aria-selected", which === "leads" ? "true" : "false");
+    indexEl.hidden = which !== "convos";
+    leadsEl.hidden = which !== "leads";
+    if (which === "leads") loadLeads();
+  }
+
+  backEl.addEventListener("click", function () {
+    showTab(leadsEl.hidden ? "convos" : "leads");
+  });
+  tabConvos.addEventListener("click", function () { showTab("convos"); });
+  tabLeads.addEventListener("click", function () { showTab("leads"); });
   moreEl.addEventListener("click", function () {
     moreEl.disabled = true;
     loadPage().finally(function () { moreEl.disabled = false; });
@@ -622,6 +1072,7 @@ const PAGE = `<!doctype html>
   if (!token) {
     say("Falta el enlace completo. Ábrelo exactamente como te lo enviaron, sin recortarlo.", true);
   } else {
+    indexEl.hidden = false;
     loadPage().catch(function () {
       say("No se pudo conectar. Revisa tu conexión e intenta de nuevo.", true);
     });
