@@ -4,6 +4,8 @@ import { registerAdminConsole } from "../src/admin/console.js";
 import { issueAdminSession, revokeAdminSession } from "../src/data/admin-sessions.js";
 import { openDb, type DB } from "../src/data/db.js";
 import {
+  getLiveHandoff,
+  getSessionId,
   insertLead,
   isConversationPaused,
   listConversationMessages,
@@ -11,6 +13,7 @@ import {
   recordInboundMessages,
   recordOutboundMessage,
   recordToolCall,
+  setSessionId,
 } from "../src/data/repo.js";
 import { AGENT_IDS } from "../src/router.js";
 import type { WhatsAppChannel } from "../src/whatsapp/channel.js";
@@ -766,9 +769,140 @@ describe("admin console: the leads panel", () => {
     const lead = seedLead(h.db);
     await h.post("/admin/lead/status", { id: lead.id, status: "in_progress" });
 
-    await h.post("/admin/lead/status", { id: lead.id, status: "closed" });
+    const response = await h.post("/admin/lead/status", { id: lead.id, status: "closed" });
 
     expect(isConversationPaused(h.db, PHONE, SALES)).toBe(true);
+    // REPORTED, though. The pause surviving the close is correct; discovering
+    // it in another tab a week later is what was not.
+    expect(response.json()).toMatchObject({ paused: true, released: false });
+  });
+
+  /**
+   * THE DESYNCHRONISATION THIS GROUP EXISTS FOR. "Reabrir" says the lead is back
+   * in the queue and nobody is handling it — `setLeadStatus` clears `claimed_by`
+   * for that exact reason — so leaving the assistant silenced afterwards strands
+   * the customer between a bot that will not answer and a human who has stepped
+   * away. Observed in the running store: two leads reopened, both conversations
+   * still held by a human, with nothing on either screen saying so.
+   */
+  it("hands the conversation back when the lead that took it is reopened", async () => {
+    const h = await harness();
+    const lead = seedLead(h.db);
+    await h.post("/admin/lead/status", { id: lead.id, status: "in_progress" });
+    expect(isConversationPaused(h.db, PHONE, SALES)).toBe(true);
+    setSessionId(h.db, SALES, PHONE, "sess-before-the-pause");
+
+    const response = await h.post("/admin/lead/status", { id: lead.id, status: "new" });
+
+    expect(response.json()).toMatchObject({ released: true, paused: false });
+    expect(isConversationPaused(h.db, PHONE, SALES)).toBe(false);
+    // THE SESSION GOES WITH IT, for the same reason the release route drops it:
+    // while the human held the conversation the agent ran no turns, so its
+    // transcript still ends at the pause and resuming would answer from a point
+    // everyone else has long left.
+    expect(getSessionId(h.db, SALES, PHONE)).toBeUndefined();
+  });
+
+  /**
+   * LEADS ARE NOT ONE-TO-ONE WITH CONVERSATIONS. One exchange routinely produces
+   * several — a restock notice and a follow-up, three products in one chat — so
+   * handing ONE back says nothing about whether the agent may have the
+   * conversation. Releasing here would put the assistant back in front of a
+   * customer a colleague is mid-reply to.
+   */
+  it("keeps the conversation paused while another of its leads is still held", async () => {
+    const h = await harness();
+    const first = seedLead(h.db);
+    const second = seedLead(h.db, { type: "back_in_stock", product_code: "SKU-9" });
+    await h.post("/admin/lead/status", { id: first.id, status: "in_progress" });
+    await h.post("/admin/lead/status", { id: second.id, status: "in_progress" });
+
+    const response = await h.post("/admin/lead/status", { id: first.id, status: "new" });
+
+    expect(response.json()).toMatchObject({ released: false, stillPausedBecause: "other_leads" });
+    expect(isConversationPaused(h.db, PHONE, SALES)).toBe(true);
+
+    // ...and handing the LAST one back does release it. Same three conditions,
+    // now all satisfied.
+    const last = await h.post("/admin/lead/status", { id: second.id, status: "new" });
+    expect(last.json()).toMatchObject({ released: true });
+    expect(isConversationPaused(h.db, PHONE, SALES)).toBe(false);
+  });
+
+  /**
+   * A PAUSE SET BY HAND IS NOT A LEAD'S TO UNDO. An admin who opened the thread
+   * and took it over did so for a reason the lead knows nothing about — quite
+   * possibly one that has nothing to do with the lead at all — so reopening the
+   * lead must leave that pause exactly where it is.
+   */
+  it("does not release a conversation a human paused by hand", async () => {
+    const h = await harness();
+    const lead = seedLead(h.db);
+    // Paused FIRST, by hand. Taking the lead afterwards finds a live handoff and
+    // keeps it (pauseConversation is idempotent), cause included.
+    pauseConversation(h.db, {
+      conversationKey: PHONE,
+      agentId: SALES,
+      pausedBy: ADMIN,
+      reason: "por algo que no tiene que ver con el lead",
+    });
+    await h.post("/admin/lead/status", { id: lead.id, status: "in_progress" });
+    expect(getLiveHandoff(h.db, PHONE, SALES)?.lead_id).toBeNull();
+
+    const response = await h.post("/admin/lead/status", { id: lead.id, status: "new" });
+
+    expect(response.json()).toMatchObject({ released: false, stillPausedBecause: "manual" });
+    expect(isConversationPaused(h.db, PHONE, SALES)).toBe(true);
+  });
+
+  /** Taking a lead records WHICH lead caused the pause — the whole mechanism. */
+  it("records the lead behind a pause it caused", async () => {
+    const h = await harness();
+    const lead = seedLead(h.db);
+
+    await h.post("/admin/lead/status", { id: lead.id, status: "in_progress" });
+
+    expect(getLiveHandoff(h.db, PHONE, SALES)?.lead_id).toBe(lead.id);
+  });
+
+  /**
+   * The state of the conversation, ON THE LEAD. Two things with independent
+   * states and independent actions cannot be one control — what they can be is
+   * visible at the same time, which is what stops the desync being discovered
+   * rather than seen.
+   */
+  it("reports each lead's conversation state alongside it", async () => {
+    const h = await harness();
+    const first = seedLead(h.db);
+    const second = seedLead(h.db, { type: "back_in_stock", product_code: "SKU-9" });
+    await h.post("/admin/lead/status", { id: first.id, status: "in_progress" });
+    await h.post("/admin/lead/status", { id: second.id, status: "in_progress" });
+
+    const leads = (await h.get("/admin/leads")).json().leads as Record<string, unknown>[];
+    const one = leads.find((lead) => lead.id === first.id);
+
+    expect(one).toMatchObject({
+      conversationPaused: true,
+      pausedBy: ADMIN,
+      pausedByLeadId: first.id,
+      // Its own row is not counted against itself: what matters is who ELSE
+      // holds this conversation, because that is what a release waits on.
+      otherLeadsHolding: 1,
+    });
+  });
+
+  /** A lead with no provenance has no conversation state to report. */
+  it("reports no conversation state for a lead that has none", async () => {
+    const h = await harness();
+    seedLead(h.db, { conversation_key: null, agent_id: null });
+
+    const leads = (await h.get("/admin/leads")).json().leads as Record<string, unknown>[];
+
+    expect(leads[0]).toMatchObject({
+      conversationKey: null,
+      conversationPaused: false,
+      otherLeadsHolding: 0,
+    });
   });
 
   /**

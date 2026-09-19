@@ -10,6 +10,10 @@ import type { DB } from "../data/db.js";
 import {
   clearSessionId,
   countConversations,
+  countLeadsHolding,
+  countLeadsHoldingByConversation,
+  getLead,
+  getLiveHandoff,
   isConversationPaused,
   listConversationHandoffs,
   listConversations,
@@ -605,7 +609,24 @@ export function registerAdminConsole(app: FastifyInstance, deps: AdminConsoleDep
     return guardHeaders(reply).code(200).send({ sent: true, turnKey });
   });
 
-  /** The leads panel: what the assistant escalated, and where each one came from. */
+  /**
+   * The leads panel: what the assistant escalated, where each one came from —
+   * and WHAT STATE ITS CONVERSATION IS IN.
+   *
+   * A lead and a conversation are two things with independent states and
+   * independent actions, and until this they were also two things with no
+   * visible relationship: a lead could read `closed` while the agent sat
+   * silenced for that customer, and the only way to notice was to open the
+   * conversations tab and recognise the phone number. The desynchronisation was
+   * not the bug — leads legitimately outlive their conversations, and one
+   * conversation legitimately produces several leads. The bug was that it was
+   * INVISIBLE. Every lead now carries the answer to "is the assistant still
+   * silent for this person, and why", which is what makes the release control
+   * on the card honest rather than a second guess.
+   *
+   * Two queries for the whole page, not two per row: a map of live handoffs and
+   * a map of how many leads each conversation still has in_progress.
+   */
   app.get(`${PREFIX}/leads`, async (request, reply) => {
     const session = authenticate(db, reply, request.headers.authorization);
     if (!session) return reply;
@@ -614,23 +635,53 @@ export function registerAdminConsole(app: FastifyInstance, deps: AdminConsoleDep
     if (!parsed.success) return guardHeaders(reply).code(400).send({ error: "invalid_request" });
     const { include_handled, limit } = parsed.data;
 
-    const leads = listLeads(db, { openOnly: include_handled !== true, limit }).map((lead) => ({
-      id: lead.id,
-      phone: lead.phone,
-      type: lead.type,
-      status: lead.status,
-      name: lead.name,
-      note: lead.note,
-      productCode: lead.product_code,
-      createdAt: lead.created_at,
-      statusChangedAt: lead.status_changed_at,
-      claimedBy: lead.claimed_by,
-      // The link back to the exchange that produced it. NULL on a lead captured
-      // before leads carried a provenance — an honest gap, not an invented one.
-      conversationKey: lead.conversation_key,
-      agentId: lead.agent_id,
-      turnKey: lead.turn_key,
-    }));
+    const handoffs = new Map(
+      listPausedConversations(db).map((handoff) => [
+        `${handoff.conversation_key}\u0000${handoff.agent_id}`,
+        handoff,
+      ]),
+    );
+    const holding = countLeadsHoldingByConversation(db);
+
+    const leads = listLeads(db, { openOnly: include_handled !== true, limit }).map((lead) => {
+      const pair =
+        lead.conversation_key !== null && lead.agent_id !== null
+          ? `${lead.conversation_key}\u0000${lead.agent_id}`
+          : null;
+      const handoff = pair !== null ? (handoffs.get(pair) ?? null) : null;
+      return {
+        id: lead.id,
+        phone: lead.phone,
+        type: lead.type,
+        status: lead.status,
+        name: lead.name,
+        note: lead.note,
+        productCode: lead.product_code,
+        createdAt: lead.created_at,
+        statusChangedAt: lead.status_changed_at,
+        claimedBy: lead.claimed_by,
+        // The link back to the exchange that produced it. NULL on a lead captured
+        // before leads carried a provenance — an honest gap, not an invented one.
+        conversationKey: lead.conversation_key,
+        agentId: lead.agent_id,
+        turnKey: lead.turn_key,
+        /** Is the assistant currently silent for this lead's conversation? */
+        conversationPaused: handoff !== null,
+        /** Who silenced it, and — when a lead did — which one. */
+        pausedBy: handoff?.paused_by ?? null,
+        pausedByLeadId: handoff?.lead_id ?? null,
+        /**
+         * How many OTHER leads from the same conversation a human still holds.
+         * This is the number that explains a conversation staying paused after
+         * this lead was handed back, and it is on the card so nobody has to
+         * deduce it from a list.
+         */
+        otherLeadsHolding: Math.max(
+          0,
+          (pair !== null ? (holding.get(pair) ?? 0) : 0) - (lead.status === "in_progress" ? 1 : 0),
+        ),
+      };
+    });
 
     return guardHeaders(reply).code(200).send({ leads });
   });
@@ -645,11 +696,34 @@ export function registerAdminConsole(app: FastifyInstance, deps: AdminConsoleDep
    * the person is told a team member will follow up, a team member picks it up,
    * and the assistant keeps talking over them in between.
    *
+   * REOPENING RELEASES, UNDER THREE CONDITIONS. "Reabrir" says the lead is back
+   * in the queue and nobody is handling it — `setLeadStatus` even clears
+   * `claimed_by` for exactly that reason — so leaving the assistant silenced
+   * afterwards strands the customer between a bot that will not answer and a
+   * human who has stepped away. It is the symmetric half of taking the lead,
+   * and it releases only when all three hold:
+   *
+   *   1. The conversation IS paused. Nothing to undo otherwise.
+   *   2. A LEAD CAUSED THE PAUSE (`handoff.lead_id` is not null). A pause an
+   *      admin set by hand was set for a reason no lead knows about, and a lead
+   *      must not undo it.
+   *   3. NO OTHER LEAD FROM THAT CONVERSATION IS STILL `in_progress`. Leads are
+   *      not one-to-one with conversations — one exchange routinely produces
+   *      several — so handing one back while a colleague holds another would
+   *      put the agent back in front of a customer somebody is mid-reply to.
+   *
+   * When any of them fails the status change still happens and the response
+   * says why the conversation stayed paused, rather than reporting a release
+   * that did not occur.
+   *
    * CLOSING DOES NOT RELEASE, deliberately. "I am done with this lead" and "the
    * assistant may have this conversation back" are different statements —
    * somebody can close a lead and still be mid-exchange with the person. An
    * auto-release here would resume the agent mid-sentence, which is exactly
-   * what `Nothing auto-releases a handoff` refuses to do.
+   * what `Nothing auto-releases a handoff` refuses to do. What changed is that
+   * the response now reports the conversation as still paused, so the card can
+   * offer the release as a deliberate second click instead of leaving the
+   * operator to discover it in another tab.
    *
    * A lead from before leads carried a provenance has no conversation to pause,
    * and one whose conversation is an agent-to-agent key has no person behind
@@ -664,42 +738,82 @@ export function registerAdminConsole(app: FastifyInstance, deps: AdminConsoleDep
     if (!parsed.success) return guardHeaders(reply).code(400).send({ error: "invalid_request" });
     const { id, status } = parsed.data;
 
+    // Read BEFORE the write: whether this transition is a hand-back depends on
+    // where the lead was, and after `setLeadStatus` that is gone.
+    const before = getLead(db, id);
+    if (!before) return guardHeaders(reply).code(404).send({ error: "not_found" });
+
     const lead = setLeadStatus(db, { id, status, claimedBy: session.phone });
     if (!lead) return guardHeaders(reply).code(404).send({ error: "not_found" });
 
-    let paused = false;
-    if (
-      status === "in_progress" &&
+    // The conversation this lead can act on: null for a lead with no
+    // provenance, and for an a2a key, which has no person behind it.
+    const target =
       lead.conversation_key !== null &&
       lead.agent_id !== null &&
       !isAgentConversationKey(lead.conversation_key)
-    ) {
+        ? { conversationKey: lead.conversation_key, agentId: lead.agent_id }
+        : null;
+
+    let paused = false;
+    let released = false;
+    /** Why the conversation is still paused after a hand-back, for the card to say. */
+    let stillPausedBecause: "manual" | "other_leads" | null = null;
+
+    if (status === "in_progress" && target) {
       // Idempotent, so taking a lead whose conversation somebody else already
-      // holds does not produce a second handoff (see pauseConversation).
+      // holds does not produce a second handoff (see pauseConversation) — and
+      // does not relabel that handoff's cause as this lead.
       pauseConversation(db, {
-        conversationKey: lead.conversation_key,
-        agentId: lead.agent_id,
+        ...target,
         pausedBy: session.phone,
         reason: `lead #${lead.id} tomado desde el panel`,
+        leadId: lead.id,
       });
       paused = true;
       request.log.warn(
-        {
-          leadId: lead.id,
-          conversationKey: lead.conversation_key,
-          agentId: lead.agent_id,
-          admin: session.phone,
-        },
+        { leadId: lead.id, ...target, admin: session.phone },
         "admin console: a lead was taken; the agent is now silent for its conversation",
       );
+    } else if (before.status === "in_progress" && status === "new" && target) {
+      const handoff = getLiveHandoff(db, target.conversationKey, target.agentId);
+      const others = countLeadsHolding(db, { ...target, excludeLeadId: lead.id });
+      if (handoff === null) {
+        // Nothing to undo. Not an error and not worth a message.
+      } else if (handoff.lead_id === null) {
+        stillPausedBecause = "manual";
+        paused = true;
+      } else if (others > 0) {
+        stillPausedBecause = "other_leads";
+        paused = true;
+      } else {
+        releaseConversation(db, { ...target, releasedBy: session.phone });
+        // The session is dropped for the same reason the release route drops
+        // it: while the human held the conversation the agent ran no turns, so
+        // its transcript still ends at the pause and resuming would answer from
+        // a point the conversation has long left.
+        clearSessionId(db, target.agentId, target.conversationKey);
+        released = true;
+        request.log.warn(
+          { leadId: lead.id, ...target, admin: session.phone },
+          "admin console: a lead was handed back; the agent has its conversation again",
+        );
+      }
+    } else if (target) {
+      // Every other transition leaves the handoff exactly as it is — including
+      // closing, which deliberately does not release. Reported, not acted on.
+      paused = isConversationPaused(db, target.conversationKey, target.agentId);
     }
 
-    // `paused` and the conversation are reported so the page can go straight
-    // there — taking a lead and then hunting for its conversation is the
-    // three-click path this replaces.
+    // The conversation is reported on EVERY transition so the page can go
+    // straight there — taking a lead and then hunting for its conversation is
+    // the three-click path this replaces, and a lead whose conversation is
+    // still paused needs somewhere to send the operator too.
     return guardHeaders(reply).code(200).send({
       lead,
       paused,
+      released,
+      stillPausedBecause,
       conversationKey: lead.conversation_key,
       agentId: lead.agent_id,
     });
@@ -1102,17 +1216,51 @@ const PAGE = `<!doctype html>
 
   // --- leads -----------------------------------------------------------------
 
+  function leadButton(label, strong) {
+    var b = el("button", null, label);
+    b.type = "button";
+    b.style.border = strong ? "1px solid currentColor" : "1px solid var(--line)";
+    b.style.background = "transparent";
+    b.style.color = "inherit";
+    b.style.borderRadius = "10px";
+    b.style.padding = "7px 14px";
+    if (strong) b.style.fontWeight = "600";
+    return b;
+  }
+
+  // WHY THE CONVERSATION'S STATE IS ON THE LEAD CARD. A lead and a conversation
+  // have independent states and independent actions, and one conversation
+  // produces several leads — so they cannot be one control. What they can be is
+  // visible at the same time: closing every lead while the assistant stays
+  // silenced for that customer is a real and ordinary outcome, and the only
+  // thing that made it dangerous was having to notice it in another tab.
   function renderLead(lead) {
     var card = el("div", "card");
     var top = el("div", "top");
     top.appendChild(el("strong", null, "#" + lead.id + " · " + lead.type));
     top.appendChild(el("span", "pill " + lead.status, lead.status));
+    if (lead.conversationPaused) top.appendChild(el("span", "pill paused", "asistente en pausa"));
     card.appendChild(top);
     card.appendChild(el("div", "meta",
       lead.phone + (lead.productCode ? " · " + lead.productCode : "") + " · " + lead.createdAt + " UTC" +
       (lead.claimedBy ? " · lo lleva " + lead.claimedBy : "")));
     if (lead.name) card.appendChild(el("div", null, lead.name));
     if (lead.note) card.appendChild(el("div", null, lead.note));
+
+    if (!lead.conversationKey || !lead.agentId) {
+      // Said rather than silently omitted: a card with no navigation looks
+      // exactly like a broken one, and the reason is not guessable.
+      card.appendChild(el("div", "meta",
+        "Sin conversación asociada — este lead se capturó antes de que los leads guardaran su origen."));
+    } else if (lead.conversationPaused) {
+      card.appendChild(el("div", "meta",
+        "El asistente no le responde a este cliente" +
+        (lead.pausedBy ? " · en pausa por " + lead.pausedBy : "") +
+        (lead.pausedByLeadId ? " al tomar el lead #" + lead.pausedByLeadId : " (pausa manual)") +
+        (lead.otherLeadsHolding > 0
+          ? " · hay " + lead.otherLeadsHolding + " lead(s) más de esta conversación en curso"
+          : "")));
+    }
 
     var row = el("div", "row");
     row.style.marginTop = "10px";
@@ -1125,14 +1273,7 @@ const PAGE = `<!doctype html>
       var label = status === "new" ? "Reabrir"
         : status === "in_progress" ? "Lo atiendo yo →"
         : "Cerrar";
-      var b = el("button", null, label);
-      b.type = "button";
-      b.style.border = status === "in_progress" ? "1px solid currentColor" : "1px solid var(--line)";
-      b.style.background = "transparent";
-      b.style.color = "inherit";
-      b.style.borderRadius = "10px";
-      b.style.padding = "7px 14px";
-      if (status === "in_progress") b.style.fontWeight = "600";
+      var b = leadButton(label, status === "in_progress");
       b.addEventListener("click", function () {
         b.disabled = true;
         call("/admin/lead/status", { method: "POST", body: { id: lead.id, status: status } })
@@ -1147,7 +1288,20 @@ const PAGE = `<!doctype html>
                   : "Tomaste este lead. No tiene una conversación asociada que pausar.");
               });
             }
-            return loadLeads();
+            // A hand-back reports what happened to the conversation, because
+            // "reabrir" not returning the customer to the assistant is exactly
+            // the surprise this whole panel is meant to stop producing.
+            return loadLeads().then(function () {
+              if (data.released) {
+                say("Lead reabierto. El asistente vuelve a atender esta conversación.");
+              } else if (data.stillPausedBecause === "other_leads") {
+                say("Lead reabierto. La conversación sigue en pausa: hay otro lead de este cliente en curso.");
+              } else if (data.stillPausedBecause === "manual") {
+                say("Lead reabierto. La conversación sigue en pausa porque alguien la tomó a mano — devuélvela desde la conversación.");
+              } else if (status === "closed" && data.paused) {
+                say("Lead cerrado. El asistente sigue en silencio con este cliente — devuélvelo cuando termines.");
+              }
+            });
           })
           .finally(function () { b.disabled = false; });
       });
@@ -1155,15 +1309,27 @@ const PAGE = `<!doctype html>
     });
 
     if (lead.conversationKey && lead.agentId) {
-      var open = el("button", null, "Ver la conversación");
-      open.type = "button";
-      open.style.border = "1px solid currentColor";
-      open.style.background = "transparent";
-      open.style.color = "inherit";
-      open.style.borderRadius = "10px";
-      open.style.padding = "7px 14px";
+      var open = leadButton("Ver la conversación", true);
       open.addEventListener("click", function () { openThread(lead.conversationKey, lead.agentId); });
       row.appendChild(open);
+
+      if (lead.conversationPaused) {
+        // The conversation's action, on the lead's card. It is the SAME route
+        // the thread uses, deliberately: one writer, and a release from here is
+        // as deliberate as a release from there.
+        var back = leadButton("Devolver al asistente", false);
+        back.addEventListener("click", function () {
+          back.disabled = true;
+          say("Devolviendo…");
+          call("/admin/conversation/release", { method: "POST", body: { key: lead.conversationKey, agent: lead.agentId } })
+            .then(function (data) {
+              if (!data) return;
+              return loadLeads().then(function () { say("El asistente vuelve a atender esta conversación."); });
+            })
+            .finally(function () { back.disabled = false; });
+        });
+        row.appendChild(back);
+      }
     }
     card.appendChild(row);
     return card;

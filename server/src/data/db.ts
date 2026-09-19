@@ -613,6 +613,13 @@ export function createSchema(db: DB, options: SchemaOptions = {}): void {
       -- authorisation: the session is what authorised the request.
       paused_by TEXT NOT NULL,
       reason TEXT,
+      -- The lead whose takeover caused this pause, or NULL when a human paused
+      -- the conversation directly. It is what makes handing a lead back able to
+      -- hand its conversation back too, WITHOUT undoing a pause set by hand.
+      -- No foreign key: SQLite cannot add one to an existing table, so the
+      -- running pilot would have a constraint the new databases have and it
+      -- does not. A dangling id reads as "lead-caused", which is what it is.
+      lead_id INTEGER,
       released_at TEXT,
       released_by TEXT
     );
@@ -744,6 +751,14 @@ function migrate(db: DB, options: SchemaOptions): void {
   // single typed function (see repo.ts setLeadStatus).
   addColumn(db, "leads", "status_changed_at", "TEXT");
   addColumn(db, "leads", "claimed_by", "TEXT");
+  // WHY THE PAUSE EXISTS. A handoff created by taking a lead and one created by
+  // an admin opening a thread and hitting pause are the same row, and without
+  // this column nothing can tell them apart — so giving the conversation back
+  // when a lead is handed back would also undo a pause somebody set by hand,
+  // for reasons the lead knows nothing about. NULL means a human paused it
+  // directly, which is every row written before this column existed: the
+  // conservative reading, since a NULL never auto-releases.
+  addColumn(db, "conversation_handoff", "lead_id", "INTEGER");
   // Created HERE rather than in createSchema: the column it indexes is added by
   // the step immediately above, so on an existing database a CREATE INDEX in
   // the schema block would run against a table that does not have it yet and

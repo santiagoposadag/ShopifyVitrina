@@ -108,6 +108,11 @@ export function findOpenDuplicateLead(
   return row ?? null;
 }
 
+/** One lead by id, or null. */
+export function getLead(db: DB, id: number): Lead | null {
+  return (db.prepare(`SELECT * FROM leads WHERE id = ?`).get(id) as Lead | undefined) ?? null;
+}
+
 /**
  * Move a lead through its lifecycle. Returns the updated lead, or null when no
  * such lead exists.
@@ -1305,6 +1310,15 @@ export interface Handoff {
   /** The phone behind the admin session that paused it. Attribution, not authorisation. */
   paused_by: string;
   reason: string | null;
+  /**
+   * The lead whose takeover caused this pause, or NULL when a human paused the
+   * conversation directly.
+   *
+   * This is the ONLY thing that distinguishes the two, and the distinction is
+   * what lets handing a lead back hand its conversation back without also
+   * undoing a pause somebody set by hand for a reason no lead knows about.
+   */
+  lead_id: number | null;
   released_at: string | null;
   released_by: string | null;
 }
@@ -1340,10 +1354,22 @@ export function isConversationPaused(db: DB, conversationKey: string, agentId: s
  * other, with the console showing it as live. One immediate transaction so the
  * check and the insert see one state — the same reasoning as every other
  * read-then-write in this codebase.
+ *
+ * `leadId` NAMES THE CAUSE, and the idempotency above means it is recorded only
+ * when this call is the one that creates the pause. Taking a lead over a
+ * conversation a human already paused by hand keeps that pause exactly as it
+ * was, NULL cause included — so handing the lead back later will not release
+ * something the lead never caused.
  */
 export function pauseConversation(
   db: DB,
-  input: { conversationKey: string; agentId: string; pausedBy: string; reason?: string },
+  input: {
+    conversationKey: string;
+    agentId: string;
+    pausedBy: string;
+    reason?: string;
+    leadId?: number | null;
+  },
 ): Handoff {
   const pause = db.transaction((): Handoff => {
     const existing = db
@@ -1357,14 +1383,15 @@ export function pauseConversation(
 
     const info = db
       .prepare(
-        `INSERT INTO conversation_handoff (conversation_key, agent_id, paused_by, reason)
-         VALUES (@conversation_key, @agent_id, @paused_by, @reason)`,
+        `INSERT INTO conversation_handoff (conversation_key, agent_id, paused_by, reason, lead_id)
+         VALUES (@conversation_key, @agent_id, @paused_by, @reason, @lead_id)`,
       )
       .run({
         conversation_key: input.conversationKey,
         agent_id: input.agentId,
         paused_by: input.pausedBy,
         reason: input.reason ?? null,
+        lead_id: input.leadId ?? null,
       });
     return db
       .prepare(`SELECT * FROM conversation_handoff WHERE id = ?`)
@@ -1399,6 +1426,64 @@ export function releaseConversation(
       agent_id: input.agentId,
       released_by: input.releasedBy,
     }).changes;
+}
+
+/**
+ * The live handoff for one conversation, or null.
+ *
+ * `isConversationPaused` answers the hot yes/no on every inbound batch; this
+ * one is for the caller that needs to know WHY it is paused — specifically
+ * whether a lead caused it — before deciding to release it.
+ */
+export function getLiveHandoff(db: DB, conversationKey: string, agentId: string): Handoff | null {
+  const row = db
+    .prepare(
+      `SELECT * FROM conversation_handoff
+       WHERE conversation_key = ? AND agent_id = ? AND released_at IS NULL
+       ORDER BY id ASC LIMIT 1`,
+    )
+    .get(conversationKey, agentId) as Handoff | undefined;
+  return row ?? null;
+}
+
+/**
+ * How many leads from this conversation a human is still holding.
+ *
+ * LEADS ARE NOT ONE-TO-ONE WITH CONVERSATIONS. One exchange routinely produces
+ * several — a restock notice and a follow-up, or three products in one chat —
+ * so handing ONE of them back says nothing about whether the agent may have the
+ * conversation. This is the question that does, and `excludeLeadId` takes the
+ * lead being moved out of its own count: the caller asks it AFTER the status
+ * write, so without the exclusion a lead being closed would still be counted
+ * against itself only when the write happened to leave it in_progress.
+ */
+export function countLeadsHolding(
+  db: DB,
+  input: { conversationKey: string; agentId: string; excludeLeadId?: number },
+): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM leads
+       WHERE conversation_key = ? AND agent_id = ? AND status = 'in_progress' AND id IS NOT ?`,
+    )
+    .get(input.conversationKey, input.agentId, input.excludeLeadId ?? null) as { n: number };
+  return row.n;
+}
+
+/**
+ * The same count for every conversation at once, keyed by `conversation_key`
+ * and `agent_id` joined with a NUL — one query for a whole page of leads
+ * instead of one per row.
+ */
+export function countLeadsHoldingByConversation(db: DB): Map<string, number> {
+  const rows = db
+    .prepare(
+      `SELECT conversation_key, agent_id, COUNT(*) AS n FROM leads
+       WHERE status = 'in_progress' AND conversation_key IS NOT NULL AND agent_id IS NOT NULL
+       GROUP BY conversation_key, agent_id`,
+    )
+    .all() as { conversation_key: string; agent_id: string; n: number }[];
+  return new Map(rows.map((row) => [`${row.conversation_key}\u0000${row.agent_id}`, row.n]));
 }
 
 /** Every conversation a human currently holds, oldest pause first. */
