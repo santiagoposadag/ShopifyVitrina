@@ -47,12 +47,44 @@ function isPlaceholderHost(hostname: string): boolean {
  *
  * `route` is the console's own path, with no fragment and no trailing slash.
  */
+/**
+ * Compose a LANDING link, whose code rides the PATH rather than the fragment.
+ *
+ * THE OPPOSITE OF THE RULE ABOVE, and forced rather than chosen: this is what a
+ * WhatsApp template's URL button points at, and Meta appends the template's one
+ * variable to the END of a fixed base URL. A fragment cannot be expressed that
+ * way at all — there is nowhere to put the `#`, and the base is frozen at
+ * approval.
+ *
+ * WHAT MAKES THAT ACCEPTABLE is that the value in the path is NOT a session
+ * token. It is a single-use code (see data/admin-deep-links.ts): it buys one
+ * redemption and is spent by the first open, so the copy a request log keeps is
+ * already worthless by the time anyone reads it. The session token it produces
+ * never touches a URL the server sees — the landing page hands it over in a
+ * document body and it reaches the browser as a fragment, like every other
+ * token here.
+ *
+ * `route` ends WITHOUT a trailing slash; one is added, because the code is a
+ * path segment and the base URL submitted to Meta has to end in that slash.
+ */
+export function buildLandingLink(
+  route: string,
+  code: string,
+  publicBaseUrl: string | undefined,
+): ConsoleLink {
+  return composeLink(`${route}/${code}`, publicBaseUrl);
+}
+
 export function buildConsoleLink(
   route: string,
   token: string,
   publicBaseUrl: string | undefined,
 ): ConsoleLink {
-  const path = `${route}#t=${token}`;
+  return composeLink(`${route}#t=${token}`, publicBaseUrl);
+}
+
+/** The shared half: resolve the origin, or report that there is not a usable one. */
+function composeLink(path: string, publicBaseUrl: string | undefined): ConsoleLink {
   const trimmed = publicBaseUrl?.trim();
   if (!trimmed) return { link: null, path, placeholder: true };
 

@@ -14,6 +14,8 @@ import { countAgentCredentials } from "./data/agent-registry.js";
 import { registerTestConsole } from "./admin/test-console.js";
 import { countRosterEntries } from "./data/test-roster.js";
 import { registerAdminConsole } from "./admin/console.js";
+import { registerDeepLinks } from "./admin/deep-link.js";
+import { deleteStaleAdminDeepLinks } from "./data/admin-deep-links.js";
 import {
   ADMIN_LINK_RECORDED_PLACEHOLDER,
   buildAdminLinkMessage,
@@ -269,7 +271,7 @@ async function main(): Promise<void> {
       // Admin sessions are swept long AFTER they expire, not on expiry: a dead
       // session is still an audit record, and an admin write to a conversation
       // names the session that made it. See deleteStaleAdminSessions.
-      const adminSessions = deleteStaleAdminSessions(db);
+      const adminSessions = deleteStaleAdminSessions(db) + deleteStaleAdminDeepLinks(db);
       const staged = await sweepStagedMedia(config.bridgeStagingDir, STAGED_MEDIA_TTL_HOURS);
       if (media > 0 || inbox > 0 || transcripts > 0 || staged > 0 || adminSessions > 0) {
         app.log.info(
@@ -725,6 +727,12 @@ async function main(): Promise<void> {
   // on the same "one switch, and it is the data" principle as the two doors
   // above.
   registerAdminConsole(app, { db, channel });
+  // The landing route a WhatsApp notification points at. Registered OUTSIDE the
+  // console's own gate on purpose: every /admin path answers 404 while no
+  // session is live, and opening one of these is what creates the first one.
+  // Its gate is the same shape one level down — an empty `admin_deep_links`
+  // table matches nothing.
+  registerDeepLinks(app, { db, publicBaseUrl: config.publicBaseUrl });
   const admins = countLiveAdminSessions(db);
   if (admins > 0) {
     // WARN, next to ECHO_MODE and the test console, and for a reason of its

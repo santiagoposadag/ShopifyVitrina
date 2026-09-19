@@ -132,6 +132,102 @@ query string: el servidor corre con `logger: true`, así que `?t=` escribiría u
 credencial viva en el log de peticiones en cada carga de página. Un fragmento no
 llega al servidor en ningún navegador.
 
+## Enlaces directos a una conversación (`/go/<código>`)
+
+Un aviso de lead por WhatsApp lleva un botón que abre **esa conversación** en el
+panel. La forma se la impone Meta: **el botón URL de una plantilla acepta una
+sola variable, y va anexada al final de una URL base fija**. No existe
+`/admin/conversacion/<clave>?agente=<id>&t=<token>` en una plantilla — no hay
+dónde poner el resto.
+
+Entonces un solo valor opaco carga las tres cosas:
+
+```
+https://luminiere.pasiolum.com/go/{{1}}
+```
+
+`{{1}}` es un código de 43 caracteres base64url. `/go/<código>` lo gasta, emite
+una sesión de admin y entrega al navegador:
+
+```
+/admin#t=<token>&c=<conversación>&g=<agente>
+```
+
+El panel lo lee del fragmento y **abre directo en ese hilo**.
+
+### Por qué el código va en el path y el token no
+
+Es la regla opuesta a la del enlace de `panel`, y es forzada, no elegida: Meta
+anexa la variable al final de la base, así que un fragmento no se puede
+expresar. Lo que lo hace aceptable es que **lo que va en el path no es un
+token de sesión**: es un código **de un solo uso**, gastado por la primera
+apertura. La copia que guarde un log de peticiones ya no vale nada cuando
+alguien la lea.
+
+El token de sesión que produce nunca toca una URL que el servidor vea: la página
+de aterrizaje lo entrega en el **cuerpo** del documento (`location.replace`), no
+en un `Location`. Un 302 lo pondría en una cabecera, y los proxies inversos
+detrás de los que corre esto son mucho más propensos a loguear cabeceras de
+respuesta que Fastify.
+
+### Los plazos, y por qué son distintos
+
+| | Enlace de `panel` | Código de aterrizaje |
+|---|---|---|
+| Vida | 15 min para abrir, 12 h de sesión | 24 h |
+| Usos | **varios** | **uno** |
+
+No es una inconsistencia. El de `panel` se pide y se abre en un mismo gesto. Este
+llega sin pedirlo — un lead a las 2am que se lee a las 8 — así que una ventana de
+minutos lo entregaría muerto. **El uso único es lo que paga la ventana larga.**
+
+### Probarlo antes de que exista la plantilla
+
+```bash
+docker compose --profile ops run --rm admin-access link 573001112233 \
+  --conversation 573004445566 --agent vitrina-ventas
+```
+
+Imprime el `/go/<código>` real. Ábrelo una vez y aterriza en el hilo; ábrelo dos
+veces y la segunda muestra la página de vencido.
+
+### La plantilla de Meta
+
+| Campo | Valor |
+|---|---|
+| Nombre | `lead_capturado` |
+| Categoría | **UTILITY** |
+| Idioma | Español (`es`) |
+| Encabezado | `🔔 Nuevo lead` (fijo, sin variables) |
+| Botón | URL dinámica, texto `Abrir conversación` |
+| URL | `https://luminiere.pasiolum.com/go/{{1}}` |
+
+Cuerpo:
+
+```
+Un cliente {{1}}.
+
+Teléfono: {{2}}
+Producto: {{3}}
+Nota: {{4}}
+
+Abre la conversación para responderle tú mismo.
+```
+
+Tres reglas que cuestan un rechazo o una falla en producción:
+
+1. **El cuerpo no puede empezar ni terminar con variable, ni tener dos
+   seguidas.** El de arriba ya cumple.
+2. **Ninguna variable puede ir vacía al enviar.** `product_code` y `note` son
+   nulos en la base cuando el cliente no los dio, así que el envío sustituye por
+   `—`. Vacío lo rechaza Meta *al enviar*, no al aprobar.
+3. **La URL base queda congelada al aprobarse.** Cambiar de dominio después es
+   plantilla nueva y aprobación nueva.
+
+La URL de muestra (`/go/<código inventado>`) **abre bien**: devuelve 200 con la
+página de "este enlace ya no sirve", que es exactamente lo que debe ver un
+revisor — una página real del negocio que se explica sola, no un 404.
+
 ## Escalamiento: qué pasa cuando el agente no puede cerrar
 
 El agente de ventas captura un lead cuando el checkout no puede resolver algo —
