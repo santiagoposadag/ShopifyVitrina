@@ -21,3 +21,11 @@ env.txt
 
 # Go build artifact: `go build ./...` drops the binary next to its source.
 /bridge/bridge
+
+# Local scratch: store exports, dry-run plans and apply logs. Business data,
+# never code — the scripts that read them live in scripts/catalog-loads/.
+/tmp/
+
+# Python bytecode (scripts/catalog-loads/ is the first Python in the repo).
+__pycache__/
+*.pyc
