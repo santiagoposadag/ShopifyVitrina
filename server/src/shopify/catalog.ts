@@ -206,6 +206,27 @@ export interface ResolvedProduct {
 }
 
 /**
+ * More than one variant, on DIFFERENT products, carries the EXACT SKU a
+ * reference named. Shopify does not enforce SKU uniqueness across products
+ * any more than it does within one, so a caller cannot pick one and silently
+ * act on it — resolveProduct returns this instead of a `ResolvedProduct` so
+ * nobody downstream can mistake a guess for a resolution.
+ *
+ * This is deliberately NOT what several of the SAME product's own variants
+ * sharing a SKU produces (the live store has exactly that case, e.g. one SKU
+ * on all seven variants of "Vela Arcángel 3D"): the PRODUCT there resolved
+ * cleanly, and only the variant is undecided — that belongs to whichever
+ * caller needs a variant to decide, with its own guard, not to this function
+ * refusing on the product's behalf.
+ */
+export interface AmbiguousProductResolution {
+  ambiguous: true;
+  /** The reference that produced more than one exact owner. */
+  ref: string;
+  candidates: { product: ShopifyProduct; variant: ShopifyVariant }[];
+}
+
+/**
  * Resolve one of the three things the owner might call a product by.
  *
  * Order matters and is not arbitrary. A SKU is the identifier the owner says
@@ -214,11 +235,22 @@ export interface ResolvedProduct {
  * carry back. Nothing here falls through to a text search: a fuzzy match that
  * feeds `delete_product` is how the wrong product gets deleted, so an
  * unresolvable reference returns null and the agent has to search and confirm.
+ *
+ * The SKU branch goes through `findVariantsBySku`, the same STORE-WIDE, EXACT
+ * lookup `update_product`'s new_sku check uses — not a `first: 2` peek at
+ * Shopify's fuzzy search. Two different products can legitimately carry the
+ * same SKU (Shopify never stops them), and a reference that names EXACT
+ * owners on more than one PRODUCT comes back as `AmbiguousProductResolution`
+ * rather than a silent first pick: picking one here is exactly how
+ * `delete_product` or a price change would land on a stranger's product
+ * instead of the one asked for. Several owners that all agree on one product
+ * resolve that product cleanly, with no `variant` set — see
+ * `AmbiguousProductResolution`'s own comment for why that split matters.
  */
 export async function resolveProduct(
   client: ShopifyClient,
   ref: string,
-): Promise<ResolvedProduct | null> {
+): Promise<ResolvedProduct | AmbiguousProductResolution | null> {
   const trimmed = ref.trim();
   if (trimmed === "") return null;
 
@@ -232,26 +264,24 @@ export async function resolveProduct(
   }
 
   // SKU first: it identifies a single variant, which is what a stock or price
-  // question is actually about.
-  const bySku: { productVariants: { nodes: (RawVariant & { product: RawProduct })[] } } =
-    await client.request(
-      `${PRODUCT_FIELDS}
-       query VariantBySku($query: String!) {
-         productVariants(first: 2, query: $query) {
-           nodes {
-             id sku title price compareAtPrice inventoryQuantity
-             selectedOptions { name value }
-             inventoryItem { id tracked }
-             product { ...ProductFields }
-           }
-         }
-       }`,
-      { query: `sku:${quoteQueryValue(trimmed)}` },
-    );
-
-  const variantNode = bySku.productVariants.nodes[0];
-  if (variantNode) {
-    return { product: toProduct(variantNode.product), variant: toVariant(variantNode) };
+  // question is actually about. EXACT owners only — a fuzzy hit that does not
+  // actually equal this SKU must fall through to the handle lookup below, not
+  // be treated as a match.
+  const owners = await findVariantsBySku(client, trimmed);
+  if (owners.length === 1) {
+    return { product: owners[0]!.product, variant: owners[0]!.variant };
+  }
+  if (owners.length > 1) {
+    const distinctProducts = new Set(owners.map((o) => o.product.id));
+    if (distinctProducts.size > 1) {
+      return { ambiguous: true, ref: trimmed, candidates: owners };
+    }
+    // Every owner agrees on the product — only WHICH of its variants is open,
+    // and that is not this function's call. Leaving `variant` unset is what
+    // routes the decision to the caller's own guard instead of an arbitrary
+    // pick: resolveUpdateVariant's variant/variant_sku selection, or
+    // adjust_inventory's variantsWithSku refusal.
+    return { product: owners[0]!.product };
   }
 
   const byHandle: { products: { nodes: RawProduct[] } } = await client.request(
@@ -270,6 +300,68 @@ export async function resolveProduct(
 export function findVariantBySku(product: ShopifyProduct, sku: string): ShopifyVariant | undefined {
   const wanted = sku.trim().toLowerCase();
   return product.variants.find((v) => v.sku?.toLowerCase() === wanted);
+}
+
+/**
+ * Every variant across the WHOLE STORE whose SKU exactly equals this one.
+ *
+ * Shopify does not enforce SKU uniqueness, so a `new_sku` write can collide
+ * with a SKU already sitting on a different variant with no error from
+ * Shopify at all — and its own search is not exact, so a caller cannot trust
+ * `productVariants(query: "sku:...")` alone to answer "is this taken". This
+ * pages through EVERY fuzzy candidate search finds (the same cursor-loop
+ * shape as `fetchProducts`, since a false "unique" is exactly what stops
+ * paging after the first page would produce) and filters the whole set down
+ * to a trimmed, case-insensitive EXACT match before answering.
+ */
+export async function findVariantsBySku(
+  client: ShopifyClient,
+  sku: string,
+  limit = 250,
+): Promise<{ product: ShopifyProduct; variant: ShopifyVariant }[]> {
+  const trimmed = sku.trim();
+  if (trimmed === "") return [];
+
+  const wanted = trimmed.toLowerCase();
+  const query = `sku:${quoteQueryValue(trimmed)}`;
+  const matches: { product: ShopifyProduct; variant: ShopifyVariant }[] = [];
+  let cursor: string | null = null;
+  let fetched = 0;
+
+  while (fetched < limit) {
+    const pageSize = Math.min(PRODUCTS_PAGE, limit - fetched);
+    const data: {
+      productVariants: {
+        nodes: (RawVariant & { product: RawProduct })[];
+        pageInfo: { hasNextPage: boolean; endCursor: string | null };
+      };
+    } = await client.request(
+      `${PRODUCT_FIELDS}
+       query VariantsBySku($first: Int!, $after: String, $query: String!) {
+         productVariants(first: $first, after: $after, query: $query) {
+           nodes {
+             id sku title price compareAtPrice inventoryQuantity
+             selectedOptions { name value }
+             inventoryItem { id tracked }
+             product { ...ProductFields }
+           }
+           pageInfo { hasNextPage endCursor }
+         }
+       }`,
+      { first: pageSize, after: cursor, query },
+    );
+
+    for (const node of data.productVariants.nodes) {
+      if ((node.sku ?? "").trim().toLowerCase() === wanted) {
+        matches.push({ product: toProduct(node.product), variant: toVariant(node) });
+      }
+    }
+    fetched += data.productVariants.nodes.length;
+    if (!data.productVariants.pageInfo.hasNextPage) break;
+    cursor = data.productVariants.pageInfo.endCursor;
+  }
+
+  return matches;
 }
 
 // --- Locations and stock ------------------------------------------------------

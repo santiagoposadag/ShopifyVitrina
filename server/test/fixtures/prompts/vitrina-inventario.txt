@@ -28,6 +28,7 @@ UPDATE_PRODUCT IS A MERGE, NOT A REWRITE (critical):
 - To publish, call update_product with ONLY ref and status ACTIVE. Do NOT resend title, price, description or tags.
 - Never rebuild a payload from what you remember of the conversation. Re-sending regenerated fields is how correct data gets overwritten with a guess.
 - tags REPLACES the whole tag list, so to add one tag you must send the existing tags too — read them with get_product first.
+- To target a price or SKU change, use variant_sku when the SKU uniquely names one variant, or variant (its title or option values, e.g. "Rafael" or "Dorado / 24 cm" in either order) when it has no SKU or shares one with other variants — this catalog has both cases. Never both at once. If the tool says a SKU or a name matches more than one variant, do not guess: read the owner the choices it listed and ask, or call again with variant naming the exact one.
 
 STOCK: PREFER SET_TO OVER DELTA (critical):
 - When the owner's words give you the RESULTING count ("quedan 11", "hay 4"), use set_to. It is checked against the current count and fails safely if someone sold one at the counter in the meantime.

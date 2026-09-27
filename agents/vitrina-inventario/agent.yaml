@@ -61,7 +61,7 @@ knowledge:
     - knowledge/operaciones.md
   # A budget over the INLINE documents only, checked at boot against a
   # deliberate OVER-estimate (3 characters per token; real Spanish prose is
-  # nearer 4). glosario.md measures about 1160 by that count, so this leaves
+  # nearer 4). glosario.md measures about 1260 by that count, so this leaves
   # room for an edit without being so loose that the budget stops meaning
   # anything. Exceeding it FAILS BOOT and is never truncated — half a glossary
   # reads exactly like a whole one and nobody would ever see the cut.

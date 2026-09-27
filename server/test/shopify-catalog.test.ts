@@ -6,12 +6,15 @@ import {
   adjustInventory,
   createProduct,
   deleteProduct,
+  findVariantsBySku,
   publishToOnlineStore,
   resolveLocation,
   resolveProduct,
   setInventory,
   updateProduct,
   uploadProductPhotos,
+  type AmbiguousProductResolution,
+  type ResolvedProduct,
 } from "../src/shopify/catalog.js";
 import { ShopifyClient, type ShopifyConfig } from "../src/shopify/client.js";
 
@@ -63,6 +66,30 @@ const rawVariant = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
+/** A `productVariants` response page, pageInfo included since findVariantsBySku pages through it. */
+const variantsPage = (
+  nodes: unknown[],
+  pageInfo: { hasNextPage: boolean; endCursor: string | null } = { hasNextPage: false, endCursor: null },
+) => ({ productVariants: { nodes, pageInfo } });
+
+/** Narrows a resolution to the resolved-product case, or fails the test loudly. */
+function asResolved(resolved: ResolvedProduct | AmbiguousProductResolution | null): ResolvedProduct {
+  if (!resolved || "ambiguous" in resolved) {
+    throw new Error(`expected a resolved product, got: ${JSON.stringify(resolved)}`);
+  }
+  return resolved;
+}
+
+/** Narrows a resolution to the ambiguous case, or fails the test loudly. */
+function asAmbiguous(
+  resolved: ResolvedProduct | AmbiguousProductResolution | null,
+): AmbiguousProductResolution {
+  if (!resolved || !("ambiguous" in resolved)) {
+    throw new Error(`expected an ambiguous resolution, got: ${JSON.stringify(resolved)}`);
+  }
+  return resolved;
+}
+
 const rawProduct = (overrides: Record<string, unknown> = {}) => ({
   id: "gid://shopify/Product/1",
   handle: "camiseta-negra",
@@ -86,9 +113,9 @@ const rawProduct = (overrides: Record<string, unknown> = {}) => ({
 describe("resolveProduct", () => {
   it("resolves a gid directly, without a search", async () => {
     const { client, calls } = fakeShopify([{ product: rawProduct() }]);
-    const resolved = await resolveProduct(client, "gid://shopify/Product/1");
+    const resolved = asResolved(await resolveProduct(client, "gid://shopify/Product/1"));
 
-    expect(resolved?.product.handle).toBe("camiseta-negra");
+    expect(resolved.product.handle).toBe("camiseta-negra");
     expect(calls).toHaveLength(1);
     expect(calls[0]!.variables["id"]).toBe("gid://shopify/Product/1");
   });
@@ -97,39 +124,36 @@ describe("resolveProduct", () => {
   // question is actually about.
   it("tries SKU before handle and carries the matched variant back", async () => {
     const { client, calls } = fakeShopify([
-      { productVariants: { nodes: [{ ...rawVariant(), product: rawProduct() }] } },
+      variantsPage([{ ...rawVariant(), product: rawProduct() }]),
     ]);
-    const resolved = await resolveProduct(client, "CAM-NEG-M");
+    const resolved = asResolved(await resolveProduct(client, "CAM-NEG-M"));
 
-    expect(resolved?.variant?.sku).toBe("CAM-NEG-M");
+    expect(resolved.variant?.sku).toBe("CAM-NEG-M");
     expect(calls).toHaveLength(1);
     expect(calls[0]!.variables["query"]).toBe('sku:"CAM-NEG-M"');
   });
 
   it("falls back to the handle when no SKU matches", async () => {
     const { client, calls } = fakeShopify([
-      { productVariants: { nodes: [] } },
+      variantsPage([]),
       { products: { nodes: [rawProduct()] } },
     ]);
-    const resolved = await resolveProduct(client, "camiseta-negra");
+    const resolved = asResolved(await resolveProduct(client, "camiseta-negra"));
 
-    expect(resolved?.product.handle).toBe("camiseta-negra");
-    expect(resolved?.variant).toBeUndefined();
+    expect(resolved.product.handle).toBe("camiseta-negra");
+    expect(resolved.variant).toBeUndefined();
     expect(calls[1]!.variables["query"]).toBe('handle:"camiseta-negra"');
   });
 
   it("returns null rather than guessing when nothing matches", async () => {
-    const { client } = fakeShopify([
-      { productVariants: { nodes: [] } },
-      { products: { nodes: [] } },
-    ]);
+    const { client } = fakeShopify([variantsPage([]), { products: { nodes: [] } }]);
     expect(await resolveProduct(client, "no-existe")).toBeNull();
   });
 
   // The query argument is its own little language. An unescaped quote does not
   // error — it silently changes which products the query selects.
   it("escapes quotes and backslashes in the reference", async () => {
-    const { client, calls } = fakeShopify([{ productVariants: { nodes: [] } }, { products: { nodes: [] } }]);
+    const { client, calls } = fakeShopify([variantsPage([]), { products: { nodes: [] } }]);
     await resolveProduct(client, 'SKU" OR id:*');
     expect(calls[0]!.variables["query"]).toBe('sku:"SKU\\" OR id:*"');
   });
@@ -137,6 +161,134 @@ describe("resolveProduct", () => {
   it("treats an empty reference as no reference at all", async () => {
     const { client, calls } = fakeShopify([]);
     expect(await resolveProduct(client, "   ")).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  // Shopify's search is FUZZY: a node the query returns does not necessarily
+  // carry the exact SKU asked for. Treating it as a match anyway is how a
+  // reference silently resolves to the wrong product.
+  it("does not treat a fuzzy hit as a SKU match, and falls through to the handle lookup", async () => {
+    const { client, calls } = fakeShopify([
+      variantsPage([{ ...rawVariant({ sku: "CAM-NEG-M-XL" }), product: rawProduct() }]),
+      { products: { nodes: [] } },
+    ]);
+
+    expect(await resolveProduct(client, "CAM-NEG-M")).toBeNull();
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.variables["query"]).toBe('handle:"CAM-NEG-M"');
+  });
+
+  // Shopify never enforces SKU uniqueness. Two DIFFERENT products can each
+  // carry an exact variant with the same SKU, and picking the first one here
+  // is exactly how a price change or a delete lands on a stranger's product.
+  it("refuses to pick a first match when the SKU exactly matches variants of two different products", async () => {
+    const { client } = fakeShopify([
+      variantsPage([
+        { ...rawVariant(), product: rawProduct() },
+        {
+          ...rawVariant({ id: "gid://shopify/ProductVariant/9" }),
+          product: rawProduct({ id: "gid://shopify/Product/9", handle: "camiseta-negra-bodega-2" }),
+        },
+      ]),
+    ]);
+
+    const ambiguous = asAmbiguous(await resolveProduct(client, "CAM-NEG-M"));
+    expect(ambiguous.ref).toBe("CAM-NEG-M");
+    expect(ambiguous.candidates.map((c) => c.product.handle)).toEqual([
+      "camiseta-negra",
+      "camiseta-negra-bodega-2",
+    ]);
+  });
+
+  // Real store data: VANG-RA sits on 7 variants of ONE product ("Vela
+  // Arcángel 3D"). The PRODUCT itself resolved cleanly — every owner agrees on
+  // it — so this must NOT be ambiguous the way two different products sharing
+  // a SKU are. Which VARIANT it names is the open question, and that decision
+  // belongs to the caller's own guards (resolveUpdateVariant, adjust_inventory's
+  // variantsWithSku check), not to resolveProduct picking one.
+  it("resolves the product without picking a variant when several of ITS OWN variants share the SKU", async () => {
+    const { client } = fakeShopify([
+      variantsPage([
+        {
+          ...rawVariant({ id: "gid://shopify/ProductVariant/1", sku: "VANG-RA", title: "Jofiel" }),
+          product: rawProduct(),
+        },
+        {
+          ...rawVariant({ id: "gid://shopify/ProductVariant/2", sku: "VANG-RA", title: "Rafael" }),
+          product: rawProduct(),
+        },
+      ]),
+    ]);
+
+    const resolved = asResolved(await resolveProduct(client, "VANG-RA"));
+    expect(resolved.product.handle).toBe("camiseta-negra");
+    expect(resolved.variant).toBeUndefined();
+  });
+});
+
+// findVariantsBySku backs both resolveProduct's SKU branch and
+// update_product's new_sku uniqueness check — a false "unique" here is a
+// false "safe to write" there.
+describe("findVariantsBySku", () => {
+  it("pages through fuzzy candidates and still finds an exact match on a later page", async () => {
+    const { client, calls } = fakeShopify([
+      variantsPage(
+        [
+          {
+            ...rawVariant({ sku: "CAM-NEG-M-2" }),
+            product: rawProduct({ id: "gid://shopify/Product/2", handle: "camiseta-negra-2" }),
+          },
+        ],
+        { hasNextPage: true, endCursor: "cursor-1" },
+      ),
+      variantsPage([{ ...rawVariant(), product: rawProduct() }]),
+    ]);
+
+    const matches = await findVariantsBySku(client, "CAM-NEG-M");
+
+    // A page size that stopped after the first page would report a false
+    // "unique" — or worse here, "not found" — for a SKU that IS taken.
+    expect(matches).toHaveLength(1);
+    expect(matches[0]!.product.handle).toBe("camiseta-negra");
+    expect(calls).toHaveLength(2);
+    expect(calls[0]!.variables).toMatchObject({ first: 50, after: null, query: 'sku:"CAM-NEG-M"' });
+    expect(calls[1]!.variables).toMatchObject({
+      first: 50,
+      after: "cursor-1",
+      query: 'sku:"CAM-NEG-M"',
+    });
+  });
+
+  it("collects every exact owner even when they are spread across more than one page", async () => {
+    const { client } = fakeShopify([
+      variantsPage([{ ...rawVariant(), product: rawProduct() }], {
+        hasNextPage: true,
+        endCursor: "c1",
+      }),
+      variantsPage([
+        {
+          ...rawVariant({ id: "gid://shopify/ProductVariant/9" }),
+          product: rawProduct({ id: "gid://shopify/Product/9", handle: "camiseta-negra-bodega-2" }),
+        },
+      ]),
+    ]);
+
+    const matches = await findVariantsBySku(client, "CAM-NEG-M");
+    expect(matches.map((m) => m.product.handle)).toEqual([
+      "camiseta-negra",
+      "camiseta-negra-bodega-2",
+    ]);
+  });
+
+  it("escapes quotes and backslashes the same way resolveProduct does", async () => {
+    const { client, calls } = fakeShopify([variantsPage([])]);
+    await findVariantsBySku(client, 'SKU" OR id:*');
+    expect(calls[0]!.variables["query"]).toBe('sku:"SKU\\" OR id:*"');
+  });
+
+  it("treats an empty SKU as no SKU at all", async () => {
+    const { client, calls } = fakeShopify([]);
+    expect(await findVariantsBySku(client, "   ")).toEqual([]);
     expect(calls).toHaveLength(0);
   });
 });

@@ -35,6 +35,9 @@ permanentes.
 El SKU es el código de UNA variante y es la forma más precisa de nombrarla.
 El handle es el nombre del producto dentro de la dirección web de su página en la tienda.
 Un producto se identifica por su código exacto, nunca por parecido.
+No toda variante tiene SKU, y en esta tienda un mismo SKU a veces se repite en varias
+variantes de un mismo producto. Cuando eso pasa, la variante se nombra por su título o sus
+valores de opción (por ejemplo "Rafael", o "Dorado / 24 cm"), nunca por ese SKU repetido.
 
 ## Existencias: por variante y por ubicación
 

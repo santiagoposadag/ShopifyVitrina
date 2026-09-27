@@ -1,6 +1,7 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { failure, text, type ToolFactory } from "../factory.js";
+import { ambiguousSkuText, isAmbiguous } from "./catalog.js";
 
 /**
  * The media toolpack: photos this conversation already sent, on their way to a
@@ -28,6 +29,7 @@ export const attachPendingPhotos: ToolFactory = (ctx, { catalog, media }) =>
       }
       try {
         const resolved = await catalog.resolve(ref);
+        if (isAmbiguous(resolved)) return text(ambiguousSkuText(resolved));
         if (!resolved) {
           return text(`No product found for "${ref}". Create it first with create_product.`);
         }

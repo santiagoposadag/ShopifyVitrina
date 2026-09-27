@@ -3,7 +3,7 @@ import { z } from "zod";
 import { variantSellable } from "../../shopify/rank.js";
 import { failure, text, type ToolFactory } from "../factory.js";
 import type { CartLine } from "../ports.js";
-import { describeVariant } from "./catalog.js";
+import { ambiguousSkuText, describeVariant, isAmbiguous } from "./catalog.js";
 
 /**
  * The cart toolpack: one tool that turns chosen SKUs into a checkout link.
@@ -61,6 +61,7 @@ export const buildCart: ToolFactory = (ctx, { catalog }) =>
           }
 
           const resolved = await catalog.resolve(sku);
+          if (isAmbiguous(resolved)) return text(ambiguousSkuText(resolved));
           // A cart link is built from ONE variant, and only a SKU names one.
           if (!resolved?.variant) {
             return text(

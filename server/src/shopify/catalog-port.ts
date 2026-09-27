@@ -1,5 +1,6 @@
 import type { Config } from "../config.js";
 import type {
+  AmbiguousResolution,
   CartLine,
   CatalogPort,
   CatalogSearch,
@@ -106,9 +107,12 @@ export function shopifyCatalogPort(deps: ShopifyCatalogPortDeps): CatalogPort {
       };
     },
 
-    resolve: (ref: string): Promise<ResolvedProduct | null> => catalog.resolveProduct(client, ref),
+    resolve: (ref: string): Promise<ResolvedProduct | AmbiguousResolution | null> =>
+      catalog.resolveProduct(client, ref),
 
     variantBySku: catalog.findVariantBySku,
+
+    variantsBySku: (sku: string) => catalog.findVariantsBySku(client, sku),
 
     locations: () => catalog.listLocations(client),
 
