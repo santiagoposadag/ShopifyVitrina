@@ -1,5 +1,6 @@
 import type {
   AgentsPort,
+  AmbiguousResolution,
   AskAgentRequest,
   AskAgentResult,
   CartLine,
@@ -22,6 +23,7 @@ import type {
   ProductInput,
   ShopifyLocation,
   ShopifyProduct,
+  ShopifyVariant,
   VariantInput,
 } from "../../src/shopify/types.js";
 
@@ -41,13 +43,23 @@ export interface RecordedCall {
 export interface FakePorts {
   ports: ToolPorts;
   calls: RecordedCall[];
-  /** Answers for `resolve`, keyed by the exact ref the tool passes. */
-  products: Map<string, ResolvedProduct>;
+  /**
+   * Answers for `resolve`, keyed by the exact ref the tool passes. A test
+   * driving the ambiguous-SKU refusal sets an `AmbiguousResolution` here
+   * directly — this fake has no store to derive one from search results.
+   */
+  products: Map<string, ResolvedProduct | AmbiguousResolution>;
   pending: PendingPhoto[];
   /** What `adjustInventory` reports back as the resulting count. */
   quantityAfterAdjust: number | null;
   /** What the knowledge port answers with. */
   knowledgeHits: KnowledgeHit[];
+  /**
+   * What `variantsBySku` answers with — the store-wide owners of whatever SKU
+   * is asked about. Empty by default, since this port has no store to search:
+   * a test wanting a collision sets this to the variant that already holds it.
+   */
+  skuOwners: { product: ShopifyProduct; variant: ShopifyVariant }[];
 }
 
 export function fakeProduct(overrides: Partial<ShopifyProduct> = {}): ShopifyProduct {
@@ -86,13 +98,14 @@ const LOCATION: ShopifyLocation = { id: "gid://shopify/Location/1", name: "Bodeg
 
 export function fakePorts(): FakePorts {
   const calls: RecordedCall[] = [];
-  const products = new Map<string, ResolvedProduct>();
+  const products = new Map<string, ResolvedProduct | AmbiguousResolution>();
   const state: FakePorts = {
     calls,
     products,
     pending: [],
     quantityAfterAdjust: 1,
     knowledgeHits: [],
+    skuOwners: [],
     ports: undefined as unknown as ToolPorts,
   };
   const record = (method: string, ...args: unknown[]): void => {
@@ -104,12 +117,16 @@ export function fakePorts(): FakePorts {
       record("search", input);
       return { hits: [], truncated: false };
     },
-    async resolve(ref: string): Promise<ResolvedProduct | null> {
+    async resolve(ref: string): Promise<ResolvedProduct | AmbiguousResolution | null> {
       record("resolve", ref);
       return products.get(ref) ?? null;
     },
     variantBySku(product: ShopifyProduct, sku: string) {
       return product.variants.find((v) => v.sku?.toLowerCase() === sku.trim().toLowerCase());
+    },
+    async variantsBySku(sku: string) {
+      record("variantsBySku", sku);
+      return state.skuOwners;
     },
     async locations(): Promise<ShopifyLocation[]> {
       record("locations");

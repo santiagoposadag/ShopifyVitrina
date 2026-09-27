@@ -8,7 +8,7 @@ import {
 } from "../../shopify/rank.js";
 import type { ShopifyProduct, ShopifyVariant } from "../../shopify/types.js";
 import { failure, text, type ToolContext, type ToolFactory } from "../factory.js";
-import type { CatalogPort } from "../ports.js";
+import type { AmbiguousResolution, CatalogPort, ResolvedProduct } from "../ports.js";
 
 /**
  * The catalog toolpack: everything that reads or writes products, variants and
@@ -240,6 +240,161 @@ function parseVariants(json: string): { variants: VariantDraft[] } | { error: st
   return { variants };
 }
 
+/**
+ * Fold accents, case and stray whitespace so "Aromática", "AROMATICA" and
+ * "  aromatica " all compare equal. Shopify's own values are not folded this
+ * way anywhere else — this exists only to let an owner type a variant's name
+ * loosely and still hit it.
+ */
+function normalizeLabel(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+/** The variants of an already-fetched product whose SKU exactly equals this one. */
+function variantsWithSku(product: ShopifyProduct, sku: string): ShopifyVariant[] {
+  const wanted = sku.trim().toLowerCase();
+  return product.variants.filter((v) => v.sku?.toLowerCase() === wanted);
+}
+
+/** How a variant is shown in a refusal, so the owner can tell it from its siblings. */
+function describeVariantChoices(
+  product: ShopifyProduct,
+  variants: ShopifyVariant[] = product.variants,
+): string {
+  return variants.map((v) => `"${v.title}"${v.sku ? ` (sku=${v.sku})` : " (no sku)"}`).join(", ");
+}
+
+/**
+ * True when `catalog.resolve` could not pick one exact SKU owner.
+ *
+ * Every caller of `catalog.resolve` must check this BEFORE touching
+ * `.product` — TypeScript enforces it structurally (`AmbiguousResolution` has
+ * no `product` field), and this is the one narrowing check every call site
+ * shares, so the refusal text stays identical everywhere the ambiguity can
+ * surface rather than drifting one tool at a time.
+ */
+export function isAmbiguous(
+  resolved: ResolvedProduct | AmbiguousResolution | null,
+): resolved is AmbiguousResolution {
+  return resolved !== null && "ambiguous" in resolved;
+}
+
+/**
+ * The refusal text for a SKU that named more than one exact owner.
+ *
+ * Never guesses which one was meant — Shopify does not enforce SKU
+ * uniqueness across products any more than it does within one, and picking
+ * the first candidate here is exactly how `delete_product` or a price change
+ * lands on a stranger's product. Every candidate is named by its own
+ * product's handle, so the owner (or model) can repeat the request with that
+ * instead of the ambiguous SKU.
+ */
+export function ambiguousSkuText(resolution: AmbiguousResolution): string {
+  const candidates = resolution.candidates
+    .map((c) => `"${c.variant.title}" on ${c.product.handle} ("${c.product.title}")`)
+    .join(", ");
+  return `"${resolution.ref}" matches more than one variant, so it cannot be used to identify a product safely: ${candidates}. Say which product this is about — its handle, or a SKU that names only one.`;
+}
+
+/**
+ * Every variant of a product that `label` names, by title or by its option
+ * values.
+ *
+ * A variant's title is usually its option values joined with " / ", but this
+ * checks the values directly rather than trusting that string: it accepts
+ * the parts in ANY order ("24 cm / Dorado" as much as "Dorado / 24 cm"), and
+ * it accepts a single value with no slash at all — which is the only way to
+ * name a variant on a single-axis product like "Rafael" on a product whose
+ * only axis is "Nombre". Everything is compared through `normalizeLabel`, so
+ * accents, case and stray whitespace never cause a miss.
+ *
+ * The comparison is a MULTISET (sorted arrays), not a Set: a variant with the
+ * SAME value on two different axes (e.g. Color="Dorado", Acabado="Dorado")
+ * has TWO option values, and a Set would de-duplicate that down to one,
+ * making the one-word label "Dorado" match a variant it only half-names.
+ * `selectedOptions.length` is the variant's true axis count and must agree
+ * with the number of parts in the label before either side's values matter.
+ *
+ * Exported and pure so it is tested directly; `update_product` uses it to
+ * resolve the `variant` parameter before any mutation is sent.
+ */
+export function findVariantsByLabel(product: ShopifyProduct, label: string): ShopifyVariant[] {
+  const normalizedWhole = normalizeLabel(label);
+  if (normalizedWhole === "") return [];
+
+  const parts = label
+    .split("/")
+    .map((part) => normalizeLabel(part))
+    .filter((part) => part !== "");
+  const sortedParts = [...parts].sort();
+
+  return product.variants.filter((variant) => {
+    if (normalizeLabel(variant.title) === normalizedWhole) return true;
+
+    const values = variant.selectedOptions.map((o) => normalizeLabel(o.value));
+    if (parts.length === 0 || parts.length !== values.length) return false;
+    const sortedValues = [...values].sort();
+    return sortedParts.every((part, i) => part === sortedValues[i]);
+  });
+}
+
+/**
+ * Which variant of `product` a price or SKU write targets, or the refusal
+ * message when that cannot be decided safely.
+ *
+ * Three ways in, tried in order: an explicit `variant` label, an explicit
+ * `variantSku`, or — when neither was given — the product's only variant, or
+ * the variant the product reference itself resolved (a SKU that named the
+ * product). Every path that could land on more than one variant refuses
+ * instead of guessing: a duplicated SKU is real in this catalog (Shopify does
+ * not enforce uniqueness), and picking the first match silently repriced the
+ * wrong candle for years before this existed.
+ */
+export function resolveUpdateVariant(
+  product: ShopifyProduct,
+  resolvedVariant: ShopifyVariant | undefined,
+  selector: { variant?: string; variantSku?: string },
+): ShopifyVariant | string {
+  if (selector.variant !== undefined) {
+    const matches = findVariantsByLabel(product, selector.variant);
+    if (matches.length === 0) {
+      return `No variant of ${product.handle} matches "${selector.variant}". Its variants are: ${describeVariantChoices(product)}.`;
+    }
+    if (matches.length > 1) {
+      return `"${selector.variant}" matches more than one variant of ${product.handle}: ${describeVariantChoices(product, matches)}. Be more specific.`;
+    }
+    return matches[0]!;
+  }
+
+  if (selector.variantSku !== undefined) {
+    const shared = variantsWithSku(product, selector.variantSku);
+    if (shared.length > 1) {
+      return `SKU "${selector.variantSku}" is shared by ${shared.length} variants of ${product.handle}: ${describeVariantChoices(product, shared)}. Use variant instead, naming the one you mean (e.g. "${shared[0]!.title}").`;
+    }
+    if (shared.length === 1) return shared[0]!;
+    return `"${selector.variantSku}" does not match any variant of ${product.handle}. Its variants are: ${describeVariantChoices(product)}.`;
+  }
+
+  if (product.variants.length === 1) return product.variants[0]!;
+
+  if (resolvedVariant) {
+    if (resolvedVariant.sku) {
+      const shared = variantsWithSku(product, resolvedVariant.sku);
+      if (shared.length > 1) {
+        return `The SKU used to find this product is shared by ${shared.length} of its variants: ${describeVariantChoices(product, shared)}. Pass variant to say which one, naming it by its title (e.g. "${shared[0]!.title}").`;
+      }
+    }
+    return resolvedVariant;
+  }
+
+  return `Product ${product.handle} has ${product.variants.length} variants: ${describeVariantChoices(product)}. Say which one the price or SKU is for, using variant or variant_sku.`;
+}
+
 /** What the publish half of a create or an update reports, given what it managed to do. */
 function publishNote(published: boolean): string {
   return published
@@ -302,6 +457,7 @@ function getProductTool(ctx: ToolContext, catalog: CatalogPort, options: {
     async ({ ref }) => {
       try {
         const resolved = await catalog.resolve(ref);
+        if (isAmbiguous(resolved)) return text(ambiguousSkuText(resolved));
         if (!resolved) return text(`No product found for "${ref}".`);
         if (!options.anyStatus && resolved.product.status !== "ACTIVE") {
           return text(`No product found for "${ref}".`);
@@ -432,7 +588,7 @@ export const updateProduct: ToolFactory = (ctx, { catalog }) =>
   tool(
     "update_product",
     ctx.describe(
-      "Update an EXISTING product, found by SKU, handle or id. This is a MERGE, not a rewrite: pass ONLY the fields you are actually changing, and everything you omit keeps its stored value. To publish, pass just ref and status ACTIVE. To change one variant's price or SKU, pass variant_sku plus the new price. Never rebuild a payload from what you remember of the conversation — re-sending regenerated fields is how correct data gets overwritten with a guess. To change stock, use adjust_inventory, not this tool.",
+      "Update an EXISTING product, found by SKU, handle or id. This is a MERGE, not a rewrite: pass ONLY the fields you are actually changing, and everything you omit keeps its stored value. To publish, pass just ref and status ACTIVE. To change one variant's price or SKU, pass variant_sku plus the new price — or, when the variant has no SKU or shares one with other variants of the same product (both happen in this catalog), pass variant instead, naming it by its title or option values (e.g. 'Rafael', or 'Dorado / 24 cm' in either order). variant and variant_sku are mutually exclusive. Assigning a brand-new SKU to a variant that has none is ref + variant + new_sku. Never rebuild a payload from what you remember of the conversation — re-sending regenerated fields is how correct data gets overwritten with a guess. To change stock, use adjust_inventory, not this tool.",
     ),
     {
       ref: z.string().describe("The product's SKU, handle, or Shopify id"),
@@ -445,13 +601,25 @@ export const updateProduct: ToolFactory = (ctx, { catalog }) =>
       variant_sku: z
         .string()
         .optional()
-        .describe("Which variant price/new_sku apply to. Required when the product has more than one."),
+        .describe("Which variant price/new_sku apply to. Required when the product has more than one, unless variant is used instead."),
+      variant: z
+        .string()
+        .optional()
+        .describe(
+          "Which variant price/new_sku apply to, by its title or option values (e.g. 'Rafael', or 'Dorado / 24 cm' in either order). Use this instead of variant_sku when the variant has no SKU or shares one with other variants. Mutually exclusive with variant_sku.",
+        ),
       price: z.number().optional().describe("New price for that variant"),
       new_sku: z.string().optional().describe("New SKU for that variant"),
     },
     async (args) => {
+      if (args.variant !== undefined && args.variant_sku !== undefined) {
+        return text(
+          "Pass variant or variant_sku, not both. Use variant (a title or option values, e.g. 'Rafael') when the SKU is missing or shared by more than one variant; use variant_sku when the SKU uniquely names one.",
+        );
+      }
       try {
         const resolved = await catalog.resolve(args.ref);
+        if (isAmbiguous(resolved)) return text(ambiguousSkuText(resolved));
         if (!resolved) {
           return text(`No product found for "${args.ref}". Use list_products to find it, or create_product if it is new.`);
         }
@@ -476,20 +644,24 @@ export const updateProduct: ToolFactory = (ctx, { catalog }) =>
         }
 
         if (touchesVariant) {
-          const variant = args.variant_sku
-            ? catalog.variantBySku(product, args.variant_sku)
-            : product.variants.length === 1
-              ? product.variants[0]
-              : resolved.variant;
-          if (!variant) {
-            return text(
-              `Product ${product.handle} has ${product.variants.length} variants: ${product.variants
-                .map((v) => v.sku ?? v.title)
-                .join(", ")}. Say which one the price or SKU is for.`,
-            );
+          const target = resolveUpdateVariant(product, resolved.variant, {
+            variant: args.variant,
+            variantSku: args.variant_sku,
+          });
+          if (typeof target === "string") return text(target);
+
+          if (args.new_sku !== undefined && args.new_sku.trim() !== "") {
+            const owners = await catalog.variantsBySku(args.new_sku);
+            const conflict = owners.find((o) => o.variant.id !== target.id);
+            if (conflict) {
+              return text(
+                `Refused: SKU "${args.new_sku}" is already used by "${conflict.variant.title}" on ${conflict.product.handle} ("${conflict.product.title}"). SKUs must be unique — pick a different one. Nothing was changed.`,
+              );
+            }
           }
+
           product = await catalog.updateVariants(product.id, [
-            { id: variant.id, price: args.price, sku: args.new_sku },
+            { id: target.id, price: args.price, sku: args.new_sku },
           ]);
         }
 
@@ -522,6 +694,7 @@ export const deleteProduct: ToolFactory = (ctx, { catalog }) =>
     async ({ ref, confirm_handle }) => {
       try {
         const resolved = await catalog.resolve(ref);
+        if (isAmbiguous(resolved)) return text(ambiguousSkuText(resolved));
         if (!resolved) return text(`No product found for "${ref}". Nothing was deleted.`);
         if (resolved.product.handle !== confirm_handle.trim()) {
           // The guard is the whole point of the parameter: a reference that
@@ -566,6 +739,7 @@ export const addVariant: ToolFactory = (ctx, { catalog }) =>
 
       try {
         const resolved = await catalog.resolve(ref);
+        if (isAmbiguous(resolved)) return text(ambiguousSkuText(resolved));
         if (!resolved) return text(`No product found for "${ref}". Nothing was added.`);
         const product = resolved.product;
 
@@ -615,6 +789,7 @@ export const getInventory: ToolFactory = (ctx, { catalog }) =>
     async ({ ref }) => {
       try {
         const resolved = await catalog.resolve(ref);
+        if (isAmbiguous(resolved)) return text(ambiguousSkuText(resolved));
         if (!resolved) return text(`No product found for "${ref}".`);
 
         const variants = resolved.variant ? [resolved.variant] : resolved.product.variants;
@@ -660,7 +835,19 @@ export const adjustInventory: ToolFactory = (ctx, { catalog }) =>
       }
       try {
         const resolved = await catalog.resolve(sku);
+        if (isAmbiguous(resolved)) return text(ambiguousSkuText(resolved));
         if (!resolved) return text(`No variant found with SKU "${sku}".`);
+
+        // Shopify does not enforce SKU uniqueness, and a stock delta on the
+        // wrong variant is silent damage — adjusting one candle's count when
+        // the owner meant its sibling. Refuse rather than guess which one.
+        const shared = variantsWithSku(resolved.product, sku);
+        if (shared.length > 1) {
+          return text(
+            `SKU "${sku}" is shared by ${shared.length} variants of ${resolved.product.handle}: ${describeVariantChoices(resolved.product, shared)}. adjust_inventory cannot tell them apart safely — fix the duplicate SKU in Shopify, or ask the owner which variant they mean.`,
+          );
+        }
+
         const variant = resolved.variant ?? catalog.variantBySku(resolved.product, sku);
         if (!variant) {
           return text(

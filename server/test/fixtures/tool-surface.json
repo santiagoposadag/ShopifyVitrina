@@ -205,7 +205,7 @@
     },
     {
       "name": "update_product",
-      "description": "Update an EXISTING product, found by SKU, handle or id. This is a MERGE, not a rewrite: pass ONLY the fields you are actually changing, and everything you omit keeps its stored value. To publish, pass just ref and status ACTIVE. To change one variant's price or SKU, pass variant_sku plus the new price. Never rebuild a payload from what you remember of the conversation — re-sending regenerated fields is how correct data gets overwritten with a guess. To change stock, use adjust_inventory, not this tool.",
+      "description": "Update an EXISTING product, found by SKU, handle or id. This is a MERGE, not a rewrite: pass ONLY the fields you are actually changing, and everything you omit keeps its stored value. To publish, pass just ref and status ACTIVE. To change one variant's price or SKU, pass variant_sku plus the new price — or, when the variant has no SKU or shares one with other variants of the same product (both happen in this catalog), pass variant instead, naming it by its title or option values (e.g. 'Rafael', or 'Dorado / 24 cm' in either order). variant and variant_sku are mutually exclusive. Assigning a brand-new SKU to a variant that has none is ref + variant + new_sku. Never rebuild a payload from what you remember of the conversation — re-sending regenerated fields is how correct data gets overwritten with a guess. To change stock, use adjust_inventory, not this tool.",
       "params": {
         "ref": {
           "type": "ZodString",
@@ -260,7 +260,14 @@
           "type": "ZodString",
           "optional": true,
           "descriptions": [
-            "Which variant price/new_sku apply to. Required when the product has more than one."
+            "Which variant price/new_sku apply to. Required when the product has more than one, unless variant is used instead."
+          ]
+        },
+        "variant": {
+          "type": "ZodString",
+          "optional": true,
+          "descriptions": [
+            "Which variant price/new_sku apply to, by its title or option values (e.g. 'Rafael', or 'Dorado / 24 cm' in either order). Use this instead of variant_sku when the variant has no SKU or shares one with other variants. Mutually exclusive with variant_sku."
           ]
         },
         "price": {

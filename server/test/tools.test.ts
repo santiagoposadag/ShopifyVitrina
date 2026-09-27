@@ -7,10 +7,12 @@ import { buildToolServer, MCP_SERVER_NAME, TOOL_REGISTRY, toolUniverse } from ".
 import { newToolContext, renderDescription } from "../src/tools/factory.js";
 import {
   describeProduct,
+  findVariantsByLabel,
   isPublishTransition,
   newOptionValues,
   renderProductList,
   renderSearchHits,
+  resolveUpdateVariant,
   whyVariantsCannotBeAdded,
 } from "../src/tools/packs/catalog.js";
 import { cartPermalink, storefrontHost } from "../src/shopify/catalog-port.js";
@@ -376,6 +378,182 @@ describe("write guards reach the port only when they should", () => {
     ]);
   });
 
+  /** Four variants of one product sharing ONE sku — the live duplicate-SKU bug. */
+  function archangelCandle(): ShopifyProduct {
+    const names = ["Jofiel", "Chamuel", "Gabriel", "Rafael"];
+    return fakeProduct({
+      handle: "vela-arcangel-3d",
+      title: "Vela Arcángel 3D",
+      options: [{ name: "Nombre", values: names }],
+      variants: names.map((name, i) => ({
+        id: `gid://shopify/ProductVariant/${i + 1}`,
+        sku: "VANG-RA",
+        title: name,
+        price: "45000.00",
+        compareAtPrice: null,
+        inventoryQuantity: 3,
+        inventoryItemId: `gid://shopify/InventoryItem/${i + 1}`,
+        inventoryTracked: true,
+        selectedOptions: [{ name: "Nombre", value: name }],
+      })),
+    });
+  }
+
+  it("update_product refuses when both variant and variant_sku are given", async () => {
+    const { fake, tool } = build(definitionWith(["update_product"]));
+    fake.products.set("vela-arcangel-3d", { product: archangelCandle() });
+
+    const out = await callTool(tool("update_product"), {
+      ref: "vela-arcangel-3d",
+      variant: "Rafael",
+      variant_sku: "VANG-RA",
+      price: 46000,
+    });
+
+    expect(out).toMatch(/not both/);
+    expect(callsTo(fake, "updateVariants")).toEqual([]);
+  });
+
+  it("update_product selects a variant by label when the SKU is shared", async () => {
+    const { fake, tool } = build(definitionWith(["update_product"]));
+    fake.products.set("vela-arcangel-3d", { product: archangelCandle() });
+
+    await callTool(tool("update_product"), {
+      ref: "vela-arcangel-3d",
+      variant: "Rafael",
+      price: 46000,
+    });
+
+    expect(callsTo(fake, "updateVariants")).toEqual([
+      ["gid://shopify/Product/1", [{ id: "gid://shopify/ProductVariant/4", price: 46000, sku: undefined }]],
+    ]);
+  });
+
+  it("update_product refuses a variant_sku that names more than one variant", async () => {
+    const { fake, tool } = build(definitionWith(["update_product"]));
+    fake.products.set("vela-arcangel-3d", { product: archangelCandle() });
+
+    const out = await callTool(tool("update_product"), {
+      ref: "vela-arcangel-3d",
+      variant_sku: "VANG-RA",
+      price: 46000,
+    });
+
+    expect(out).toMatch(/shared by 4 variants/);
+    expect(out).toContain("Rafael");
+    expect(callsTo(fake, "updateVariants")).toEqual([]);
+  });
+
+  // catalog.resolve resolves the PRODUCT cleanly here (every owner of the
+  // shared SKU agrees on it) and leaves `variant` unset — which of its 4
+  // variants was meant is still open, so with no selector at all this must
+  // land on the generic "say which one" refusal, not a mutation.
+  it("update_product refuses when a shared-SKU ref names no variant at all", async () => {
+    const { fake, tool } = build(definitionWith(["update_product"]));
+    fake.products.set("VANG-RA", { product: archangelCandle() });
+
+    const out = await callTool(tool("update_product"), { ref: "VANG-RA", price: 46000 });
+
+    expect(out).toMatch(/variant_sku/);
+    expect(callsTo(fake, "updateVariants")).toEqual([]);
+  });
+
+  // A shared SKU used AS THE REF still resolves the product; `variant`
+  // selects among its variants exactly as it does when the ref was the
+  // product's handle. This is the documented repair recipe for a duplicated
+  // SKU: ref (the SKU itself) + variant (the name) + new_sku.
+  it("update_product selects a variant by label when the ref itself is the shared SKU", async () => {
+    const { fake, tool } = build(definitionWith(["update_product"]));
+    fake.products.set("VANG-RA", { product: archangelCandle() });
+
+    await callTool(tool("update_product"), {
+      ref: "VANG-RA",
+      variant: "Rafael",
+      new_sku: "VANG-RAFAEL",
+    });
+
+    expect(callsTo(fake, "updateVariants")).toEqual([
+      [
+        "gid://shopify/Product/1",
+        [{ id: "gid://shopify/ProductVariant/4", price: undefined, sku: "VANG-RAFAEL" }],
+      ],
+    ]);
+  });
+
+  // Defense in depth: even if some other path ever handed resolveUpdateVariant
+  // a `resolvedVariant` whose own SKU turns out to be shared (catalog.resolve
+  // itself no longer does this — see shopify-catalog.test.ts — but the guard
+  // stays, the same way canUseTool stays behind allowedTools), it must not be
+  // used implicitly. Pinned directly against resolveUpdateVariant below too.
+  it("update_product still refuses an implicit variant whose own SKU turns out to be shared", async () => {
+    const { fake, tool } = build(definitionWith(["update_product"]));
+    const candle = archangelCandle();
+    fake.products.set("VANG-RA", { product: candle, variant: candle.variants[0] });
+
+    const out = await callTool(tool("update_product"), { ref: "VANG-RA", price: 46000 });
+
+    expect(out).toMatch(/shared by 4/);
+    expect(callsTo(fake, "updateVariants")).toEqual([]);
+  });
+
+  it("update_product refuses a new_sku already used by a different variant", async () => {
+    const { fake, tool } = build(definitionWith(["update_product"]));
+    const target = fakeProduct();
+    fake.products.set("062AC-MZ", { product: target });
+    const otherVariant = { ...target.variants[0]!, id: "gid://shopify/ProductVariant/999" };
+    fake.skuOwners = [{ product: fakeProduct({ handle: "otra-vela" }), variant: otherVariant }];
+
+    const out = await callTool(tool("update_product"), {
+      ref: "062AC-MZ",
+      new_sku: "TAKEN-SKU",
+    });
+
+    expect(out).toMatch(/Refused/);
+    expect(out).toContain("otra-vela");
+    expect(callsTo(fake, "updateVariants")).toEqual([]);
+  });
+
+  it("update_product allows a new_sku already held by the SAME target variant", async () => {
+    const { fake, tool } = build(definitionWith(["update_product"]));
+    const target = fakeProduct();
+    fake.products.set("062AC-MZ", { product: target });
+    // The uniqueness check must exclude the variant being written to, or a
+    // no-op re-send of its own SKU would refuse itself.
+    fake.skuOwners = [{ product: target, variant: target.variants[0]! }];
+
+    await callTool(tool("update_product"), { ref: "062AC-MZ", new_sku: "062AC-MZ" });
+
+    expect(callsTo(fake, "updateVariants")).toEqual([
+      ["gid://shopify/Product/1", [{ id: "gid://shopify/ProductVariant/51237367841067", price: undefined, sku: "062AC-MZ" }]],
+    ]);
+  });
+
+  it("adjust_inventory refuses a SKU shared by more than one variant", async () => {
+    const { fake, tool } = build(definitionWith(["adjust_inventory"]));
+    fake.products.set("VANG-RA", { product: archangelCandle() });
+
+    const out = await callTool(tool("adjust_inventory"), { sku: "VANG-RA", delta: -1 });
+
+    expect(out).toMatch(/shared by 4 variants/);
+    expect(callsTo(fake, "adjustInventory")).toEqual([]);
+    expect(callsTo(fake, "setInventory")).toEqual([]);
+  });
+
+  // catalog.resolve resolves the PRODUCT (every owner of "VANG-RA" agrees on
+  // it) but leaves `variant` unset. build_cart needs exactly ONE variant to
+  // build a line — it must refuse rather than add an arbitrary one of the 4.
+  it("build_cart refuses a SKU shared by more than one variant of the same product", async () => {
+    const { fake, tool } = build(definitionWith(["build_cart"]));
+    fake.products.set("VANG-RA", { product: archangelCandle() });
+
+    const out = await callTool(tool("build_cart"), {
+      items_json: '[{"sku":"VANG-RA","quantity":1}]',
+    });
+
+    expect(out).toMatch(/No variant found/);
+    expect(callsTo(fake, "cartUrl")).toEqual([]);
+  });
+
   it("build_cart refuses a sold-out variant before a link exists", async () => {
     const { fake, tool } = build(definitionWith(["build_cart"]));
     const product = fakeProduct();
@@ -425,6 +603,85 @@ describe("write guards reach the port only when they should", () => {
       ],
     ]);
     expect(callsTo(fake, "markAttached")).toEqual([[[1, 2], "gid://shopify/Product/1"]]);
+  });
+});
+
+/**
+ * `catalog.resolve` can answer with an `AmbiguousResolution` instead of a
+ * product — a SKU that names more than one exact owner, possibly on
+ * different products. Every tool that calls `resolve` has to check for it
+ * BEFORE touching `.product`, and refuse the same way: no mutation, and the
+ * candidates named so the model can retry with something unambiguous.
+ */
+describe("an ambiguous catalog.resolve reaches every caller the same way", () => {
+  function ambiguity(ref: string) {
+    return {
+      ambiguous: true as const,
+      ref,
+      candidates: [
+        { product: fakeProduct({ handle: "vela-arcangel-3d" }), variant: fakeProduct().variants[0]! },
+        { product: fakeProduct({ handle: "vela-arcangel-3d-bodega-2" }), variant: fakeProduct().variants[0]! },
+      ],
+    };
+  }
+
+  it("update_product refuses and names both products, sending no mutation", async () => {
+    const { fake, tool } = build(definitionWith(["update_product"]));
+    fake.products.set("VANG-RA", ambiguity("VANG-RA"));
+
+    const out = await callTool(tool("update_product"), { ref: "VANG-RA", price: 46000 });
+
+    expect(out).toMatch(/matches more than one variant/);
+    expect(out).toContain("vela-arcangel-3d");
+    expect(out).toContain("vela-arcangel-3d-bodega-2");
+    expect(callsTo(fake, "update")).toEqual([]);
+    expect(callsTo(fake, "updateVariants")).toEqual([]);
+  });
+
+  it("adjust_inventory refuses before reading or writing any stock", async () => {
+    const { fake, tool } = build(definitionWith(["adjust_inventory"]));
+    fake.products.set("VANG-RA", ambiguity("VANG-RA"));
+
+    const out = await callTool(tool("adjust_inventory"), { sku: "VANG-RA", delta: -1 });
+
+    expect(out).toMatch(/matches more than one variant/);
+    expect(callsTo(fake, "inventoryLevels")).toEqual([]);
+    expect(callsTo(fake, "adjustInventory")).toEqual([]);
+    expect(callsTo(fake, "setInventory")).toEqual([]);
+  });
+
+  it("get_product refuses rather than describing a first pick", async () => {
+    const { fake, tool } = build(definitionWith(["get_product"]));
+    fake.products.set("VANG-RA", ambiguity("VANG-RA"));
+
+    const out = await callTool(tool("get_product"), { ref: "VANG-RA" });
+
+    expect(out).toMatch(/matches more than one variant/);
+  });
+
+  it("build_cart refuses before a link exists", async () => {
+    const { fake, tool } = build(definitionWith(["build_cart"]));
+    fake.products.set("VANG-RA", ambiguity("VANG-RA"));
+
+    const out = await callTool(tool("build_cart"), {
+      items_json: '[{"sku":"VANG-RA","quantity":1}]',
+    });
+
+    expect(out).toMatch(/matches more than one variant/);
+    expect(callsTo(fake, "cartUrl")).toEqual([]);
+  });
+
+  it("delete_product refuses before anything is removed", async () => {
+    const { fake, tool } = build(definitionWith(["delete_product"]));
+    fake.products.set("VANG-RA", ambiguity("VANG-RA"));
+
+    const out = await callTool(tool("delete_product"), {
+      ref: "VANG-RA",
+      confirm_handle: "vela-arcangel-3d",
+    });
+
+    expect(out).toMatch(/matches more than one variant/);
+    expect(callsTo(fake, "remove")).toEqual([]);
   });
 });
 
@@ -822,6 +1079,226 @@ describe("newOptionValues", () => {
       { price: 2, option_values: ["9 cm", "8 cm"] },
     ];
     expect(newOptionValues(candle(), drafts)).toEqual(['Diámetro="9 cm"']);
+  });
+});
+
+/**
+ * Selecting a variant by its title or option values, not just by SKU.
+ *
+ * A live audit found variants with no SKU at all (an option axis like
+ * "Aroma" with values nobody gave a code) and SKUs duplicated across every
+ * variant of one product (one candle line shares "VANG-RA" across four
+ * archangel names) — both make SKU-only targeting unreachable or dangerous.
+ */
+describe("findVariantsByLabel", () => {
+  /** Four variants of one product, all sharing ONE sku — the live bug. */
+  function archangelCandle(): ShopifyProduct {
+    const names = ["Jofiel", "Chamuel", "Gabriel", "Rafael"];
+    return product({
+      handle: "vela-arcangel-3d",
+      title: "Vela Arcángel 3D",
+      options: [{ name: "Nombre", values: names }],
+      variants: names.map((name, i) => ({
+        id: `gid://shopify/ProductVariant/${i + 1}`,
+        sku: "VANG-RA",
+        title: name,
+        price: "45000.00",
+        compareAtPrice: null,
+        inventoryQuantity: 3,
+        inventoryItemId: `gid://shopify/InventoryItem/${i + 1}`,
+        inventoryTracked: true,
+        selectedOptions: [{ name: "Nombre", value: name }],
+      })),
+    });
+  }
+
+  /** One variant with NO sku, on a two-axis product — the other live bug. */
+  function botanicalCandle(): ShopifyProduct {
+    return product({
+      handle: "vela-botanica",
+      title: "Vela Botánica",
+      options: [
+        { name: "Aroma", values: ["Aromática"] },
+        { name: "Diámetro", values: ["8 cm"] },
+      ],
+      variants: [
+        {
+          id: "gid://shopify/ProductVariant/9",
+          sku: null,
+          title: "Aromática / 8 cm",
+          price: "17900.00",
+          compareAtPrice: null,
+          inventoryQuantity: 6,
+          inventoryItemId: "gid://shopify/InventoryItem/9",
+          inventoryTracked: true,
+          selectedOptions: [
+            { name: "Aroma", value: "Aromática" },
+            { name: "Diámetro", value: "8 cm" },
+          ],
+        },
+      ],
+    });
+  }
+
+  it("selects a single-axis variant by one value", () => {
+    const matches = findVariantsByLabel(archangelCandle(), "Rafael");
+    expect(matches.map((v) => v.title)).toEqual(["Rafael"]);
+  });
+
+  it("selects a two-axis variant by 'A / B', in EITHER order", () => {
+    const candle = botanicalCandle();
+    expect(findVariantsByLabel(candle, "Aromática / 8 cm").map((v) => v.id)).toEqual([
+      "gid://shopify/ProductVariant/9",
+    ]);
+    expect(findVariantsByLabel(candle, "8 cm / Aromática").map((v) => v.id)).toEqual([
+      "gid://shopify/ProductVariant/9",
+    ]);
+  });
+
+  it("folds accents, case and stray whitespace", () => {
+    const candle = botanicalCandle();
+    expect(findVariantsByLabel(candle, "  AROMATICA  /  8 CM  ").map((v) => v.id)).toEqual([
+      "gid://shopify/ProductVariant/9",
+    ]);
+  });
+
+  it("finds nothing for a label that names no variant", () => {
+    expect(findVariantsByLabel(archangelCandle(), "Miguel")).toEqual([]);
+  });
+
+  it("matches more than one variant for an ambiguous label", () => {
+    // Two variants sharing a value on one axis, distinguished on another.
+    const p = product({
+      options: [
+        { name: "Color", values: ["Dorado"] },
+        { name: "Diámetro", values: ["10 cm", "24 cm"] },
+      ],
+      variants: [
+        {
+          id: "gid://shopify/ProductVariant/1",
+          sku: "VD-DOR-10",
+          title: "Dorado / 10 cm",
+          price: "40000.00",
+          compareAtPrice: null,
+          inventoryQuantity: 1,
+          inventoryItemId: "gid://shopify/InventoryItem/1",
+          inventoryTracked: true,
+          selectedOptions: [
+            { name: "Color", value: "Dorado" },
+            { name: "Diámetro", value: "10 cm" },
+          ],
+        },
+        {
+          id: "gid://shopify/ProductVariant/2",
+          sku: "VD-DOR-24",
+          title: "Dorado / 24 cm",
+          price: "50000.00",
+          compareAtPrice: null,
+          inventoryQuantity: 1,
+          inventoryItemId: "gid://shopify/InventoryItem/2",
+          inventoryTracked: true,
+          selectedOptions: [
+            { name: "Color", value: "Dorado" },
+            { name: "Diámetro", value: "24 cm" },
+          ],
+        },
+      ],
+    });
+    // "Dorado" alone names only one VALUE, not one variant of a two-axis
+    // product — it must not resolve to either half of an incomplete label.
+    expect(findVariantsByLabel(p, "Dorado")).toEqual([]);
+  });
+
+  // The values were compared as a SET, so a two-axis variant carrying the
+  // SAME value on both axes de-duplicated down to size 1 — exactly matching a
+  // one-word label that only ever named ONE of its two axes. The true axis
+  // count (selectedOptions.length, a multiset) is what must be compared.
+  it("does not match a one-word label against a variant with a repeated value on two axes", () => {
+    const p = product({
+      options: [
+        { name: "Color", values: ["Dorado"] },
+        { name: "Acabado", values: ["Dorado"] },
+      ],
+      variants: [
+        {
+          id: "gid://shopify/ProductVariant/1",
+          sku: "VD-DOR-DOR",
+          title: "Dorado / Dorado",
+          price: "40000.00",
+          compareAtPrice: null,
+          inventoryQuantity: 1,
+          inventoryItemId: "gid://shopify/InventoryItem/1",
+          inventoryTracked: true,
+          selectedOptions: [
+            { name: "Color", value: "Dorado" },
+            { name: "Acabado", value: "Dorado" },
+          ],
+        },
+      ],
+    });
+    expect(findVariantsByLabel(p, "Dorado")).toEqual([]);
+    // The full two-part label still matches it, in either order.
+    expect(findVariantsByLabel(p, "Dorado / Dorado").map((v) => v.id)).toEqual([
+      "gid://shopify/ProductVariant/1",
+    ]);
+  });
+});
+
+/**
+ * `resolveUpdateVariant` — the decision update_product makes before any
+ * mutation is sent. Every path that could land on more than one variant must
+ * refuse rather than guess, because Shopify itself never enforces the
+ * uniqueness that would make guessing safe.
+ */
+describe("resolveUpdateVariant", () => {
+  const names = ["Jofiel", "Chamuel", "Gabriel", "Rafael"];
+  function archangelCandle(): ShopifyProduct {
+    return product({
+      handle: "vela-arcangel-3d",
+      options: [{ name: "Nombre", values: names }],
+      variants: names.map((name, i) => ({
+        id: `gid://shopify/ProductVariant/${i + 1}`,
+        sku: "VANG-RA",
+        title: name,
+        price: "45000.00",
+        compareAtPrice: null,
+        inventoryQuantity: 3,
+        inventoryItemId: `gid://shopify/InventoryItem/${i + 1}`,
+        inventoryTracked: true,
+        selectedOptions: [{ name: "Nombre", value: name }],
+      })),
+    });
+  }
+
+  it("resolves an unambiguous variant label", () => {
+    const target = resolveUpdateVariant(archangelCandle(), undefined, { variant: "Rafael" });
+    expect(target).not.toBeTypeOf("string");
+    expect((target as { title: string }).title).toBe("Rafael");
+  });
+
+  it("refuses a variant_sku shared by several variants, naming them", () => {
+    const refusal = resolveUpdateVariant(archangelCandle(), undefined, { variantSku: "VANG-RA" });
+    expect(refusal).toBeTypeOf("string");
+    expect(refusal as string).toContain("shared by 4 variants");
+    for (const name of names) expect(refusal as string).toContain(name);
+  });
+
+  // Defense in depth: catalog.resolve itself never hands back a `variant`
+  // whose own SKU is shared any more (see shopify-catalog.test.ts) — it
+  // leaves `variant` unset for that case instead. This guard is what stops
+  // an implicit pick if a `resolvedVariant` with a shared SKU ever reaches
+  // here anyway, the silent-wrong-variant case.
+  it("refuses the implicit path when the resolved variant's own SKU is ambiguous", () => {
+    const candle = archangelCandle();
+    const refusal = resolveUpdateVariant(candle, candle.variants[0], {});
+    expect(refusal).toBeTypeOf("string");
+    expect(refusal as string).toMatch(/shared by 4/);
+  });
+
+  it("uses the implicit variant when its SKU is not shared", () => {
+    const single = product();
+    const target = resolveUpdateVariant(single, single.variants[0], {});
+    expect(target).toBe(single.variants[0]);
   });
 });
 

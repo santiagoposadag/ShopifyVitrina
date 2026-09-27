@@ -26,10 +26,22 @@ sola. Nada de aquí reemplaza un resultado de herramienta: los datos de un produ
 
 El precio vive en la VARIANTE, no en el producto: un producto con tallas tiene un precio
 por talla y hay que decir cuál se cambia.
-Se cambia con update_product, identificando la variante por su SKU y enviando únicamente el
-precio nuevo. Los campos que no se envían conservan su valor guardado.
+Se cambia con update_product, identificando la variante y enviando únicamente el precio
+nuevo. Los campos que no se envían conservan su valor guardado.
 Si el dueño no dijo el precio, hay que preguntarlo. El precio es el dato más fácil de
 adivinar y el más caro de equivocar en una tienda que cobra de verdad.
+
+Para identificar la variante hay dos formas, y no son intercambiables. variant_sku sirve
+cuando el SKU nombra una sola variante sin ambigüedad. variant sirve cuando la variante no
+tiene SKU o cuando ese SKU se repite en varias variantes del mismo producto (pasa en este
+catálogo) — se nombra por su título o sus valores de opción, por ejemplo "Rafael" o
+"Dorado / 24 cm" en cualquier orden. Nunca se pasan los dos a la vez.
+Si update_product responde que el SKU o el nombre coinciden con más de una variante, no
+elige ninguna por su cuenta: hay que repetirle al dueño cuáles son y preguntar cuál es, o
+usar variant con el nombre exacto que la herramienta mostró.
+Asignarle un SKU nuevo a una variante que no tiene es ref + variant + new_sku: variant dice
+cuál variante, new_sku el código que se le pone. Si ese código ya está en otra variante,
+update_product lo rechaza — los SKU deben ser únicos, aunque Shopify no lo obligue.
 
 ## Agregar una talla, un color o una medida nueva
 

@@ -36,6 +36,20 @@ export interface ResolvedProduct {
 }
 
 /**
+ * More than one variant, across possibly different products, carries the
+ * EXACT SKU a reference named. Shopify does not enforce SKU uniqueness, so
+ * `resolve` returns this instead of picking one: every caller must refuse and
+ * name the candidates rather than silently act on a guess — a duplicated SKU
+ * is real in this catalog, and a stranger's product is one first-match away.
+ */
+export interface AmbiguousResolution {
+  ambiguous: true;
+  /** The reference that produced more than one exact owner. */
+  ref: string;
+  candidates: { product: ShopifyProduct; variant: ShopifyVariant }[];
+}
+
+/**
  * What a search asks for.
  *
  * `status` EXCLUDES and `query` only SCORES — the split shopify/rank.ts makes
@@ -81,9 +95,12 @@ export interface CatalogPort {
   /**
    * gid, then SKU, then handle, then null. An implementation must NOT fall
    * through to a text search: a fuzzy match that then feeds delete_product is
-   * how the wrong product gets deleted.
+   * how the wrong product gets deleted. A SKU that names more than one exact
+   * owner (Shopify never enforces uniqueness) is not a silent first pick
+   * either — it comes back as `AmbiguousResolution`, and every caller of this
+   * method must check for it before touching `.product`.
    */
-  resolve(ref: string): Promise<ResolvedProduct | null>;
+  resolve(ref: string): Promise<ResolvedProduct | AmbiguousResolution | null>;
 
   /**
    * The variant of an ALREADY FETCHED product with this SKU. Pure and
@@ -91,6 +108,15 @@ export interface CatalogPort {
    * be asked about, and making it async would only add an await to every caller.
    */
   variantBySku(product: ShopifyProduct, sku: string): ShopifyVariant | undefined;
+
+  /**
+   * Every variant STORE-WIDE whose SKU exactly equals this one, trimmed and
+   * case-insensitively. Shopify does not enforce SKU uniqueness, so a
+   * `new_sku` write can silently collide with a SKU already sitting on a
+   * different variant unless a caller checks first — this is what it checks
+   * against.
+   */
+  variantsBySku(sku: string): Promise<{ product: ShopifyProduct; variant: ShopifyVariant }[]>;
 
   locations(): Promise<ShopifyLocation[]>;
 
