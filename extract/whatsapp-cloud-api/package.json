@@ -1,0 +1,20 @@
+{
+  "name": "whatsapp-cloud-api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Dependency-free client and webhook helpers for Meta's WhatsApp Business Cloud API.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "example": "tsx examples/node-http.ts"
+  },
+  "engines": { "node": ">=20" },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
