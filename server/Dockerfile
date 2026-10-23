@@ -7,7 +7,7 @@
 # NODE_ENV is deliberately NOT set here. npm defaults `omit` to `dev` whenever
 # NODE_ENV=production, which would strip typescript from the build stage and
 # break `tsc`. Each stage below opts in explicitly.
-FROM node:22-bookworm-slim AS base
+FROM node:22.23.4-bookworm-slim AS base
 WORKDIR /app
 
 # ---------------------------------------------------------------------------
