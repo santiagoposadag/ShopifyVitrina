@@ -694,7 +694,7 @@ describe("an ambiguous catalog.resolve reaches every caller the same way", () =>
  * shipped definition sets a slot. These pin the seam itself.
  */
 describe("templated descriptions", () => {
-  const CART_EXAMPLE = '[{"sku":"062AC-MZ","quantity":1}]';
+  const CART_EXAMPLE = '[{"sku":"062AMLLA","quantity":1}]';
 
   it("falls back to the pack's own literal when the definition sets no slot", () => {
     const { tool } = build(definitionWith(["build_cart"]));

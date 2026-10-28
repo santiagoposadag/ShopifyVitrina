@@ -35,7 +35,7 @@ const CATALOG_SLOTS = {
   example_option_names: '["Talla","Color"]',
   example_product_types: "Camiseta, Zapato",
   example_axis_variants_json:
-    '[{"sku":"062AC-LV","price":13800,"option_values":["5 cm","8 cm"],"quantity":10}]',
+    '[{"sku":"062ALV","price":13800,"option_values":["5 cm","8 cm"],"quantity":10}]',
   example_option_value_typo: '"7,5 cm" is not "7.5 cm"',
 } as const;
 
