@@ -20,7 +20,7 @@ import { ambiguousSkuText, describeVariant, isAmbiguous } from "./catalog.js";
  */
 
 const CART_SLOTS = {
-  example_cart_items_json: '[{"sku":"062AC-MZ","quantity":1}]',
+  example_cart_items_json: '[{"sku":"062AMLLA","quantity":1}]',
 } as const;
 
 export const buildCart: ToolFactory = (ctx, { catalog }) =>
